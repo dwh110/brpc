@@ -15,19 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BUTIL_TEST_SSTREAM_WORKAROUND
-#define BUTIL_TEST_SSTREAM_WORKAROUND
+#include "brpc/policy/baidu_rpc_protocol.h"
+#include "fuzz_common.h"
 
-// defining private as public makes it fail to compile sstream with gcc5.x like this:
-// "error: ‘struct std::__cxx11::basic_stringbuf<_CharT, _Traits, _Alloc>::
-// __xfer_bufptrs’ redeclared with different access"
+#define kMinInputLength 5
+#define kMaxInputLength 4096
 
-#ifdef private
-# undef private
-# include <sstream>
-# define private public
-#else
-# include <sstream>
-#endif
+extern "C" int
+LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (size < kMinInputLength || size > kMaxInputLength){
+        return 1;
+    }
 
-#endif  //  BUTIL_TEST_SSTREAM_WORKAROUND
+    std::string input(reinterpret_cast<const char*>(data), size);
+    butil::IOBuf buf;
+    buf.append(input);
+
+    brpc::Socket* sock = get_fuzz_socket();
+    if (sock == NULL) {
+        return 0;
+    }
+    brpc::policy::ParseRpcMessage(&buf, sock, false, NULL);
+    return 0;
+}

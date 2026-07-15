@@ -119,7 +119,7 @@ static void string_append_value(const BUTIL_RAPIDJSON_NAMESPACE::Value& value,
 //otherwise will append error into error message and return false.
 inline bool value_invalid(const google::protobuf::FieldDescriptor* field, const char* type,
                           const BUTIL_RAPIDJSON_NAMESPACE::Value& value, std::string* err) {
-    bool optional = field->is_optional();
+    bool optional = !field->is_required() && !field->is_repeated();
     if (err) {
         if (!err->empty()) {
             err->append(", ");
@@ -733,6 +733,14 @@ bool ProtoJsonToProtoMessage(google::protobuf::io::ZeroCopyInputStream* json,
                              google::protobuf::Message* message,
                              const ProtoJson2PbOptions& options,
                              std::string* error) {
+#if GOOGLE_PROTOBUF_VERSION >= 6031000
+    auto st = google::protobuf::json::JsonStreamToMessage(json, message, options);
+    bool ok = st.ok();
+    if (!ok && NULL != error) {
+        *error = st.ToString();
+    }
+    return ok;
+#else
     TypeResolverUniqueptr type_resolver = GetTypeResolver(*message);
     std::string type_url = GetTypeUrl(*message);
     butil::IOBuf buf;
@@ -753,6 +761,7 @@ bool ProtoJsonToProtoMessage(google::protobuf::io::ZeroCopyInputStream* json,
         *error = "Fail to ParseFromCodedStream";
     }
     return ok;
+#endif // GOOGLE_PROTOBUF_VERSION >= 6031000
 }
 
 bool ProtoJsonToProtoMessage(const std::string& json, google::protobuf::Message* message,

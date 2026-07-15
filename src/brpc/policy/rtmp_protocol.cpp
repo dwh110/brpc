@@ -1925,8 +1925,8 @@ bool RtmpChunkStream::OnSetPeerBandwidth(
 
 bool RtmpChunkStream::OnUserControlMessage(
     const RtmpMessageHeader& mh, butil::IOBuf* msg_body, Socket* socket) {
-    if (mh.message_length > 32) {
-        RTMP_ERROR(socket, mh) << "No user control message long as "
+    if (mh.message_length < 2u || mh.message_length > 32u) {
+        RTMP_ERROR(socket, mh) << "Invalid user control message length="
                                << mh.message_length << " bytes";
         return false;
     }
@@ -3540,8 +3540,7 @@ void OnServerStreamCreated::Run(bool error,
             break;
         }
     } while (0);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(base_realtime);
         span->set_received_us(received_us);
         span->set_response_size(istream->popped_bytes());

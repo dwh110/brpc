@@ -39,6 +39,7 @@
 namespace brpc {
 
 DECLARE_bool(enable_rpcz);
+DECLARE_uint64(max_body_size);
 
 namespace policy {
 
@@ -96,6 +97,9 @@ ParseResult ParseCouchbaseMessage(butil::IOBuf* source, Socket* socket,
     }
     const CouchbaseResponseHeader* header = (const CouchbaseResponseHeader*)p;
     uint32_t total_body_length = butil::NetToHost32(header->total_body_length);
+    if (total_body_length > FLAGS_max_body_size) {
+      return MakeParseError(PARSE_ERROR_TOO_BIG_DATA);
+    }
     if (source->size() < sizeof(*header) + total_body_length) {
       return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
     }
@@ -160,8 +164,7 @@ void ProcessCouchbaseResponse(InputMessageBase* msg_base) {
   }
 
   ControllerPrivateAccessor accessor(cntl);
-  Span* span = accessor.span();
-  if (span) {
+  if (auto span = accessor.span()) {
     span->set_base_real_us(msg->base_real_us());
     span->set_received_us(msg->received_us());
     span->set_response_size(msg->meta.length());

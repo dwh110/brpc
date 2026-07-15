@@ -81,6 +81,13 @@ DEFINE_int32(socket_send_buffer_size, -1,
 
 DEFINE_int32(ssl_bio_buffer_size, 16*1024, "Set buffer size for SSL read/write");
 
+DEFINE_int32(ssl_handshake_timeout_ms, 5000,
+             "Max duration of one SSL handshake on a socket. Zero or negative "
+             "disables the limit and falls back to waiting forever, which can "
+             "leak ESTABLISHED sockets if the peer never finishes the TLS "
+             "handshake (e.g. server not actually listening with SSL).");
+BRPC_VALIDATE_GFLAG(ssl_handshake_timeout_ms, PassValidate);
+
 DEFINE_int64(socket_max_unwritten_bytes, 64 * 1024 * 1024,
              "Max unwritten bytes in each socket, if the limit is reached,"
              " Socket.Write fails with EOVERCROWDED");
@@ -454,6 +461,7 @@ Socket::Socket(Forbidden f)
     , _fd(-1)
     , _tos(0)
     , _reset_fd_real_us(-1)
+    , _fd_version(0)
     , _on_edge_triggered_events(NULL)
     , _need_on_edge_trigger(false)
     , _user(NULL)
@@ -571,8 +579,11 @@ int Socket::ResetFileDescriptor(int fd) {
     _avg_msg_size = 0;
     // MUST store `_fd' before adding itself into epoll device to avoid
     // race conditions with the callback function inside epoll
+    static butil::atomic<uint64_t> BAIDU_CACHELINE_ALIGNMENT fd_version(0);
+    _fd_version.store(fd_version.fetch_add(1, butil::memory_order_relaxed),
+                      butil::memory_order_relaxed);
     _fd.store(fd, butil::memory_order_release);
-    _reset_fd_real_us = butil::gettimeofday_us();
+    _reset_fd_real_us = butil::cpuwide_time_us();
     if (!ValidFileDescriptor(fd)) {
         return 0;
     }
@@ -896,8 +907,7 @@ void Socket::OnFailed(int error_code, const std::string& error_text) {
     // comes online.
     if (HCEnabled()) {
         GetOrNewSharedPart()->circuit_breaker.MarkAsBroken();
-        StartHealthCheck(id(),
-            GetOrNewSharedPart()->circuit_breaker.isolation_duration_ms());
+        StartHealthCheck(id(), GetOrNewSharedPart()->circuit_breaker.isolation_duration_ms());
     }
     // Wake up all threads waiting on EPOLLOUT when closing fd
     _epollout_butex->fetch_add(1, butil::memory_order_relaxed);
@@ -1266,12 +1276,18 @@ int Socket::Connect(const timespec* abstime,
     // We need to do async connect (to manage the timeout by ourselves).
     CHECK_EQ(0, butil::make_non_blocking(sockfd));
     if (!_device_name.empty()) {
+#ifdef SO_BINDTODEVICE
         if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE,
                        _device_name.c_str(), _device_name.size()) < 0) {
             PLOG(ERROR) << "Fail to set SO_BINDTODEVICE of fd=" << sockfd
                         << " to device_name=" << _device_name;
             return -1;
         }
+#else
+        LOG(ERROR) << "SO_BINDTODEVICE (device_name=" << _device_name
+                   << ") is not supported on this platform";
+        return -1;
+#endif
     }
     if (local_side().ip != butil::IP_ANY) {
         struct sockaddr_storage cli_addr;
@@ -1548,8 +1564,7 @@ void Socket::CheckConnectedAndKeepWrite(int fd, int err, void* data) {
             g_vars->channel_conn << 1;
         }
         if (s->_app_connect) {
-            s->_app_connect->StartConnect(req->get_socket(),
-                                          AfterAppConnected, req);
+            s->_app_connect->StartConnect(req->get_socket(), AfterAppConnected, req);
         } else {
             // Successfully created a connection
             AfterAppConnected(0, req);
@@ -1607,7 +1622,10 @@ int Socket::Write(butil::IOBuf* data, const WriteOptions* options_in) {
     if (options_in) {
         opt = *options_in;
     }
-    if (data->empty()) {
+    // An auth write (opt.auth_flags != 0) may carry an empty data buffer: some
+    // protocols (e.g. mysql) read the server greeting first and send their real
+    // bytes from the connection-phase handler, not from `data` here.
+    if (data->empty() && !opt.auth_flags) {
         return SetError(opt.id_wait, EINVAL);
     }
     if (opt.pipelined_count > MAX_PIPELINED_COUNT) {
@@ -1840,8 +1858,7 @@ void* Socket::KeepWrite(void* void_arg) {
             // KeepWrite to check and setup pending WriteRequests periodically,
             // which may turn on _overcrowded to stop pending requests from
             // growing infinitely.
-            const timespec duetime =
-                                butil::milliseconds_from_now(WAIT_EPOLLOUT_TIMEOUT_MS);
+            const timespec duetime = butil::milliseconds_from_now(WAIT_EPOLLOUT_TIMEOUT_MS);
             bool pollin = s->_transport->HasOnEdgeTrigger();
             int ret = s->_transport->WaitEpollOut(s->_epollout_butex, pollin, duetime);
             if (ret == 1) {
@@ -1957,9 +1974,23 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
 
     _ssl_state = SSL_CONNECTING;
 
+    // Bound the handshake by a deadline; without it, a peer that completes
+    // the TCP handshake but never returns a TLS Hello (e.g. server not
+    // configured for SSL) would park this bthread on bthread_fd_wait
+    // forever. That bthread holds a Socket reference via WriteRequest, so
+    // the underlying fd would never be recycled and the connection would
+    // remain ESTABLISHED indefinitely.
+    const int handshake_timeout_ms = FLAGS_ssl_handshake_timeout_ms;
+    timespec abstime_storage;
+    const timespec* abstime = NULL;
+    if (handshake_timeout_ms > 0) {
+        abstime_storage = butil::milliseconds_from_now(handshake_timeout_ms);
+        abstime = &abstime_storage;
+    }
+
     // Loop until SSL handshake has completed. For SSL_ERROR_WANT_READ/WRITE,
-    // we use bthread_fd_wait as polling mechanism instead of EventDispatcher
-    // as it may confuse the origin event processing code.
+    // we use bthread_fd_timedwait as polling mechanism instead of
+    // EventDispatcher as it may confuse the origin event processing code.
     while (true) {
         ERR_clear_error();
         int rc = SSL_do_handshake(_ssl_session);
@@ -2005,20 +2036,32 @@ int Socket::SSLHandshake(int fd, bool server_mode) {
         switch (ssl_error) {
         case SSL_ERROR_WANT_READ:
 #if defined(OS_LINUX)
-            if (bthread_fd_wait(fd, EPOLLIN) != 0) {
+            if (bthread_fd_timedwait(fd, EPOLLIN, abstime) != 0) {
 #elif defined(OS_MACOSX)
-            if (bthread_fd_wait(fd, EVFILT_READ) != 0) {
+            if (bthread_fd_timedwait(fd, EVFILT_READ, abstime) != 0) {
 #endif
+                if (errno == ETIMEDOUT) {
+                    LOG(WARNING) << "SSL handshake timed out after "
+                                 << handshake_timeout_ms
+                                 << "ms while waiting for peer data on fd="
+                                 << fd << " remote_side=" << _remote_side;
+                }
                 return -1;
             }
             break;
 
         case SSL_ERROR_WANT_WRITE:
 #if defined(OS_LINUX)
-            if (bthread_fd_wait(fd, EPOLLOUT) != 0) {
+            if (bthread_fd_timedwait(fd, EPOLLOUT, abstime) != 0) {
 #elif defined(OS_MACOSX)
-            if (bthread_fd_wait(fd, EVFILT_WRITE) != 0) {
+            if (bthread_fd_timedwait(fd, EVFILT_WRITE, abstime) != 0) {
 #endif
+                if (errno == ETIMEDOUT) {
+                    LOG(WARNING) << "SSL handshake timed out after "
+                                 << handshake_timeout_ms
+                                 << "ms while waiting to send on fd=" << fd
+                                 << " remote_side=" << _remote_side;
+                }
                 return -1;
             }
             break;
@@ -2101,18 +2144,27 @@ ssize_t Socket::DoRead(size_t size_hint) {
     default: {
         const unsigned long e = ERR_get_error();
         if (nr == 0) {
-            // Socket EOF or SSL session EOF
+            if (ssl_error != SSL_ERROR_ZERO_RETURN) {
+                // Unexpected EOF without proper SSL shutdown (close_notify)
+                LOG(WARNING) << "Fail to read from ssl_fd=" << fd()
+                             << ": unexpected ssl_error=" << ssl_error;
+                errno = ESSL;
+                return -1;
+            }
+            // Clean SSL shutdown (close_notify received)
         } else if (e != 0) {
             LOG(WARNING) << "Fail to read from ssl_fd=" << fd()
                          << ": " << SSLError(e);
             errno = ESSL;
         } else {
+            int saved_errno = errno;
             // System error with corresponding errno set.
             bool is_fatal_error = (ssl_error != SSL_ERROR_ZERO_RETURN &&
                                    ssl_error != SSL_ERROR_SYSCALL) ||
-                                   BIO_fd_non_fatal_error(errno) != 0 ||
+                                   BIO_fd_non_fatal_error(saved_errno) != 0 ||
                                   nr < 0;
             PLOG_IF(WARNING, is_fatal_error) << "Fail to read from ssl_fd=" << fd();
+            errno = saved_errno;
         }
         break;
     }
@@ -2315,7 +2367,7 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
        << "\nnevent=" << ptr->_nevent.load(butil::memory_order_relaxed)
        << "\nfd=" << fd
        << "\ntos=" << ptr->_tos
-       << "\nreset_fd_to_now=" << butil::gettimeofday_us() - ptr->_reset_fd_real_us << "us"
+       << "\nreset_fd_to_now=" << butil::cpuwide_time_us() - ptr->_reset_fd_real_us << "us"
        << "\nremote_side=" << ptr->_remote_side
        << "\nlocal_side=" << ptr->_local_side
        << "\non_et_events=" << (void*)ptr->_on_edge_triggered_events
@@ -2511,8 +2563,12 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
            << "\n}";
     }
 #endif
+
+    os << "\nrdma={\n";
     ptr->_transport->Debug(os);
-    { os << "\nbthread_tag=" << ptr->_io_event.bthread_tag(); }
+    os << "}\n";
+
+    os << "\nbthread_tag=" << ptr->_io_event.bthread_tag();
 }
 
 int Socket::CheckHealth() {

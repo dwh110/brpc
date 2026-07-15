@@ -258,6 +258,10 @@ Requirements of instance tag is the same as wrr.
 
 which is locality-aware. Perfer servers with lower latencies, until the latency is higher than others, no other settings. Check out [Locality-aware load balancing](lalb.md) for more details.
 
+### p2c
+
+which is power-of-two-choices with peak-EWMA latency scoring. Each selection samples two random servers and routes to the one with the lower `latency * (inflight + 1) / weight` score, where the latency is a peak-sensitive moving average: an upward spike takes effect immediately while recovery decays over `tau_ms`(default 10s). A slow or failing server is shed within one observation and selection cost is O(1) regardless of cluster size. Weight comes from the instance tag as in wrr(default 1). Optional parameters: `p2c:choices=4`(compare 4 sampled servers instead of 2, useful when many servers degrade at once), `p2c:tau_ms=5000`.
+
 ### c_murmurhash or c_md5
 
 which is consistent hashing. Adding or removing servers does not make destinations of requests change as dramatically as in simple hashing. It's especially suitable for caching services.
@@ -717,8 +721,9 @@ Another solution is setting gflag -defer_close_second
 | Name               | Value | Description                              | Defined At              |
 | ------------------ | ----- | ---------------------------------------- | ----------------------- |
 | defer_close_second | 0     | Defer close of connections for so many seconds even if the connection is not used by anyone. Close immediately for non-positive values | src/brpc/socket_map.cpp |
+| defer_close_respect_idle | false | When defer_close_second > 0, close a connection immediately when the last reference is removed and the socket has already been idle for longer than defer_close_second | src/brpc/socket_map.cpp |
 
-After setting, connection is not closed immediately after last referential count, instead it will be closed after so many seconds. If a channel references the connection again during the wait, the connection resumes to normal. No matter how frequent channels are created, this flag limits the frequency of closing connections. Side effect of the flag is that file descriptors are not closed immediately after destroying of channels, if the flag is wrongly set to be large, number of active file descriptors in the process may be large as well.
+After setting, connection is not closed immediately after last referential count, instead it will be closed after so many seconds. If a channel references the connection again during the wait, the connection resumes to normal. No matter how frequent channels are created, this flag limits the frequency of closing connections. Side effect of the flag is that file descriptors are not closed immediately after destroying of channels, if the flag is wrongly set to be large, number of active file descriptors in the process may be large as well. When -defer_close_respect_idle is enabled, a connection that has already been idle for longer than defer_close_second may be closed when the last reference is removed.
 
 ## Buffer size of connections
 

@@ -421,7 +421,401 @@ uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
   return static_cast<uint32_t>(l ^ 0xffffffffu);
 }
 
-// Detect if SS42 or not.
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#include <stdio.h>
+#if defined(__riscv_zvbc)
+#include <riscv_vector.h>
+#endif
+
+// RISC-V Zbc carry-less multiplication inline helpers
+static inline uint64_t rv_clmul(uint64_t a, uint64_t b) {
+  uint64_t result;
+  __asm__ volatile ("clmul %0, %1, %2" : "=r"(result) : "r"(a), "r"(b));
+  return result;
+}
+
+static inline uint64_t rv_clmulh(uint64_t a, uint64_t b) {
+  uint64_t result;
+  __asm__ volatile ("clmulh %0, %1, %2" : "=r"(result) : "r"(a), "r"(b));
+  return result;
+}
+
+// Bitwise CRC32C fallback for small chunks
+static inline uint32_t rv_crc32c_bitwise(uint32_t crc, const uint8_t* buf,
+                                         size_t len) {
+  uint32_t c = crc;
+  for (size_t i = 0; i < len; ++i) {
+    c ^= buf[i];
+    for (int k = 0; k < 8; ++k) {
+      c = (c >> 1) ^ ((c & 1) ? 0x82F63B78U : 0);
+    }
+  }
+  return c;
+}
+
+// Fold a 128-bit CRC state (lo:hi) with fold constants and XOR in new data
+static inline void rv_fold_pair_xor_data(uint64_t* lo, uint64_t* hi,
+                                         uint64_t k0, uint64_t k1,
+                                         uint64_t d0, uint64_t d1) {
+  uint64_t l = rv_clmul(*lo, k0) ^ rv_clmul(*hi, k1);
+  uint64_t h = rv_clmulh(*lo, k0) ^ rv_clmulh(*hi, k1);
+  *lo = l ^ d0;
+  *hi = h ^ d1;
+}
+
+// Fold a 128-bit CRC state with fold constants and XOR in another state
+static inline void rv_fold_pair_xor_state(uint64_t* lo, uint64_t* hi,
+                                          uint64_t k0, uint64_t k1,
+                                          uint64_t s0, uint64_t s1) {
+  uint64_t l = rv_clmul(*lo, k0) ^ rv_clmul(*hi, k1);
+  uint64_t h = rv_clmulh(*lo, k0) ^ rv_clmulh(*hi, k1);
+  *lo = l ^ s0;
+  *hi = h ^ s1;
+}
+
+// Folding constants for CRC32C (Castagnoli polynomial 0x1EDC6F41)
+// x^(64*i+64) mod P(x) for i=1..4, in bit-reflected form
+static const uint64_t crc32c_fold_const[4] __attribute__((aligned(16))) = {
+  0x00000000740eef02ULL,  // k1: fold 512->256
+  0x000000009e4addf8ULL,  // k2: fold 512->256
+  0x00000000f20c0dfeULL,  // k3: fold 256->128
+  0x00000000493c7d27ULL   // k4: fold 256->128
+};
+
+// Barrett reduction constants for CRC32C finalization
+#define RV_CRC32C_CONST_0    0x00000000dd45aab8ULL  // x^64 mod P
+#define RV_CRC32C_CONST_1    0x00000000493c7d27ULL  // x^96 mod P
+#define RV_CRC32C_CONST_QUO  0x0000000dea713f1ULL   // floor(x^64 / P)
+#define RV_CRC32C_CONST_POLY 0x0000000105ec76f1ULL  // P(x) true LE full
+#define RV_CRC32_MASK32      0x00000000FFFFFFFFULL
+
+// Hardware-accelerated CRC32C using RISC-V Zbc carry-less multiplication.
+// Processes data in 64-byte chunks with 128-bit folding, then Barrett reduces.
+#if defined(__riscv_zbc)
+static uint32_t rv_crc32c_clmul(uint32_t crc, const char* buf, size_t len) {
+  // Convert external CRC to internal register state
+  crc ^= 0xFFFFFFFF;
+
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  size_t n = len;
+
+  // Small data: use bitwise fallback
+  if (n < 64) {
+    return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+  }
+
+  // Align to 16-byte boundary
+  uintptr_t mis = (uintptr_t)p & 0xF;
+  if (mis) {
+    size_t pre = 16 - mis;
+    if (pre > n) pre = n;
+    crc = rv_crc32c_bitwise(crc, p, pre);
+    p += pre;
+    n -= pre;
+    if (n < 64) {
+      return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+    }
+  }
+
+  // Load first 64 bytes and XOR CRC into the first 8 bytes
+  uint64_t x0, x1, y0, y1, z0, z1, w0, w1;
+  memcpy(&x0, p + 0, 8);
+  memcpy(&x1, p + 8, 8);
+  memcpy(&y0, p + 16, 8);
+  memcpy(&y1, p + 24, 8);
+  memcpy(&z0, p + 32, 8);
+  memcpy(&z1, p + 40, 8);
+  memcpy(&w0, p + 48, 8);
+  memcpy(&w1, p + 56, 8);
+
+  x0 ^= (uint64_t)crc;
+  p += 64;
+  n -= 64;
+
+  const uint64_t k1 = crc32c_fold_const[0];
+  const uint64_t k2 = crc32c_fold_const[1];
+  const uint64_t k3 = crc32c_fold_const[2];
+  const uint64_t k4 = crc32c_fold_const[3];
+
+  // Main loop: fold 64 bytes per iteration using 128-bit folding
+  while (n >= 64) {
+    uint64_t d0, d1;
+    memcpy(&d0, p + 0, 8);
+    memcpy(&d1, p + 8, 8);
+    rv_fold_pair_xor_data(&x0, &x1, k1, k2, d0, d1);
+    memcpy(&d0, p + 16, 8);
+    memcpy(&d1, p + 24, 8);
+    rv_fold_pair_xor_data(&y0, &y1, k1, k2, d0, d1);
+    memcpy(&d0, p + 32, 8);
+    memcpy(&d1, p + 40, 8);
+    rv_fold_pair_xor_data(&z0, &z1, k1, k2, d0, d1);
+    memcpy(&d0, p + 48, 8);
+    memcpy(&d1, p + 56, 8);
+    rv_fold_pair_xor_data(&w0, &w1, k1, k2, d0, d1);
+    p += 64;
+    n -= 64;
+  }
+
+  // Reduce 4x128-bit to 1x128-bit
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, y0, y1);
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, z0, z1);
+  rv_fold_pair_xor_state(&x0, &x1, k3, k4, w0, w1);
+
+  // Barrett reduction: 128-bit -> 32-bit CRC
+  uint64_t t4 = rv_clmul(x0, RV_CRC32C_CONST_1);
+  uint64_t t3 = rv_clmulh(x0, RV_CRC32C_CONST_1);
+  uint64_t t1 = x1 ^ t4;
+  t4 = t1 & RV_CRC32_MASK32;
+  t1 >>= 32;
+  uint64_t t0 = rv_clmul(t4, RV_CRC32C_CONST_0);
+  t3 = (t3 << 32) ^ t1 ^ t0;
+
+  t4 = t3 & RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_QUO);
+  t4 &= RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_POLY);
+  t4 ^= t3;
+
+  uint32_t c = (uint32_t)((t4 >> 32) & RV_CRC32_MASK32);
+  // Handle remaining bytes
+  if (n) {
+    c = rv_crc32c_bitwise(c, p, n);
+  }
+  // Convert internal register state to external CRC
+  return c ^ 0xFFFFFFFF;
+}
+#endif  // __riscv_zbc
+
+// Runtime detection: check if RISC-V CPU supports Zbc extension
+static bool is_zbc() {
+  static const bool zbc_supported = []() {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return false;
+    bool supported = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+      if (strstr(line, "isa") || strstr(line, "hart isa")) {
+        char* colon = strchr(line, ':');
+        if (colon) {
+          if (strstr(colon, "_zbc")) {
+            supported = true;
+            break;
+          }
+        }
+      }
+    }
+    fclose(f);
+    return supported;
+  }();
+  return zbc_supported;
+}
+
+#if defined(__riscv_zvbc)
+// Hardware-accelerated CRC32C using RISC-V Zvbc vector carry-less multiplication.
+// Uses RVV vclmul/vclmulh to process 2 lanes per vector operation (VLEN=128).
+// With VLEN=128, each vector register holds 2 x 64-bit elements.
+// 4 lanes are processed using 2 vector register pairs per clmul step.
+static uint32_t rv_crc32c_vclmul(uint32_t crc, const char* buf, size_t len) {
+  crc ^= 0xFFFFFFFF;
+
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  size_t n = len;
+
+  if (n < 64) {
+    return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+  }
+
+  // Align to 16-byte boundary
+  uintptr_t mis = (uintptr_t)p & 0xF;
+  if (mis) {
+    size_t pre = 16 - mis;
+    if (pre > n) pre = n;
+    crc = rv_crc32c_bitwise(crc, p, pre);
+    p += pre;
+    n -= pre;
+    if (n < 64) {
+      return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+    }
+  }
+
+  // Set up RVV for 64-bit elements: vl = min(VLEN/64, 2) = 2 for VLEN=128
+  // If VLEN < 128, vl will be 1 and the vector path cannot be used; fall back.
+  size_t vl = __riscv_vsetvl_e64m1(2);
+  if (vl < 2) {
+    return rv_crc32c_bitwise(crc, p, n) ^ 0xFFFFFFFF;
+  }
+
+  // Construct fold constant vectors: {k1, k2} and {k3, k4}
+  // Each element gets the appropriate constant for its position:
+  // element 0 (lo half) uses k1/k3, element 1 (hi half) uses k2/k4
+  uint64_t k12_arr[2] = { crc32c_fold_const[0], crc32c_fold_const[1] };
+  uint64_t k34_arr[2] = { crc32c_fold_const[2], crc32c_fold_const[3] };
+  vuint64m1_t k12_vec = __riscv_vle64_v_u64m1(k12_arr, vl);  // {k1, k2}
+  vuint64m1_t k34_vec = __riscv_vle64_v_u64m1(k34_arr, vl);  // {k3, k4}
+
+  // Load first 64 bytes into 4 vector registers.
+  // Each vector = one 128-bit lane: {lo_64, hi_64}
+  // Use memcpy to avoid strict-aliasing violations when loading uint8_t* as uint64_t*
+  uint64_t lane1_buf[2], lane2_buf[2], lane3_buf[2], lane4_buf[2];
+  memcpy(lane1_buf, p + 0,  16);
+  memcpy(lane2_buf, p + 16, 16);
+  memcpy(lane3_buf, p + 32, 16);
+  memcpy(lane4_buf, p + 48, 16);
+  vuint64m1_t lane1 = __riscv_vle64_v_u64m1(lane1_buf, vl);
+  vuint64m1_t lane2 = __riscv_vle64_v_u64m1(lane2_buf, vl);
+  vuint64m1_t lane3 = __riscv_vle64_v_u64m1(lane3_buf, vl);
+  vuint64m1_t lane4 = __riscv_vle64_v_u64m1(lane4_buf, vl);
+
+  // XOR CRC into element 0 of first lane
+  uint64_t tmp[2];
+  __riscv_vse64_v_u64m1(tmp, lane1, vl);
+  tmp[0] ^= (uint64_t)crc;
+  lane1 = __riscv_vle64_v_u64m1(tmp, vl);
+
+  p += 64;
+  n -= 64;
+
+  // Main loop: fold 64 bytes per iteration using vector carry-less multiply.
+  //
+  // For each 128-bit lane {lo, hi}, the fold computes:
+  //   new_lo = clmul(lo, k1) ^ clmul(hi, k2) ^ data_lo
+  //   new_hi = clmulh(lo, k1) ^ clmulh(hi, k2) ^ data_hi
+  //
+  // With k12_vec = {k1, k2} and element-wise vclmul:
+  //   vclmul(lane, k12_vec)  = {clmul(lo, k1), clmul(hi, k2)}   (lo halves of products)
+  //   vclmulh(lane, k12_vec) = {clmulh(lo, k1), clmulh(hi, k2)} (hi halves of products)
+  //
+  // The 128-bit XOR of (lo*k1) and (hi*k2) decomposes element-wise:
+  //   new_lo = clmul(lo,k1) ^ clmul(hi,k2) = vclmul[0] ^ vclmul[1]
+  //   new_hi = clmulh(lo,k1) ^ clmulh(hi,k2) = vclmulh[0] ^ vclmulh[1]
+  //
+  // So we need to XOR across elements. With VLEN=128 (2 elements), we use
+  // scalar extraction for the cross-element XOR since there's no vector
+  // permute instruction for just 2 elements that's more efficient.
+  while (n >= 64) {
+    uint64_t d1_buf[2], d2_buf[2], d3_buf[2], d4_buf[2];
+    memcpy(d1_buf, p + 0,  16);
+    memcpy(d2_buf, p + 16, 16);
+    memcpy(d3_buf, p + 32, 16);
+    memcpy(d4_buf, p + 48, 16);
+    vuint64m1_t d1 = __riscv_vle64_v_u64m1(d1_buf, vl);
+    vuint64m1_t d2 = __riscv_vle64_v_u64m1(d2_buf, vl);
+    vuint64m1_t d3 = __riscv_vle64_v_u64m1(d3_buf, vl);
+    vuint64m1_t d4 = __riscv_vle64_v_u64m1(d4_buf, vl);
+
+    // Fold each lane using vector clmul with {k1, k2}
+    uint64_t lo_r[2], hi_r[2], d_r[2];
+
+    // Lane 1
+    __riscv_vse64_v_u64m1(lo_r, __riscv_vclmul_vv_u64m1(lane1, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(hi_r, __riscv_vclmulh_vv_u64m1(lane1, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(d_r, d1, vl);
+    d_r[0] ^= lo_r[0] ^ lo_r[1];
+    d_r[1] ^= hi_r[0] ^ hi_r[1];
+    lane1 = __riscv_vle64_v_u64m1(d_r, vl);
+
+    // Lane 2
+    __riscv_vse64_v_u64m1(lo_r, __riscv_vclmul_vv_u64m1(lane2, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(hi_r, __riscv_vclmulh_vv_u64m1(lane2, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(d_r, d2, vl);
+    d_r[0] ^= lo_r[0] ^ lo_r[1];
+    d_r[1] ^= hi_r[0] ^ hi_r[1];
+    lane2 = __riscv_vle64_v_u64m1(d_r, vl);
+
+    // Lane 3
+    __riscv_vse64_v_u64m1(lo_r, __riscv_vclmul_vv_u64m1(lane3, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(hi_r, __riscv_vclmulh_vv_u64m1(lane3, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(d_r, d3, vl);
+    d_r[0] ^= lo_r[0] ^ lo_r[1];
+    d_r[1] ^= hi_r[0] ^ hi_r[1];
+    lane3 = __riscv_vle64_v_u64m1(d_r, vl);
+
+    // Lane 4
+    __riscv_vse64_v_u64m1(lo_r, __riscv_vclmul_vv_u64m1(lane4, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(hi_r, __riscv_vclmulh_vv_u64m1(lane4, k12_vec, vl), vl);
+    __riscv_vse64_v_u64m1(d_r, d4, vl);
+    d_r[0] ^= lo_r[0] ^ lo_r[1];
+    d_r[1] ^= hi_r[0] ^ hi_r[1];
+    lane4 = __riscv_vle64_v_u64m1(d_r, vl);
+
+    p += 64;
+    n -= 64;
+  }
+
+  // Reduce 4 lanes to 1 using {k3, k4}
+  // Same fold pattern: fold lane_a into lane_b
+  #define FOLD_INTO(dst, src) do { \
+    uint64_t _lo[2], _hi[2], _d[2]; \
+    __riscv_vse64_v_u64m1(_lo, __riscv_vclmul_vv_u64m1(src, k34_vec, vl), vl); \
+    __riscv_vse64_v_u64m1(_hi, __riscv_vclmulh_vv_u64m1(src, k34_vec, vl), vl); \
+    __riscv_vse64_v_u64m1(_d, dst, vl); \
+    _d[0] ^= _lo[0] ^ _lo[1]; \
+    _d[1] ^= _hi[0] ^ _hi[1]; \
+    dst = __riscv_vle64_v_u64m1(_d, vl); \
+  } while(0)
+
+  FOLD_INTO(lane2, lane1);  // lane2 = fold(lane1) ^ lane2
+  FOLD_INTO(lane3, lane2);  // lane3 = fold(lane2) ^ lane3
+  FOLD_INTO(lane4, lane3);  // lane4 = fold(lane3) ^ lane4
+  #undef FOLD_INTO
+
+  // Extract final 128-bit state from vector register
+  uint64_t final_state[2];
+  __riscv_vse64_v_u64m1(final_state, lane4, vl);
+  uint64_t x0 = final_state[0];
+  uint64_t x1 = final_state[1];
+
+  // Barrett reduction: 128-bit -> 32-bit CRC (scalar)
+  uint64_t t4 = rv_clmul(x0, RV_CRC32C_CONST_1);
+  uint64_t t3 = rv_clmulh(x0, RV_CRC32C_CONST_1);
+  uint64_t t1 = x1 ^ t4;
+  t4 = t1 & RV_CRC32_MASK32;
+  t1 >>= 32;
+  uint64_t t0 = rv_clmul(t4, RV_CRC32C_CONST_0);
+  t3 = (t3 << 32) ^ t1 ^ t0;
+
+  t4 = t3 & RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_QUO);
+  t4 &= RV_CRC32_MASK32;
+  t4 = rv_clmul(t4, RV_CRC32C_CONST_POLY);
+  t4 ^= t3;
+
+  uint32_t c = (uint32_t)((t4 >> 32) & RV_CRC32_MASK32);
+  if (n) {
+    c = rv_crc32c_bitwise(c, p, n);
+  }
+  return c ^ 0xFFFFFFFF;
+}
+
+// Runtime detection: check if RISC-V CPU supports Zvbc extension
+static bool is_zvbc() {
+  static const bool zvbc_supported = []() {
+    FILE* f = fopen("/proc/cpuinfo", "r");
+    if (!f) return false;
+    bool supported = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+      if (strstr(line, "isa") || strstr(line, "hart isa")) {
+        char* colon = strchr(line, ':');
+        if (colon) {
+          if (strstr(colon, "_zvbc")) {
+            supported = true;
+            break;
+          }
+        }
+      }
+    }
+    fclose(f);
+    return supported;
+  }();
+  return zvbc_supported;
+}
+#endif  // __riscv_zvbc
+
+#endif  // __riscv && __riscv_xlen == 64 && (__riscv_zbc || __riscv_zvbc)
+
+// Detect if SSE4.2 or not.
+#ifdef __SSE4_2__
 static bool isSSE42() {
 #if defined(__GNUC__) && defined(__x86_64__) && !defined(IOS_CROSS_COMPILE)
   uint32_t c_;
@@ -432,20 +826,44 @@ static bool isSSE42() {
   return false;
 #endif
 }
+#endif
 
 typedef uint32_t (*Function)(uint32_t, const char*, size_t);
 
 static inline Function Choose_Extend() {
-  return isSSE42() ? (Function)ExtendImpl<FastCRC32Functor> : 
-                    (Function)ExtendImpl<SlowCRC32Functor>;
+#ifdef __SSE4_2__
+  if (isSSE42()) {
+    return (Function)ExtendImpl<FastCRC32Functor>;
+  }
+#endif
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#if defined(__riscv_zvbc)
+  if (is_zvbc()) {
+    return (Function)rv_crc32c_vclmul;
+  }
+#endif
+#if defined(__riscv_zbc)
+  if (is_zbc()) {
+    return (Function)rv_crc32c_clmul;
+  }
+#endif
+#endif
+  return (Function)ExtendImpl<SlowCRC32Functor>;
 }
 
 bool IsFastCrc32Supported() {
 #ifdef __SSE4_2__
-  return isSSE42();
-#else
-  return false;
+  if (isSSE42()) return true;
 #endif
+#if defined(__riscv) && (__riscv_xlen == 64) && (defined(__riscv_zbc) || defined(__riscv_zvbc))
+#if defined(__riscv_zvbc)
+  if (is_zvbc()) return true;
+#endif
+#if defined(__riscv_zbc)
+  if (is_zbc()) return true;
+#endif
+#endif
+  return false;
 }
 
 uint32_t Extend(uint32_t crc, const char* buf, size_t size) {

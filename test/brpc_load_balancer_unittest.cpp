@@ -174,8 +174,8 @@ void DBDMultiBthread() {
     }
 
     // Modify during reading.
-    int64_t start = butil::gettimeofday_ms();
-    while (butil::gettimeofday_ms() - start < 10 * 1000) {
+    int64_t start = butil::cpuwide_time_ms();
+    while (butil::cpuwide_time_ms() - start < 10 * 1000) {
         d.Modify(AddN, 1);
         typename DBD::ScopedPtr ptr;
         d.Read(&ptr);
@@ -277,9 +277,9 @@ void PerfTest(int thread_num, bool modify_during_reading) {
     ProfilerStart(prof_name);
     int64_t run_ms = 5 * 1000;
     if (modify_during_reading) {
-        int64_t start = butil::gettimeofday_ms();
+        int64_t start = butil::cpuwide_time_ms();
         int i = 1;
-        while (butil::gettimeofday_ms() - start < run_ms) {
+        while (butil::cpuwide_time_ms() - start < run_ms) {
             ASSERT_TRUE(dbd.Modify(AddMapN, i++));
             usleep(1000);
         }
@@ -911,9 +911,11 @@ TEST_F(LoadBalancerTest, weighted_round_robin_no_valid_server) {
         brpc::ServerId id(8888);
         brpc::SocketOptions options;
         options.remote_side = dummy;
-        options.user = new SaveRecycle;
         id.tag = weight[i];
         if (i < 2) {
+            // `user` is owned by the Socket; only allocate it when a Socket is
+            // actually created, otherwise it would leak.
+            options.user = new SaveRecycle;
             ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
         }
         EXPECT_TRUE(wrrlb.AddServer(id));
@@ -1107,14 +1109,14 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
         "10.92.115.19:8832",
         "10.42.122.201:8833",
     };
-    brpc::LoadBalancer* lb = NULL;
+    std::unique_ptr<brpc::LoadBalancer> lb;
     int rand = butil::fast_rand_less_than(2);
     if (rand == 0) {
         brpc::policy::RandomizedLoadBalancer rlb;
-        lb = rlb.New("min_working_instances=2 hold_seconds=2");
+        lb.reset(rlb.New("min_working_instances=2 hold_seconds=2"));
     } else if (rand == 1) {
         brpc::policy::RoundRobinLoadBalancer rrlb;
-        lb = rrlb.New("min_working_instances=2 hold_seconds=2");
+        lb.reset(rrlb.New("min_working_instances=2 hold_seconds=2"));
     }
     brpc::SocketUniquePtr ptr[2];
     for (size_t i = 0; i < ARRAY_SIZE(servers); ++i) {
@@ -1146,10 +1148,17 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
         dummy_ptr->Revive(2);
     }
     bthread_usleep(brpc::FLAGS_detect_available_server_interval_ms * 1000);
-    // After one server is revived, the reject rate should be 50%
+    // After one server is revived, the reject rate should be ~50%.
+    // This is a statistical assertion, so use a large number of
+    // samples to make the fluctuation negligible, otherwise it may
+    // flake. With n samples and p=0.5, the std of (num_ereject - num_ok)
+    // is sqrt(n); allowing a deviation of 20% of n keeps the test
+    // meaningful (~45%-55%) while making a false failure practically
+    // impossible (>6 sigma).
     int num_ereject = 0;
     int num_ok = 0;
-    for (int i = 0; i < 100; ++i) {
+    int num_sample = 1000;
+    for (int i = 0; i < num_sample; ++i) {
         int rc = lb->SelectServer(in, &out);
         if (rc == brpc::EREJECT) {
             num_ereject++;
@@ -1159,7 +1168,7 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_sanity) {
             ASSERT_TRUE(false);
         }
     }
-    ASSERT_TRUE(abs(num_ereject - num_ok) < 30);
+    ASSERT_LT(abs(num_ereject - num_ok), num_sample / 5);
     bthread_usleep((2000 /* hold_seconds */ + 10) * 1000);
 
     // After enough waiting time, traffic should be sent to all available servers.
@@ -1276,8 +1285,8 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     ASSERT_EQ(0, server2.AddService(&service2, brpc::SERVER_DOESNT_OWN_SERVICE));
     ASSERT_EQ(0, server2.Start(point2, NULL));
     
-    int64_t start_ms = butil::gettimeofday_ms();
-    while ((butil::gettimeofday_ms() - start_ms) < 3500) {
+    int64_t start_ms = butil::cpuwide_time_ms();
+    while ((butil::cpuwide_time_ms() - start_ms) < 3500) {
         Done* done = new Done;
         done->req.set_message("123");
         stub.Echo(&done->cntl, &done->req, &done->res, done);
@@ -1302,6 +1311,83 @@ TEST_F(LoadBalancerTest, revived_from_all_failed_intergrated) {
     ASSERT_EQ(0, num_failed.load(butil::memory_order_relaxed));
 }
 #endif // BUTIL_USE_ASAN
+
+// Regression for #3268's incomplete migration of LocalityAwareLoadBalancer.
+//
+// #3268 switched `LocalityAwareLoadBalancer::Weight::Update::end_time_us` and
+// `LocalityAwareLoadBalancer::Describe::now` to `butil::cpuwide_time_us()`
+// while every caller that supplies `CallInfo::begin_time_us` (the RPC entry
+// in `Channel::CallMethod` and the retry sites in
+// `Controller::OnVersionedRPCReturned`) still uses `butil::gettimeofday_us()`.
+// The resulting time-source mismatch makes
+//
+//     latency = end_time_us - ci.begin_time_us
+//             = cpuwide_now - wallclock_begin
+//             ~= -1.7e15 us  (huge negative)
+//
+// trigger the
+//
+//     if (latency <= 0) { /* time skews, ignore the sample */ return 0; }
+//
+// short-circuit on every call. `_time_q` never accumulates samples,
+// `_avg_latency` stays at 0, and locality-aware weight feedback is silently
+// disabled. Visible downstream symptom: cold-start `list://` channels with
+// `lb=la` and 2 backends occasionally fail RPCs with `EHOSTDOWN`
+// ("Fail to select server") on retry even when one backend is healthy.
+//
+// This commit reverts the LA side of #3268, so `Weight::Update` and
+// `Describe` once again use `butil::gettimeofday_us()` to match every
+// existing caller of `CallInfo::begin_time_us`.
+//
+// The test below runs entirely against `LocalityAwareLoadBalancer` (no
+// Server / Channel is involved), so it is hermetic. It supplies a
+// gettimeofday-based `begin_time_us` (matching what `Channel::CallMethod`
+// passes today) and asserts that the LB records a positive `_avg_latency`,
+// rather than tripping the time-skew short-circuit.
+TEST_F(LoadBalancerTest, la_records_latency_with_consistent_time_source) {
+    LALB lalb;
+    char addr[] = "192.168.1.1:8080";
+    butil::EndPoint dummy;
+    ASSERT_EQ(0, str2endpoint(addr, &dummy));
+    brpc::ServerId id(8888);
+    brpc::SocketOptions options;
+    options.remote_side = dummy;
+    ASSERT_EQ(0, brpc::Socket::Create(options, &id.id));
+    ASSERT_TRUE(lalb.AddServer(id));
+
+    auto avg_latency = [&]() -> int64_t {
+        std::ostringstream os;
+        brpc::DescribeOptions opts;
+        opts.verbose = true;
+        lalb.Describe(os, opts);
+        const std::string s = os.str();
+        const size_t p = s.find("avg_latency=");
+        if (p == std::string::npos) return -1;
+        return strtoll(s.c_str() + p + strlen("avg_latency="), NULL, 10);
+    };
+
+    // Drive a few "RPCs": pick a server, sleep ~2ms, feed back. begin_time_us
+    // comes from gettimeofday_us(), matching what Channel::CallMethod and the
+    // retry sites in Controller::OnVersionedRPCReturned pass on every RPC.
+    for (int i = 0; i < 8; ++i) {
+        const int64_t begin_us = butil::gettimeofday_us();
+        brpc::SocketUniquePtr ptr;
+        brpc::LoadBalancer::SelectIn in = { begin_us, true, false, 0u, NULL };
+        brpc::LoadBalancer::SelectOut out(&ptr);
+        ASSERT_EQ(0, lalb.SelectServer(in, &out));
+        bthread_usleep(2000);
+        brpc::LoadBalancer::CallInfo ci = { begin_us, id.id, 0, NULL };
+        lalb.Feedback(ci);
+    }
+
+    // _avg_latency must reflect actual elapsed time. If this is 0, either
+    // Weight::Update::end_time_us was changed away from gettimeofday_us
+    // again (re-introducing the time-source mismatch) or some caller of
+    // CallInfo::begin_time_us drifted to a different clock domain.
+    EXPECT_GT(avg_latency(), 0);
+
+    ASSERT_EQ(0, brpc::Socket::SetFailed(id.id));
+}
 
 TEST_F(LoadBalancerTest, la_selection_too_long) {
     brpc::GlobalInitializeOrDie();

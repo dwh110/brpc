@@ -30,8 +30,9 @@ class Message;
 }
 }
 
-
 namespace brpc {
+
+class Span;
 
 class AuthContext;
 
@@ -90,20 +91,23 @@ public:
         return *this;
     }
 
-    ControllerPrivateAccessor &set_span(Span* span) {
-        _cntl->_span = span;
-        return *this;
-    }
+    // Overloaded set_span methods to support both shared_ptr and raw pointer
+    ControllerPrivateAccessor &set_span(const std::shared_ptr<Span>& span);
+    ControllerPrivateAccessor &set_span(Span* span);
     
     ControllerPrivateAccessor &set_request_protocol(ProtocolType protocol) {
         _cntl->_request_protocol = protocol;
         return *this;
     }
     
-    Span* span() const { return _cntl->_span; }
+    std::shared_ptr<Span> span() const;
 
     uint32_t pipelined_count() const { return _cntl->_pipelined_count; }
     void set_pipelined_count(uint32_t count) {  _cntl->_pipelined_count = count; }
+
+    // The mysql protocol stores its statement type (MYSQL_NORMAL_STATEMENT /
+    // MYSQL_PREPARED_STATEMENT) in the pipelined_count slot.
+    void set_mysql_statement_type(uint32_t type) { set_pipelined_count(type); }
 
     ControllerPrivateAccessor& set_server(const Server* server) {
         _cntl->_server = server;
@@ -133,6 +137,22 @@ public:
     }
 
     void clear_auth_flags() { _cntl->_auth_flags = 0; }
+
+    // Set how the sending socket is reserved after the RPC (mysql transactions).
+    void set_bind_sock_action(BindSockAction action) { _cntl->set_bind_sock_action(action); }
+    // Transfer ownership of the reserved socket to `ptr`.
+    void get_bind_sock(SocketUniquePtr* ptr) {
+        if (_cntl->_bind_sock) {
+            _cntl->_bind_sock->ReAddress(ptr);
+        }
+    }
+    // Reuse an externally-reserved socket for the next RPC.
+    void use_bind_sock(SocketId sock_id) {
+        _cntl->set_bind_sock_action(BIND_SOCK_USE);
+        Socket::Address(sock_id, &_cntl->_bind_sock);
+    }
+    void set_session_data(void* d) { _cntl->_session_data = d; }
+    void* session_data() const { return _cntl->_session_data; }
 
     std::string& protocol_param() { return _cntl->protocol_param(); }
     const std::string& protocol_param() const { return _cntl->protocol_param(); }

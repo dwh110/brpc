@@ -35,6 +35,7 @@
 #include "brpc/channel.h"
 #include "brpc/socket_map.h"
 #include "brpc/controller.h"
+#include "brpc/details/ssl_helper.h"
 #include "echo.pb.h"
 
 namespace brpc {
@@ -311,6 +312,11 @@ TEST_F(SSLTest, connect_on_create) {
         brpc::Join(correlation_id);
         ASSERT_EQ(EXP_RESPONSE, res.message());
     }
+
+    ptr->SetFailed();
+    ptr.reset();
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
 }
 
 void CheckCert(const char* cname, const char* cert) {
@@ -333,6 +339,7 @@ void CheckCert(const char* cname, const char* cert) {
     std::vector<std::string> cnames;
     brpc::ExtractHostnames(x509, &cnames);
     ASSERT_EQ(cert, cnames[0]) << x509;
+    X509_free(x509);
 }
 
 std::string GetRawPemString(const char* fname) {
@@ -489,6 +496,76 @@ TEST_F(SSLTest, ssl_perf) {
     ASSERT_EQ(0, pthread_create(&spid, NULL, ssl_perf_server , serv_ssl));
     ASSERT_EQ(0, pthread_join(cpid, NULL));
     ASSERT_EQ(0, pthread_join(spid, NULL));
+
+    SSL_free(cli_ssl);
+    SSL_free(serv_ssl);
+    SSL_CTX_free(cli_ctx);
+    SSL_CTX_free(serv_ctx);
     close(clifd);
     close(servfd);
 }
+
+
+#ifdef TLS1_3_VERSION
+
+void* tls13_do_handshake(void* arg) {
+    SSL* ssl = (SSL*)arg;
+    EXPECT_EQ(1, SSL_do_handshake(ssl));
+    return NULL;
+}
+
+TEST_F(SSLTest, tls13_protocol_string) {
+    // Same style as ssl_perf: direct SSL handshake, no SocketMap / socket internals.
+    const butil::EndPoint ep(butil::IP_ANY, 8613);
+    butil::fd_guard listenfd(butil::tcp_listen(ep));
+    ASSERT_GT(listenfd, 0);
+    int clifd = tcp_connect(ep, NULL);
+    ASSERT_GT(clifd, 0);
+    int servfd = accept(listenfd, NULL, NULL);
+    ASSERT_GT(servfd, 0);
+
+    brpc::ChannelSSLOptions opt;
+    opt.protocols = "TLSv1.3";
+    SSL_CTX* cli_ctx = brpc::CreateClientSSLContext(opt);
+    ASSERT_NE(nullptr, cli_ctx);
+    SSL_CTX* serv_ctx =
+            brpc::CreateServerSSLContext("cert1.crt", "cert1.key",
+                                         brpc::SSLOptions(), NULL, NULL);
+    ASSERT_NE(nullptr, serv_ctx);
+    SSL* cli_ssl = brpc::CreateSSLSession(cli_ctx, 0, clifd, false);
+#if defined(SSL_CTRL_SET_TLSEXT_HOSTNAME) || defined(USE_MESALINK)
+    SSL_set_tlsext_host_name(cli_ssl, "localhost");
+#endif
+    SSL* serv_ssl = brpc::CreateSSLSession(serv_ctx, 0, servfd, true);
+    ASSERT_NE(nullptr, cli_ssl);
+    ASSERT_NE(nullptr, serv_ssl);
+    pthread_t cpid;
+    pthread_t spid;
+    ASSERT_EQ(0, pthread_create(&cpid, NULL, tls13_do_handshake, cli_ssl));
+    ASSERT_EQ(0, pthread_create(&spid, NULL, tls13_do_handshake, serv_ssl));
+    ASSERT_EQ(0, pthread_join(cpid, NULL));
+    ASSERT_EQ(0, pthread_join(spid, NULL));
+
+    const char* version = SSL_get_version(cli_ssl);
+    ASSERT_TRUE(version != NULL);
+    EXPECT_STREQ("TLSv1.3", version) << "negotiated protocol=" << version;
+
+    SSL_free(cli_ssl);
+    SSL_free(serv_ssl);
+    SSL_CTX_free(cli_ctx);
+    SSL_CTX_free(serv_ctx);
+    close(clifd);
+    close(servfd);
+}
+
+#else  // TLS1_3_VERSION
+
+TEST_F(SSLTest, tls13_protocol_string) {
+    brpc::ChannelSSLOptions opt;
+    opt.protocols = "TLSv1.3";
+    SSL_CTX* ctx = brpc::CreateClientSSLContext(opt);
+    ASSERT_TRUE(ctx != NULL);
+    SSL_CTX_free(ctx);
+}
+
+#endif  // TLS1_3_VERSION

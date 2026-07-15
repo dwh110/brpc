@@ -135,6 +135,7 @@ public:
     Sender(Controller* cntl,
            const google::protobuf::Message* request,
            google::protobuf::Message* response,
+           const butil::intrusive_ptr<SharedLoadBalancer>& lb,
            google::protobuf::Closure* user_done);
     ~Sender() { Clear(); }
     int IssueRPC(int64_t start_realtime_us);
@@ -148,6 +149,7 @@ private:
     Controller* _main_cntl;
     const google::protobuf::Message* _request;
     google::protobuf::Message* _response;
+    butil::intrusive_ptr<SharedLoadBalancer> _lb;
     google::protobuf::Closure* _user_done;
     short _nfree;
     short _nalloc;
@@ -293,10 +295,12 @@ void ChannelBalancer::Describe(std::ostream& os,
 Sender::Sender(Controller* cntl,
                const google::protobuf::Message* request,
                google::protobuf::Message* response,
+               const butil::intrusive_ptr<SharedLoadBalancer>& lb,
                google::protobuf::Closure* user_done)
     : _main_cntl(cntl)
     , _request(request)
     , _response(response)
+    , _lb(lb)
     , _user_done(user_done)
     , _nfree(0)
     , _nalloc(0)
@@ -306,14 +310,20 @@ Sender::Sender(Controller* cntl,
 
 int Sender::IssueRPC(int64_t start_realtime_us) {
     _main_cntl->_current_call.need_feedback = false;
+    ChannelBalancer* balancer =
+        static_cast<ChannelBalancer*>(_lb.get());
+    if (balancer == NULL) {
+        _main_cntl->SetFailed(ECANCELED,
+                              "SelectiveChannel balancer is unavailable");
+        return -1;
+    }
     LoadBalancer::SelectIn sel_in = { start_realtime_us,
                                       true,
                                       _main_cntl->has_request_code(),
                                       _main_cntl->_request_code,
                                       _main_cntl->_accessed };
     ChannelBalancer::SelectOut sel_out;
-    const int rc = static_cast<ChannelBalancer*>(_main_cntl->_lb.get())
-        ->SelectChannel(sel_in, &sel_out);
+    const int rc = balancer->SelectChannel(sel_in, &sel_out);
     if (rc != 0) {
         _main_cntl->SetFailed(rc, "Fail to select channel, %s", berror(rc));
         return -1;
@@ -344,13 +354,13 @@ int Sender::IssueRPC(int64_t start_realtime_us) {
     sub_cntl->set_request_code(_main_cntl->request_code());
     // Forward request attachment to the subcall
     sub_cntl->request_attachment().append(_main_cntl->request_attachment());
-    sub_cntl->http_request() = _main_cntl->http_request();
+    ProtocolType protocol = _main_cntl->request_protocol();
+    if (PROTOCOL_HTTP == protocol || PROTOCOL_H2 == protocol) {
+        sub_cntl->http_request() = _main_cntl->http_request();
+    }
 
-    sel_out.channel()->CallMethod(_main_cntl->_method,
-                                  &r.sub_done->_cntl,
-                                  _request,
-                                  r.response,
-                                  r.sub_done);
+    sel_out.channel()->CallMethod(_main_cntl->_method, &r.sub_done->_cntl,
+                                  _request, r.response, r.sub_done);
     return 0;
 }
 
@@ -364,12 +374,6 @@ void SubDone::Run() {
                    << _cid.value << ": " << berror(rc);
         return;
     }
-    // NOTE: Copying gettable-but-settable fields which are generally set
-    // during the RPC to reflect details.
-    main_cntl->_remote_side = _cntl._remote_side;
-    // connection_type may be changed during CallMethod. 
-    main_cntl->set_connection_type(_cntl.connection_type());
-    main_cntl->response_attachment().swap(_cntl.response_attachment());
     Resource r;
     r.response = _cntl._response;
     r.sub_done = this;
@@ -377,6 +381,13 @@ void SubDone::Run() {
         return;
     }
     const int saved_error = main_cntl->ErrorCode();
+
+    // NOTE: Copying gettable-but-settable fields which are generally set
+    // during the RPC to reflect details.
+    main_cntl->_remote_side = _cntl._remote_side;
+    // connection_type may be changed during CallMethod. 
+    main_cntl->set_connection_type(_cntl.connection_type());
+    main_cntl->response_attachment().swap(_cntl.response_attachment());
     
     if (_cntl.Failed()) {
         if (_cntl.ErrorCode() == ENODATA || _cntl.ErrorCode() == EHOSTDOWN) {
@@ -418,11 +429,16 @@ void Sender::Clear() {
     if (_main_cntl == NULL) {
         return;
     }
-    delete _alloc_resources[1].response;
-    delete _alloc_resources[1].sub_done;
-    _alloc_resources[1] = Resource();
+    for (int i = 0; i < _nalloc; ++i) {
+        delete _alloc_resources[i].response;
+        if (_alloc_resources[i].sub_done != &_sub_done0) {
+            delete _alloc_resources[i].sub_done;
+        }
+        _alloc_resources[i] = Resource();
+    }
     const CallId cid = _main_cntl->call_id();
     _main_cntl = NULL;
+    _lb.reset(NULL);
     if (_user_done) {
         _user_done->Run();
     }
@@ -433,7 +449,7 @@ inline Resource Sender::PopFree() {
     if (_nfree == 0) {
         if (_nalloc == 0) {
             Resource r;
-            r.response = _response;
+            r.response = _response->New();
             r.sub_done = &_sub_done0;
             _alloc_resources[_nalloc++] = r;
             return r;
@@ -569,8 +585,15 @@ void SelectiveChannel::CallMethod(
     if (!initialized()) {
         cntl->SetFailed(EINVAL, "SelectiveChannel=%p is not initialized yet",
                         this);
+        // This is a branch only entered by wrongly-used RPC, just call done
+        // in-place. See comments in channel.cpp on deadlock concerns.
+        if (user_done) {
+            user_done->Run();
+        }
+        return;
     }
-    schan::Sender* sndr = new schan::Sender(cntl, request, response, user_done);
+    schan::Sender* sndr =
+        new schan::Sender(cntl, request, response, _chan._lb, user_done);
     cntl->_sender = sndr;
     cntl->add_flag(Controller::FLAGS_DESTROY_CID_IN_DONE);
     const CallId cid = cntl->call_id();

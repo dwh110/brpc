@@ -19,12 +19,15 @@
 #ifndef BRPC_EVENT_DISPATCHER_H
 #define BRPC_EVENT_DISPATCHER_H
 
+#include <gflags/gflags_declare.h>          // DECLARE_bool
 #include "butil/macros.h"                     // DISALLOW_COPY_AND_ASSIGN
 #include "bthread/types.h"                   // bthread_t, bthread_attr_t
 #include "brpc/versioned_ref_with_id.h"
 
 
 namespace brpc {
+
+DECLARE_bool(event_dispatcher_edisp_unsched);
 
 // Unique identifier of a IOEventData.
 // Users shall store EventDataId instead of EventData and call EventData::Address()
@@ -87,8 +90,9 @@ namespace rdma {
 class RdmaEndpoint;
 }
 
-// Dispatch edge-triggered events of file descriptors to consumers
-// running in separate bthreads.
+// Dispatch edge-triggered events of file descriptors to consumers.
+// By default callbacks run in spawned bthreads; when usercode-in-coroutine is
+// enabled, the callback may run inline in the current coroutine.
 class EventDispatcher {
 friend class Socket;
 friend class rdma::RdmaEndpoint;
@@ -109,6 +113,8 @@ public:
 
     // Stop bthread of this dispatcher.
     void Stop();
+
+    void set_priority_index(int idx) { _priority_index = idx; }
 
     // Suspend calling thread until bthread of this dispatcher stops.
     void Join();
@@ -184,9 +190,16 @@ private:
 
     // Pipe fds to wakeup EventDispatcher from `epoll_wait' in order to quit
     int _wakeup_fds[2];
+
+    int _priority_index{-1};
 };
 
 EventDispatcher& GetGlobalEventDispatcher(int fd, bthread_tag_t tag);
+
+// Unified unsched switch for transport layer.
+// false -> urgent start (foreground scheduling before caller continues),
+// true  -> background start (allowing schedule away).
+bool EventDispatcherUnsched();
 
 // IOEvent class manages the IO events of a file descriptor conveniently.
 template <typename T>

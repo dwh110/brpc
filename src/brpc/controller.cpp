@@ -183,9 +183,10 @@ static void CreateIgnoreAllRead() { s_ignore_all_read = new IgnoreAllRead; }
 // you don't have to set the fields to initial state after deletion since
 // they'll be set uniformly after this method is called.
 void Controller::ResetNonPods() {
-    if (_span) {
-        Span::Submit(_span, butil::cpuwide_time_us());
+    if (auto span = _span.lock()) {
+        Span::Submit(span, butil::cpuwide_time_us());
     }
+    _span.reset();
     _error_text.clear();
     _remote_side = butil::EndPoint();
     _local_side = butil::EndPoint();
@@ -231,6 +232,7 @@ void Controller::ResetNonPods() {
         _rpa.reset(NULL);
     }
     delete _remote_stream_settings;
+    _bind_sock.reset();
     _thrift_method_name.clear();
     _after_rpc_resp_fn = nullptr;
 
@@ -240,7 +242,6 @@ void Controller::ResetNonPods() {
 void Controller::ResetPods() {
     // NOTE: Make the sequence of assignments same with the order that they're
     // defined in header. Better for cpu cache and faster for lookup.
-    _span = NULL;
     _flags = 0;
 #ifndef BAIDU_INTERNAL
     set_pb_bytes_to_base64(true);
@@ -297,6 +298,7 @@ void Controller::ResetPods() {
     _request_streams.clear();
     _response_streams.clear();
     _remote_stream_settings = NULL;
+    _session_data = NULL;
     _auth_flags = 0;
     _rpc_received_us = 0;
 }
@@ -308,6 +310,8 @@ Controller::Call::Call(Controller::Call* rhs)
     , peer_id(rhs->peer_id)
     , begin_time_us(rhs->begin_time_us)
     , sending_sock(rhs->sending_sock.release())
+    // A backup/retry call never inherits the source call's bind-sock affinity.
+    , bind_sock_action(BIND_SOCK_NONE)
     , stream_user_data(rhs->stream_user_data) {
     // NOTE: fields in rhs should be reset because RPC could fail before
     // setting all the fields to next call and _current_call.OnComplete
@@ -328,6 +332,7 @@ void Controller::Call::Reset() {
     peer_id = INVALID_SOCKET_ID;
     begin_time_us = 0;
     sending_sock.reset(NULL);
+    bind_sock_action = BIND_SOCK_NONE;
     stream_user_data = NULL;
 }
 
@@ -351,8 +356,16 @@ void Controller::set_backup_request_ms(int64_t timeout_ms) {
 }
 
 int64_t Controller::backup_request_ms() const {
-    int timeout_ms = NULL != _backup_request_policy ?
-        _backup_request_policy->GetBackupRequestMs(this) : _backup_request_ms;
+    int timeout_ms = _backup_request_ms;
+    if (NULL != _backup_request_policy) {
+        const int32_t policy_ms = _backup_request_policy->GetBackupRequestMs(this);
+        // -1 is the designated sentinel: the policy defers to the channel-level
+        // backup_request_ms (set from ChannelOptions). Any other negative value
+        // disables backup for this RPC. Values >= 0 override directly.
+        if (policy_ms != -1) {
+            timeout_ms = policy_ms;
+        }
+    }
     if (timeout_ms > 0x7fffffff) {
         timeout_ms = 0x7fffffff;
         LOG(WARNING) << "backup_request_ms is limited to 0x7fffffff (roughly 24 days)";
@@ -450,9 +463,9 @@ void Controller::SetFailed(const std::string& reason) {
         AppendServerIdentiy();
     }
     _error_text.append(reason);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->Annotate(reason);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->Annotate(reason);
     }
     UpdateResponseHeader(this);
 }
@@ -479,9 +492,9 @@ void Controller::SetFailed(int error_code, const char* reason_fmt, ...) {
     va_start(ap, reason_fmt);
     butil::string_vappendf(&_error_text, reason_fmt, ap);
     va_end(ap);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->AnnotateCStr(_error_text.c_str() + old_size, 0);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->AnnotateCStr(_error_text.c_str() + old_size, 0);
     }
     UpdateResponseHeader(this);
 }
@@ -507,9 +520,9 @@ void Controller::CloseConnection(const char* reason_fmt, ...) {
     va_start(ap, reason_fmt);
     butil::string_vappendf(&_error_text, reason_fmt, ap);
     va_end(ap);
-    if (_span) {
-        _span->set_error_code(_error_code);
-        _span->AnnotateCStr(_error_text.c_str() + old_size, 0);
+    if (auto span = _span.lock()) {
+        span->set_error_code(_error_code);
+        span->AnnotateCStr(_error_text.c_str() + old_size, 0);
     }
     UpdateResponseHeader(this);
 }
@@ -611,6 +624,16 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
             _unfinished_call = NULL;
         }
         // Ignore all non-backup requests and failed backup requests.
+        _error_code = saved_error;
+        response_attachment().clear();
+        CHECK_EQ(0, bthread_id_unlock(info.id));
+        return;
+    }
+
+    if (is_ending_rpc()) {
+        // SelectiveChannel may still deliver late SubDone callbacks after the
+        // main RPC has entered EndRPC(). Ignore those callbacks instead of
+        // letting them re-enter retry/backup on partially torn-down state.
         _error_code = saved_error;
         response_attachment().clear();
         CHECK_EQ(0, bthread_id_unlock(info.id));
@@ -816,7 +839,13 @@ void Controller::Call::OnComplete(
         // assumption that one pooled connection cannot have more than one
         // message at the same time.
         if (sending_sock != NULL && (error_code == 0 || responded)) {
-            if (!sending_sock->is_read_progressive()) {
+            if (bind_sock_action == BIND_SOCK_RESERVE) {
+                // Reserve this socket on the controller for a following RPC
+                // (used by mysql transactions for connection affinity).
+                c->_bind_sock.reset(sending_sock.release());
+            } else if (bind_sock_action == BIND_SOCK_USE) {
+                // Socket is owned by the binder; do not return it to the pool.
+            } else if (!sending_sock->is_read_progressive()) {
                 // Normally-read socket which will not be used after RPC ends,
                 // safe to return. Notice that Socket::is_read_progressive may
                 // differ from Controller::is_response_read_progressively()
@@ -833,7 +862,11 @@ void Controller::Call::OnComplete(
     case CONNECTION_TYPE_SHORT:
         if (sending_sock != NULL) {
             // Check the comment in CONNECTION_TYPE_POOLED branch.
-            if (!sending_sock->is_read_progressive()) {
+            if (bind_sock_action == BIND_SOCK_RESERVE) {
+                c->_bind_sock.reset(sending_sock.release());
+            } else if (bind_sock_action == BIND_SOCK_USE) {
+                // Socket is owned by the binder; do not fail it.
+            } else if (!sending_sock->is_read_progressive()) {
                 if (c->_stream_creator == NULL) {
                     sending_sock->SetFailed();
                 }
@@ -873,6 +906,8 @@ void Controller::Call::OnComplete(
 }
 
 void Controller::EndRPC(const CompletionInfo& info) {
+    add_flag(FLAGS_ENDING_RPC);
+
     if (_timeout_id != 0) {
         bthread_timer_del(_timeout_id);
         _timeout_id = 0;
@@ -900,6 +935,9 @@ void Controller::EndRPC(const CompletionInfo& info) {
         }
         // TODO: Replace this with stream_creator.
         HandleStreamConnection(_current_call.sending_sock.get());
+        // Propagate the reserve action; OnComplete only actually reserves the
+        // socket when the RPC succeeded (its error_code==0 || responded guard).
+        _current_call.bind_sock_action = bind_sock_action();
         _current_call.OnComplete(this, _error_code, info.responded, true);
     } else {
         // Even if _unfinished_call succeeded, we don't use EBACKUPREQUEST
@@ -944,9 +982,9 @@ void Controller::EndRPC(const CompletionInfo& info) {
     }
     // RPC finished, now it's safe to release `LoadBalancerWithNaming'
     _lb.reset();
-    if (_span) {
-        _span->set_ending_cid(info.id);
-        _span->set_async(_done);
+    if (auto span = _span.lock()) {
+        span->set_ending_cid(info.id);
+        span->set_async(_done);
         // Submit the span if we're in async RPC. For sync RPC, the span
         // is submitted after Join() to get a more accurate resuming timestamp.
         if (_done) {
@@ -1020,12 +1058,16 @@ void Controller::DoneInBackupThread() {
 
 void Controller::SubmitSpan() {
     const int64_t now = butil::cpuwide_time_us();
-    _span->set_start_callback_us(now);
-    if (_span->local_parent()) {
-        _span->local_parent()->AsParent();
+    if (auto span = _span.lock()) {
+        span->set_start_callback_us(now);
+        if (auto parent_span = span->local_parent().lock()) {
+            if (parent_span->is_active()) {
+                parent_span->AsParent();
+            }
+        }
+        Span::Submit(span, now);
+        _span.reset();
     }
-    Span::Submit(_span, now);
-    _span = NULL;
 }
 
 void Controller::HandleSendFailed() {
@@ -1080,7 +1122,18 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     _current_call.need_feedback = false;
     _current_call.enable_circuit_breaker = has_enabled_circuit_breaker();
     SocketUniquePtr tmp_sock;
-    if (SingleServer()) {
+    if ((_connection_type & CONNECTION_TYPE_POOLED_AND_SHORT) &&
+        bind_sock_action() == BIND_SOCK_USE) {
+        // Reuse the socket reserved by a previous RPC (mysql transaction affinity).
+        tmp_sock.reset(_bind_sock.release());
+        if (!tmp_sock || (!is_health_check_call() && !tmp_sock->IsAvailable())) {
+            SetFailed(EHOSTDOWN, "Not connected to bind socket yet, server_id=%" PRIu64,
+                      tmp_sock ? tmp_sock->id() : (SocketId)0);
+            tmp_sock.reset();  // Release ref ASAP
+            return HandleSendFailed();
+        }
+        _current_call.peer_id = tmp_sock->id();
+    } else if (SingleServer()) {
         // Don't use _current_call.peer_id which is set to -1 after construction
         // of the backup call.
         const int rc = Socket::Address(_single_server_id, &tmp_sock);
@@ -1123,8 +1176,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         CHECK_EQ(_remote_side, tmp_sock->remote_side());
     }
 
-    Span* span = _span;
-    if (span) {
+    if (auto span = _span.lock()) {
         if (_current_call.nretry == 0) {
             span->set_remote_side(_remote_side);
         } else {
@@ -1146,7 +1198,10 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         _current_call.sending_sock->set_preferred_index(_preferred_index);
     } else {
         int rc = 0;
-        if (_connection_type == CONNECTION_TYPE_POOLED) {
+        if (bind_sock_action() == BIND_SOCK_USE) {
+            // Already holding the reserved socket; use it directly.
+            _current_call.sending_sock.reset(tmp_sock.release());
+        } else if (_connection_type == CONNECTION_TYPE_POOLED) {
             rc = tmp_sock->GetPooledSocket(&_current_call.sending_sock);
         } else if (_connection_type == CONNECTION_TYPE_SHORT) {
             rc = tmp_sock->GetShortSocket(&_current_call.sending_sock);
@@ -1168,7 +1223,8 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         _current_call.sending_sock->set_preferred_index(_preferred_index);
         // Set preferred_index of main_socket as well to make it easier to
         // debug and observe from /connections.
-        if (tmp_sock->preferred_index() < 0) {
+        // tmp_sock is NULL on the BIND_SOCK_USE path.
+        if (tmp_sock && tmp_sock->preferred_index() < 0) {
             tmp_sock->set_preferred_index(_preferred_index);
         }
         tmp_sock.reset();
@@ -1236,7 +1292,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     int rc;
     size_t packet_size = 0;
     if (user_packet_guard) {
-        if (span) {
+        if (auto span = _span.lock()) {
             packet_size = user_packet_guard->EstimatedByteSize();
         }
         rc = _current_call.sending_sock->Write(user_packet_guard, &wopt);
@@ -1244,7 +1300,7 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         packet_size = packet.size();
         rc = _current_call.sending_sock->Write(&packet, &wopt);
     }
-    if (span) {
+    if (auto span = _span.lock()) {
         if (_current_call.nretry == 0) {
             span->set_sent_us(butil::cpuwide_time_us());
             span->set_request_size(packet_size);
@@ -1388,8 +1444,19 @@ const Controller* Controller::sub(int index) const {
     return NULL;
 }
 
-uint64_t Controller::trace_id() const { return _span ? _span->trace_id() : 0; }
-uint64_t Controller::span_id() const { return _span ? _span->span_id() : 0; }
+uint64_t Controller::trace_id() const {
+    if (auto span = _span.lock()) {
+        return span->trace_id();
+    }
+    return 0;
+}
+
+uint64_t Controller::span_id() const {
+    if (auto span = _span.lock()) {
+        return span->span_id();
+    }
+    return 0;
+}
 
 void* Controller::session_local_data() {
     if (_session_local_data) {
@@ -1451,7 +1518,7 @@ void Controller::HandleStreamConnection(Socket *host_socket) {
             if(!ptrs[i]) continue;
             Stream* extra_stream = (Stream *) ptrs[i]->conn();
             _remote_stream_settings->set_stream_id(extra_stream_ids[i - 1]);
-            s->SetHostSocket(host_socket);
+            extra_stream->SetHostSocket(host_socket);
             extra_stream->SetConnected(_remote_stream_settings);
         }
     }
@@ -1714,6 +1781,26 @@ void Controller::DoPrintLogPrefix(std::ostream& os) const {
     if (FLAGS_log_as_json) {
         os << "\"M\":\"";
     }
+}
+
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(
+    const std::shared_ptr<Span>& span) {
+    _cntl->_span = span;
+    return *this;
+}
+
+ControllerPrivateAccessor& ControllerPrivateAccessor::set_span(Span* span) {
+    if (span) {
+        _cntl->_span = span->shared_from_this();
+    } else {
+        _cntl->_span.reset();
+    }
+    return *this;
+}
+
+std::shared_ptr<Span> ControllerPrivateAccessor::span() const {
+    return _cntl->_span.lock();
 }
 
 } // namespace brpc

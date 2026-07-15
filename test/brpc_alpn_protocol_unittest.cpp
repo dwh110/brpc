@@ -48,7 +48,7 @@ public:
         response->set_message(request->message());
 
         brpc::Controller* cntl = static_cast<brpc::Controller*>(controller);
-        LOG(NOTICE) << "protocol:" << cntl->request_protocol();
+        LOG(INFO) << "protocol:" << cntl->request_protocol();
   }
 };
 
@@ -65,9 +65,9 @@ public:
         ssl_options->default_cert.private_key = "cert1.key";
         ssl_options->alpns = "http, h2, baidu_std";
 
-        EXPECT_EQ(0, _server.AddService(&_echo_server_impl,
+        ASSERT_EQ(0, _server.AddService(&_echo_server_impl,
                                         brpc::SERVER_DOESNT_OWN_SERVICE));
-        EXPECT_EQ(0, _server.Start(FLAGS_listen_addr.data(), &server_options));
+        ASSERT_EQ(0, _server.Start(FLAGS_listen_addr.data(), &server_options));
     }
     
     virtual void TearDown() override {
@@ -99,13 +99,17 @@ public:
         // SSL handshake.
         SSL* ssl = brpc::CreateSSLSession(ssl_ctx, 0, cli_fd, false);
         EXPECT_NE(nullptr, ssl);
-        EXPECT_EQ(1, SSL_do_handshake(ssl)); 
+        EXPECT_EQ(1, SSL_do_handshake(ssl));
 
         // Get handshake result.
         const unsigned char* select_alpn = nullptr;
         unsigned int len = 0;
         SSL_get0_alpn_selected(ssl, &select_alpn, &len);
-        return std::string(reinterpret_cast<const char*>(select_alpn), len);
+        std::string result(reinterpret_cast<const char*>(select_alpn), len);
+
+        SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx);
+        return result;
     }
 
 private:

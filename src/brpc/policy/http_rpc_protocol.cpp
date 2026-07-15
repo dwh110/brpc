@@ -373,8 +373,7 @@ void ProcessHttpResponse(InputMessageBase* msg) {
 
     ControllerPrivateAccessor accessor(cntl);
 
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         // TODO: changing when imsg_guard->read_body_progressively() is true
@@ -721,8 +720,7 @@ void SerializeHttpRequest(butil::IOBuf* /*not used*/,
         hreq.uri().set_path(path);
     }
 
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         hreq.SetHeader("x-bd-trace-id", butil::string_printf(
                            "%llu", (unsigned long long)span->trace_id()));
         hreq.SetHeader("x-bd-span-id", butil::string_printf(
@@ -838,7 +836,7 @@ HttpResponseSender::~HttpResponseSender() {
         return;
     }
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -1219,6 +1217,25 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
         // comments in http_message.h
         rc = http_imsg->ParseFromIOBuf(*source);
     }
+    if (rc < 0 && http_imsg->body_too_large()) {
+        if (socket->CreatedByConnect()) {
+            return MakeParseError(PARSE_ERROR_TOO_BIG_DATA);
+        }
+        const int release_rc = socket->ReleaseAdditionalReference();
+        if (release_rc == 0) {
+            butil::IOBuf resp;
+            HttpHeader header;
+            header.set_status_code(HTTP_STATUS_REQUEST_ENTITY_TOO_LARGE);
+            header.SetHeader("Connection", "close");
+            MakeRawHttpResponse(&resp, &header, NULL);
+            Socket::WriteOptions wopt;
+            wopt.ignore_eovercrowded = true;
+            socket->Write(&resp, &wopt);
+        } else if (release_rc > 0) {
+            LOG(ERROR) << "Impossible: Recycled!";
+        }
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+    }
     if (http_imsg->is_stage2()) {
         // The header part is already parsed as an intact HTTP message
         // to the ProcessHttpXXX. Here parses the body part.
@@ -1389,10 +1406,12 @@ bool VerifyHttpRequest(const InputMessageBase* msg) {
         http_request->header().uri().path(), server, NULL);
     if (mp != NULL && mp->is_builtin_service &&
         mp->service->GetDescriptor() != BadMethodService::descriptor()) {
-        // BuiltinService doesn't need authentication
-        // TODO: Fix backdoor that sends BuiltinService at first
-        // and then sends other requests without authentication
-        return true;
+        // Builtin services on internal_port doesn't need authentication
+        // Builtin services on the public listener must pass authentication
+        if (server->options().internal_port >= 0 &&
+            socket->local_side().port == server->options().internal_port) {
+            return true;
+        }
     }
 
     const std::string *authorization 
@@ -1493,7 +1512,7 @@ void ProcessHttpRequest(InputMessageBase *msg) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     const std::string& path = req_header.uri().path();
     const std::string* trace_id_str = req_header.GetHeader("x-bd-trace-id");
     if (IsTraceable(trace_id_str)) {

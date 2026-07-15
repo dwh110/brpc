@@ -28,6 +28,7 @@
 #include <signal.h>
 
 #include "butil/build_config.h"                  // OS_LINUX
+#include "butil/debug/leak_annotations.h"
 // Naming services
 #ifdef BAIDU_INTERNAL
 #include "brpc/policy/baidu_naming_service.h"
@@ -46,6 +47,7 @@
 #include "brpc/policy/randomized_load_balancer.h"
 #include "brpc/policy/weighted_randomized_load_balancer.h"
 #include "brpc/policy/locality_aware_load_balancer.h"
+#include "brpc/policy/p2c_ewma_load_balancer.h"
 #include "brpc/policy/consistent_hashing_load_balancer.h"
 #include "brpc/policy/hasher.h"
 #include "brpc/policy/dynpart_load_balancer.h"
@@ -54,6 +56,7 @@
 // Span
 #include "brpc/span.h"
 #include "bthread/unstable.h"
+#include "bthread/bthread.h"
 
 // Compress handlers
 #include "brpc/compress.h"
@@ -82,6 +85,7 @@
 #include "brpc/policy/nshead_mcpack_protocol.h"
 #include "brpc/policy/rtmp_protocol.h"
 #include "brpc/policy/esp_protocol.h"
+#include "brpc/policy/mysql/mysql_protocol.h"
 #ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
 # include "brpc/policy/thrift_protocol.h"
 #endif
@@ -154,6 +158,7 @@ struct GlobalExtensions {
     RandomizedLoadBalancer randomized_lb;
     WeightedRandomizedLoadBalancer wr_lb;
     LocalityAwareLoadBalancer la_lb;
+    P2CEwmaLoadBalancer p2c_ewma_lb;
     ConsistentHashingLoadBalancer ch_mh_lb;
     ConsistentHashingLoadBalancer ch_md5_lb;
     ConsistentHashingLoadBalancer ch_ketama_lb;
@@ -215,6 +220,14 @@ static int GetRunningServerCount(void*) {
 
 // Update global stuff periodically.
 static void* GlobalUpdate(void*) {
+    // This bthread runs for the whole process lifetime and never returns, so
+    // the local objects below live until the process exits and their
+    // destructors never run. They are reachable from this bthread's stack, so
+    // the objects themselves are not reported as leaks, but the heap buffers
+    // they allocate while exposing themselves (variable names, watched path)
+    // would be. Disable leak detection only around their construction and
+    // re-enable it right after.
+    ANNOTATE_MEMORY_LEAK_DISABLE();
     // Expose variables.
     bvar::PassiveStatus<int64_t> var_iobuf_block_count(
         "iobuf_block_count", GetIOBufBlockCount, NULL);
@@ -231,19 +244,21 @@ static void* GlobalUpdate(void*) {
         "rpc_server_count", GetRunningServerCount, NULL);
 
     butil::FileWatcher fw;
-    if (fw.init_from_not_exist(DUMMY_SERVER_PORT_FILE) < 0) {
+    const int fw_rc = fw.init_from_not_exist(DUMMY_SERVER_PORT_FILE);
+    ANNOTATE_MEMORY_LEAK_ENABLE();
+    if (fw_rc < 0) {
         LOG(FATAL) << "Fail to init FileWatcher on `" << DUMMY_SERVER_PORT_FILE << "'";
         return NULL;
     }
 
     std::vector<SocketId> conns;
-    const int64_t start_time_us = butil::gettimeofday_us();
+    const int64_t start_time_us = butil::cpuwide_time_us();
     const int WARN_NOSLEEP_THRESHOLD = 2;
     int64_t last_time_us = start_time_us;
     int consecutive_nosleep = 0;
     int64_t last_return_free_memory_time = start_time_us;
     while (1) {
-        const int64_t sleep_us = 1000000L + last_time_us - butil::gettimeofday_us();
+        const int64_t sleep_us = 1000000L + last_time_us - butil::cpuwide_time_us();
         if (sleep_us > 0) {
             if (bthread_usleep(sleep_us) < 0) {
                 PLOG_IF(FATAL, errno != ESTOP) << "Fail to sleep";
@@ -256,7 +271,7 @@ static void* GlobalUpdate(void*) {
                 LOG(WARNING) << __FUNCTION__ << " is too busy!";
             }
         }
-        last_time_us = butil::gettimeofday_us();
+        last_time_us = butil::cpuwide_time_us();
 
         TrackMe();
 
@@ -269,7 +284,11 @@ static void* GlobalUpdate(void*) {
             }
         }
 
-        SocketMapList(&conns);
+        {
+            // See detail above.
+            ANNOTATE_SCOPED_MEMORY_LEAK;
+            SocketMapList(&conns);
+        }
         const int64_t now_ms = butil::cpuwide_time_ms();
         for (size_t i = 0; i < conns.size(); ++i) {
             SocketUniquePtr ptr;
@@ -343,8 +362,11 @@ static void GlobalInitializeOrDieImpl() {
     SetLogHandler(&BaiduStreamingLogHandler);
 #endif
 
-    // Set bthread create span function
-    bthread_set_create_span_func(CreateBthreadSpan);
+    if (bthread_set_span_funcs(CreateBthreadSpanAsVoid,
+                                DestroyRpczParentSpan,
+                                EndBthreadSpan) != 0) {
+        LOG(FATAL) << "Failed to register span callbacks to bthread";
+    }
 
     // Setting the variable here does not work, the profiler probably check
     // the variable before main() for only once.
@@ -387,6 +409,7 @@ static void GlobalInitializeOrDieImpl() {
     LoadBalancerExtension()->RegisterOrDie("random", &g_ext->randomized_lb);
     LoadBalancerExtension()->RegisterOrDie("wr", &g_ext->wr_lb);
     LoadBalancerExtension()->RegisterOrDie("la", &g_ext->la_lb);
+    LoadBalancerExtension()->RegisterOrDie("p2c", &g_ext->p2c_ewma_lb);
     LoadBalancerExtension()->RegisterOrDie("c_murmurhash", &g_ext->ch_mh_lb);
     LoadBalancerExtension()->RegisterOrDie("c_md5", &g_ext->ch_md5_lb);
     LoadBalancerExtension()->RegisterOrDie("c_ketama", &g_ext->ch_ketama_lb);
@@ -610,6 +633,20 @@ static void GlobalInitializeOrDieImpl() {
         NULL, NULL, NULL,
         CONNECTION_TYPE_POOLED_AND_SHORT, "esp"};
     if (RegisterProtocol(PROTOCOL_ESP, esp_protocol) != 0) {
+        exit(1);
+    }
+
+    Protocol mysql_protocol = {ParseMysqlMessage,
+                               SerializeMysqlRequest,
+                               PackMysqlRequest,
+                               NULL,
+                               ProcessMysqlResponse,
+                               NULL,
+                               NULL,
+                               GetMysqlMethodName,
+                               CONNECTION_TYPE_POOLED_AND_SHORT,
+                               "mysql"};
+    if (RegisterProtocol(PROTOCOL_MYSQL, mysql_protocol) != 0) {
         exit(1);
     }
 
