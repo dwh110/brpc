@@ -40,6 +40,9 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
     "//conditions:default": [],
+}) + select({
+    "//bazel/config:brpc_with_urma_mock": ["-DBRPC_USE_URMA_MOCK=1"],
+    "//conditions:default": ["-DBRPC_USE_URMA_MOCK=0"],
 })
 
 brpc_proto_library(
