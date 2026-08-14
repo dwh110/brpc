@@ -53,14 +53,11 @@ git_override(
     commit = '1e08f8e0507b6b6b1f4416a9a22cf5c28beaba93', # Jun 28, 2024
 )
 
-# URMA (UMDK) headers are fetched on demand via a module extension,
-# mirroring the CMake DOWNLOAD_URMA_HEADERS option.  Uncomment the
-# three lines below and build with --define BRPC_WITH_URMA=true to
-# enable URMA support:
-#
-#   urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
-#   urma.urma(download_headers = True)
-#   use_repo(urma, "umdk")
-#
-# When download_headers is False (or the tag is omitted), no external
-# fetch occurs, so builds without URMA are not slowed down.
+# URMA (UMDK) headers.  Mirrors the CMake DOWNLOAD_URMA_HEADERS option.
+# With download_headers = True (default), the UMDK repo is fetched so
+# that --define BRPC_WITH_URMA=true works out of the box.
+# Set download_headers = False to skip the download when UMDK headers
+# are already installed on the system.
+urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
+urma.urma(download_headers = True)
+use_repo(urma, "umdk")

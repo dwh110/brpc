@@ -56,7 +56,7 @@ bazel build //:brpc --define BRPC_WITH_URMA=true \
     --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
 ```
 
-When using MODULE.bazel, uncomment the `urma_deps` extension declaration:
+The `urma_deps` extension in MODULE.bazel declares the UMDK dependency:
 
 ```starlark
 urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
@@ -64,10 +64,10 @@ urma.urma(download_headers = True)
 use_repo(urma, "umdk")
 ```
 
-The default behavior mirrors CMake's `DOWNLOAD_URMA_HEADERS=ON`: UMDK headers
-are downloaded automatically.  Set `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0`
-to skip the download (equivalent to CMake's `DOWNLOAD_URMA_HEADERS=OFF`),
-in which case the system-installed UMDK headers must be available.
+`download_headers = True` (default) mirrors CMake's
+`DOWNLOAD_URMA_HEADERS=ON`: UMDK headers are downloaded automatically.
+Set to `False` to use an empty stub (equivalent to CMake's
+`DOWNLOAD_URMA_HEADERS=OFF`).
 
 ## Usage
 

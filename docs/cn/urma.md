@@ -54,7 +54,7 @@ bazel build //:brpc --define BRPC_WITH_URMA=true \
     --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
 ```
 
-使用 MODULE.bazel 时，需取消注释 `urma_deps` extension 声明：
+MODULE.bazel 中通过 `urma_deps` extension 声明 UMDK 依赖：
 
 ```starlark
 urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
@@ -62,9 +62,9 @@ urma.urma(download_headers = True)
 use_repo(urma, "umdk")
 ```
 
-默认行为等价于 CMake 的 `DOWNLOAD_URMA_HEADERS=ON`：UMDK 头文件会自动下载。
-设置 `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0` 可跳过下载（对应 CMake 的
-`DOWNLOAD_URMA_HEADERS=OFF`），此时需确保系统已安装 UMDK 头文件。
+`download_headers = True`（默认）等价于 CMake 的 `DOWNLOAD_URMA_HEADERS=ON`，
+UMDK 头文件会自动下载。设为 `False` 时使用空 stub（对应
+`DOWNLOAD_URMA_HEADERS=OFF`）。
 
 ## 使用
 
