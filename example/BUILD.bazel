@@ -37,6 +37,9 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_rdma": ["-DBRPC_WITH_RDMA=1"],
     "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
+    "//conditions:default": [],
 })
 
 brpc_proto_library(
@@ -128,10 +131,7 @@ cc_binary(
     includes = [
         "urma_performance",
     ],
-    copts = COPTS + select({
-        "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
-        "//conditions:default": [],
-    }),
+    copts = COPTS,
     deps = [
         ":cc_urma_performance_proto",
         "//:brpc",
@@ -149,10 +149,7 @@ cc_binary(
     includes = [
         "urma_performance",
     ],
-    copts = COPTS + select({
-        "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
-        "//conditions:default": [],
-    }),
+    copts = COPTS,
     deps = [
         ":cc_urma_performance_proto",
         "//:brpc",

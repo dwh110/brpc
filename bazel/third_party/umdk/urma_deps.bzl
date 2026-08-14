@@ -49,8 +49,7 @@ load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 _UMDK_COMMIT = "564ee727a55523d4351a8fb3c94292b388ebb924"  # v26.06.0_CAM
 _UMDK_REMOTE = "https://atomgit.com/openeuler/umdk.git"
 
-# Build file content for the UMDK repository, inlined so that the
-# repository_rule can write it without needing a separate file.
+# Build file content for the UMDK repository (downloaded case).
 _UMDK_BUILD_CONTENT = """\
 package(default_visibility = ["//visibility:public"])
 
@@ -67,6 +66,29 @@ cc_library(
 )
 """
 
+# Build file content for the stub repository (system-headers case).
+# Provides the same "urma_headers" target so that select() references
+# to @umdk//:urma_headers resolve, but uses system include directories
+# instead of downloaded sources.  The include directories follow the
+# same search paths as CMake's find_path(URMA_INCLUDE_PATH ...).
+_UMDK_STUB_BUILD_CONTENT = """\
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "urma_headers",
+    hdrs = [],
+    includes = [
+        "core",
+        "bond",
+    ],
+)
+
+# Symlink the system-installed UMDK header directories into the repo
+# so that Bazel can see them as local includes.  The paths follow
+# CMake's search order (ub/umdk/urma under /usr/include, /usr/local,
+# and URMA_ROOT).
+"""
+
 # ---------------------------------------------------------------------------
 # WORKSPACE helper
 # ---------------------------------------------------------------------------
@@ -75,9 +97,9 @@ def _umdk_repo_impl(repository_ctx):
     """Fetches UMDK unless BRPC_DOWNLOAD_URMA_HEADERS=0.
 
     Defaults to fetching (mirrors CMake DOWNLOAD_URMA_HEADERS=ON).  When the
-    environment variable is set to "0", an empty repository is created instead
-    so that builds with system-installed UMDK headers are not blocked on a
-    git clone.
+    environment variable is set to "0", a stub repository is created that
+    exposes system-installed UMDK headers via symlinks, so that
+    @umdk//:urma_headers resolves correctly.
     """
     if repository_ctx.os.environ.get("BRPC_DOWNLOAD_URMA_HEADERS", "1") != "0":
         repository_ctx.download_and_extract(
@@ -86,20 +108,88 @@ def _umdk_repo_impl(repository_ctx):
         )
         repository_ctx.file("BUILD.bazel", content = _UMDK_BUILD_CONTENT)
     else:
-        # Create an empty repository so that Bazel does not error on the
-        # @umdk workspace declaration.  Any target that references
-        # @umdk//:urma_headers must be guarded by a select() on
-        # //bazel/config:brpc_with_urma, which is the case in the brpc
-        # BUILD files.
-        repository_ctx.file("BUILD.bazel", content = """\
-# Empty repository.  UMDK headers are not downloaded because
-# BRPC_DOWNLOAD_URMA_HEADERS=0.  The system-installed headers
-# are expected to be found via the select() in //:brpc.
-""")
+        # Create a stub repository that symlinks to system-installed UMDK
+        # headers.  This mirrors CMake's find_path search: check URMA_ROOT
+        # first, then /usr/local/include, then /usr/include.  The PATH_SUFFIXES
+        # that CMake uses (ub/umdk/urma, umdk/urma) are resolved into the
+        # final directory that contains urma_api.h.
+        urma_root = repository_ctx.os.environ.get("URMA_ROOT", "")
+        core_dir = ""
+        bond_dir = ""
+
+        search_roots = []
+        if urma_root:
+            search_roots.append(urma_root)
+        search_roots.extend(["/usr/local/include", "/usr/include"])
+
+        suffixes = ["ub/umdk/urma", "umdk/urma", "urma"]
+
+        for root in search_roots:
+            if core_dir:
+                break
+            for suffix in suffixes:
+                candidate = root + "/" + suffix if suffix else root
+                if repository_ctx.path(candidate).exists:
+                    # Verify urma_api.h is present
+                    if repository_ctx.path(candidate + "/urma_api.h").exists:
+                        core_dir = candidate
+                        # Bond headers live in the same directory
+                        if repository_ctx.path(candidate + "/urma_ubagg.h").exists:
+                            bond_dir = candidate
+                        break
+            # Also check the upstream source layout used by the git repo
+            if not core_dir:
+                for root2 in search_roots:
+                    candidate = root2 + "/src/urma/lib/urma/core/include"
+                    if repository_ctx.path(candidate + "/urma_api.h").exists:
+                        core_dir = candidate
+                        break
+            if not bond_dir:
+                for root2 in search_roots:
+                    candidate = root2 + "/src/urma/lib/urma/bond/include"
+                    if repository_ctx.path(candidate + "/urma_ubagg.h").exists:
+                        bond_dir = candidate
+                        break
+
+        # Build the BUILD.bazel with the discovered system paths
+        includes_list = []
+        symlinks_cmds = []
+        if core_dir:
+            # Create a symlink so Bazel can treat the system headers as
+            # part of the repository.
+            repository_ctx.symlink(core_dir, "core")
+            includes_list.append("core")
+        if bond_dir:
+            repository_ctx.symlink(bond_dir, "bond")
+            includes_list.append("bond")
+
+        includes_str = ",\n        ".join(
+            ['"' + inc + '"' for inc in includes_list],
+        )
+        build_content = """\
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "urma_headers",
+    hdrs = glob(["core/*.h", "bond/*.h"]),
+    includes = [
+        {includes}
+    ],
+)
+""".format(includes = includes_str) if includes_list else """\
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "urma_headers",
+    hdrs = [],
+    includes = [],
+)
+"""
+        repository_ctx.file("BUILD.bazel", content = build_content)
 
 _umdk_repo = repository_rule(
     implementation = _umdk_repo_impl,
-    environ = ["BRPC_DOWNLOAD_URMA_HEADERS"],
+    environ = ["BRPC_DOWNLOAD_URMA_HEADERS", "URMA_ROOT"],
 )
 
 def maybe_fetch_umdk():
@@ -107,6 +197,8 @@ def maybe_fetch_umdk():
 
     Intended for WORKSPACE files.  The default behavior downloads the UMDK
     headers so that --define BRPC_WITH_URMA=true works without extra flags.
+    When BRPC_DOWNLOAD_URMA_HEADERS=0, system-installed UMDK headers are
+    discovered via the same search paths as CMake.
     """
     _umdk_repo(name = "umdk")
 
