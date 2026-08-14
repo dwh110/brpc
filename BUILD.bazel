@@ -101,6 +101,11 @@ LINKOPTS = [
     ],
     "//conditions:default": [],
 }) + select({
+    "//bazel/config:brpc_with_urma": [
+        "-lurma",
+    ],
+    "//conditions:default": [],
+}) + select({
         "//bazel/config:brpc_with_asan": ["-fsanitize=address"],
         "//conditions:default": [],
   })
