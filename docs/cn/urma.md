@@ -36,6 +36,36 @@ UMDK，可通过 `DOWNLOAD_URMA_HEADERS=OFF` 禁止下载。找到 `liburma` 时
 真实硬件数据通路，否则链接 brpc 的 mock，使 URMA 代码和测试仍可在无硬件
 环境编译。
 
+### Bazel 编译
+
+```bash
+# 带 URMA 支持编译 brpc
+bazel build //:brpc --define BRPC_WITH_URMA=true
+
+# 编译 urma_performance 示例
+bazel build //example:urma_performance_server --define BRPC_WITH_URMA=true
+bazel build //example:urma_performance_client --define BRPC_WITH_URMA=true
+
+# 不带 URMA 支持编译（默认行为）
+bazel build //:brpc
+
+# 若系统已安装 UMDK 头文件，可跳过下载
+bazel build //:brpc --define BRPC_WITH_URMA=true \
+    --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
+```
+
+使用 MODULE.bazel 时，需取消注释 `urma_deps` extension 声明：
+
+```starlark
+urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
+urma.urma(download_headers = True)
+use_repo(urma, "umdk")
+```
+
+默认行为等价于 CMake 的 `DOWNLOAD_URMA_HEADERS=ON`：UMDK 头文件会自动下载。
+设置 `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0` 可跳过下载（对应 CMake 的
+`DOWNLOAD_URMA_HEADERS=OFF`），此时需确保系统已安装 UMDK 头文件。
+
 ## 使用
 
 通过在 channel / server 上设置 `socket_mode` 选择传输层：

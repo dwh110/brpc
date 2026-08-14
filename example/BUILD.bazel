@@ -53,6 +53,13 @@ brpc_proto_library(
     proto_deps = [],
 )
 
+brpc_proto_library(
+    name = "cc_urma_performance_proto",
+    srcs = ["urma_performance/test.proto"],
+    include = "urma_performance",
+    proto_deps = [],
+)
+
 cc_binary(
     name = "echo_c++_server",
     srcs = [
@@ -111,6 +118,48 @@ cc_binary(
         ":cc_rdma_performance_proto",
         "//:brpc",
     ],
+)
+
+cc_binary(
+    name = "urma_performance_server",
+    srcs = [
+        "urma_performance/server.cpp",
+    ],
+    includes = [
+        "urma_performance",
+    ],
+    copts = COPTS + select({
+        "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":cc_urma_performance_proto",
+        "//:brpc",
+    ] + select({
+        "//bazel/config:brpc_with_urma": ["@umdk//:urma_headers"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_binary(
+    name = "urma_performance_client",
+    srcs = [
+        "urma_performance/client.cpp",
+    ],
+    includes = [
+        "urma_performance",
+    ],
+    copts = COPTS + select({
+        "//bazel/config:brpc_with_urma": ["-DBRPC_WITH_URMA=1"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":cc_urma_performance_proto",
+        "//:brpc",
+    ] + select({
+        "//bazel/config:brpc_with_urma": ["@umdk//:urma_headers"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_binary(

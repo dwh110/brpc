@@ -279,12 +279,13 @@ http_archive(
     urls = ["https://archive.apache.org/dist/thrift/0.15.0/thrift-0.15.0.tar.gz"],
 )
 
-git_repository(
-    name = "umdk",
-    build_file = "//bazel/third_party/umdk:umdk.BUILD",
-    remote = "https://atomgit.com/openeuler/umdk.git",
-    commit = "564ee727a55523d4351a8fb3c94292b388ebb924",  # v26.06.0_CAM
-)
+# URMA (UMDK) headers.  By default the UMDK repo is fetched (mirrors CMake
+# DOWNLOAD_URMA_HEADERS=ON) so that --define BRPC_WITH_URMA=true works
+# out of the box.  To skip the download (e.g. when headers are installed
+# system-wide), build with --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0.
+load("//bazel/third_party/umdk:urma_deps.bzl", "maybe_fetch_umdk")
+
+maybe_fetch_umdk()
 
 # Header-only JSON library used by iobuf_unittest's IOBuf<->std::iostream
 # adapter tests. Keep version in sync with MODULE.bazel.

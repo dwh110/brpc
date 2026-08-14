@@ -38,6 +38,37 @@ When `liburma` is found it is linked for the hardware data path. Otherwise,
 brpc uses its link-time mock so URMA code and tests can still be built without
 hardware.
 
+### Build with Bazel
+
+```bash
+# Build brpc with URMA support
+bazel build //:brpc --define BRPC_WITH_URMA=true
+
+# Build the urma_performance example
+bazel build //example:urma_performance_server --define BRPC_WITH_URMA=true
+bazel build //example:urma_performance_client --define BRPC_WITH_URMA=true
+
+# Build without URMA support (default)
+bazel build //:brpc
+
+# Skip downloading UMDK headers when they are already installed system-wide
+bazel build //:brpc --define BRPC_WITH_URMA=true \
+    --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
+```
+
+When using MODULE.bazel, uncomment the `urma_deps` extension declaration:
+
+```starlark
+urma = use_extension("//bazel/third_party/umdk:urma_deps.bzl", "urma_deps")
+urma.urma(download_headers = True)
+use_repo(urma, "umdk")
+```
+
+The default behavior mirrors CMake's `DOWNLOAD_URMA_HEADERS=ON`: UMDK headers
+are downloaded automatically.  Set `--repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0`
+to skip the download (equivalent to CMake's `DOWNLOAD_URMA_HEADERS=OFF`),
+in which case the system-installed UMDK headers must be available.
+
 ## Usage
 
 Select the transport by setting `socket_mode` on the channel / server:
