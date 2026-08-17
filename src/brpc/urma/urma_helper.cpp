@@ -479,7 +479,13 @@ static bool GlobalUrmaInitializeImpl() {
     }
 
     urma_init_attr_t init_attr{};
+    LOG(INFO) << "Calling urma_init with init_attr.uasid=" << init_attr.uasid
+              << " (0 means kernel will assign a random non-zero uasid)";
     const urma_status_t status = urma_init(&init_attr);
+    LOG(INFO) << "urma_init returned status=" << status
+              << " (URMA_SUCCESS=0, URMA_EEXIST=" << URMA_EEXIST
+              << ", URMA_FAIL=" << URMA_FAIL << ")"
+              << " init_attr.uasid after call=" << init_attr.uasid;
     if (status != URMA_SUCCESS && status != URMA_EEXIST) {
         if (status == URMA_FAIL) {
             LOG(ERROR) << "Fail to urma_init: " << status
@@ -495,6 +501,8 @@ static bool GlobalUrmaInitializeImpl() {
         return false;
     }
     g_owns_urma_init = (status == URMA_SUCCESS);
+    LOG(INFO) << "urma_init " << (g_owns_urma_init ? "succeeded" : "returned EEXIST")
+              << ", g_owns_urma_init=" << g_owns_urma_init;
 
     int num_devices = 0;
     urma_device_t** devices = urma_get_device_list(&num_devices);
@@ -548,13 +556,33 @@ static bool GlobalUrmaInitializeImpl() {
     // carry a provider-selected physical EID.
     g_local_eid = eids[0].eid;
     g_has_local_eid = true;
+    {
+        char eid_str[URMA_EID_STR_LEN + 1] = {};
+        std::snprintf(eid_str, sizeof(eid_str), EID_FMT, EID_ARGS(g_local_eid));
+        LOG(INFO) << "urma_get_eid_list returned eid_index=" << eids[0].eid_index
+                  << " eid=" << eid_str
+                  << " (uasid from urma_init = " << init_attr.uasid << ")";
+    }
     g_context = urma_create_context(found, eids[0].eid_index);
     urma_free_eid_list(eids);
     urma_free_device_list(devices);
     g_device = nullptr;
     if (!g_context) {
-        LOG(ERROR) << "Fail to urma_create_context";
+        LOG(ERROR) << "Fail to urma_create_context: returned nullptr"
+                   << " errno=" << errno << " (" << strerror(errno) << ")";
         return false;
+    }
+    {
+        char eid_str[URMA_EID_STR_LEN + 1] = {};
+        std::snprintf(eid_str, sizeof(eid_str), EID_FMT, EID_ARGS(g_context->eid));
+        LOG(INFO) << "urma_create_context succeeded:"
+                  << " g_context->uasid=" << g_context->uasid
+                  << " g_context->eid_index=" << g_context->eid_index
+                  << " g_context->eid=" << eid_str
+                  << (g_context->uasid == 0
+                          ? " [WARNING] uasid is 0 (kernel-owned), peer will "
+                            "fail to import our jetty with EPERM"
+                          : "");
     }
     // The bonding provider only accepts SET_BONDING_MODE while the context
     // has no dependent resource. This must precede register_seg/JFC/JFR.
@@ -630,7 +658,10 @@ static bool GlobalUrmaInitializeImpl() {
               << " bonding=" << g_is_bonding_device
               << " max_sge=" << g_max_sge
               << " buffer_size=" << g_pool_buffer_size
-              << " buffer_count=" << g_pool->buffer_count();
+              << " buffer_count=" << g_pool->buffer_count()
+              << " context_uasid=" << g_context->uasid
+              << " context_eid_index=" << g_context->eid_index
+              << " (peer must see non-zero uasid in hello)";
     return true;
 }
 

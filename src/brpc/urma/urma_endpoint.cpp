@@ -270,6 +270,23 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
         out->seg_len = pool->seg.len;
         out->seg_token_id = pool->seg.token_id;
     }
+    {
+        char eid_str[URMA_EID_STR_LEN + 1] = {};
+        char seg_eid_str[URMA_EID_STR_LEN + 1] = {};
+        std::snprintf(eid_str, sizeof(eid_str), EID_FMT, EID_RAW_ARGS(out->eid));
+        std::snprintf(seg_eid_str, sizeof(seg_eid_str), EID_FMT,
+                      EID_RAW_ARGS(out->seg_eid));
+        LOG(INFO) << "MakeLocalParsedHello: advertising jetty_id=" << out->jetty_id
+                  << " uasid=" << out->uasid
+                  << " (0 means kernel-owned, peer import will fail with EPERM)"
+                  << " eid=" << eid_str
+                  << " tp_type=" << static_cast<int>(out->tp_type)
+                  << " seg_uasid=" << out->seg_uasid
+                  << " seg_eid=" << seg_eid_str
+                  << " seg_va=0x" << std::hex << out->seg_va << std::dec
+                  << " seg_len=" << out->seg_len
+                  << " on " << _socket->description();
+    }
 }
 
 void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
@@ -579,6 +596,31 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
     urma_token_t token{};
     const bool use_bonding_extension =
         IsUrmaBondingDevice() && remote.trans_mode == URMA_TM_RM;
+    {
+        char peer_eid_str[URMA_EID_STR_LEN + 1] = {};
+        char peer_seg_eid_str[URMA_EID_STR_LEN + 1] = {};
+        std::snprintf(peer_eid_str, sizeof(peer_eid_str), EID_FMT,
+                      EID_RAW_ARGS(peer.eid));
+        std::snprintf(peer_seg_eid_str, sizeof(peer_seg_eid_str), EID_FMT,
+                      EID_RAW_ARGS(peer.seg_eid));
+        LOG(INFO) << "ImportPeer about to call urma_import_jetty:"
+                  << " remote_eid=" << peer_eid_str
+                  << " remote_uasid=" << peer.uasid
+                  << (peer.uasid == 0 ? " [DANGER] peer uasid=0 means kernel-"
+                                       "owned jetty, urma_import_jetty will "
+                                       "likely fail with EPERM"
+                                     : "")
+                  << " remote_jetty_id=" << peer.jetty_id
+                  << " trans_mode=" << remote.trans_mode
+                  << " tp_type=" << static_cast<int>(remote.tp_type)
+                  << " seg_eid=" << peer_seg_eid_str
+                  << " seg_uasid=" << peer.seg_uasid
+                  << " seg_va=0x" << std::hex << peer.seg_va << std::dec
+                  << " seg_len=" << peer.seg_len
+                  << " bonding_extension=" << use_bonding_extension
+                  << " local_ctx_uasid=" << ctx->uasid
+                  << " on " << _socket->description();
+    }
     errno = 0;
     if (use_bonding_extension) {
 #if BRPC_URMA_HAS_BONDING_EXT
