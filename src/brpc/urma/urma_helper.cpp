@@ -460,6 +460,28 @@ static void GlobalRelease() {
     g_device = nullptr;
 }
 
+// Kernel-side only cleanup: releases urma context and uninit without
+// unmapping the IOBuf pool. Safe to register with atexit because it does
+// not touch thread-local IOBuf block chains. The OS reclaims pool pages
+// on process exit. Without this, each brpc process start leaks a UED task
+// context in the kernel (ued_dev domain, max 32), causing "Task overflow"
+// and subsequent urma_import_jetty EPERM failures.
+static void GlobalReleaseKernelOnly() {
+    if (g_context) {
+        urma_delete_context(g_context);
+        g_context = nullptr;
+    }
+    if (g_owns_urma_init) {
+        const urma_status_t status = urma_uninit();
+        if (status != URMA_SUCCESS) {
+            // Logged at WARNING since we're in atexit; cannot use PLOG safely.
+            fprintf(stderr, "Fail to urma_uninit during atexit: %d\n",
+                    static_cast<int>(status));
+        }
+        g_owns_urma_init = false;
+    }
+}
+
 // ============================================================================
 // Global initialization.
 // ============================================================================
@@ -649,11 +671,25 @@ static bool GlobalUrmaInitializeImpl() {
     }
 
     g_urma_available.store(true, butil::memory_order_release);
-    // Do not register GlobalRelease with atexit. IOBuf keeps blocks in
+    // Register kernel-side cleanup with atexit. Unlike GlobalRelease (which
+    // unmaps the IOBuf pool and would crash thread-local IOBuf destructors
+    // if called out of order), this only releases the urma context and calls
+    // urma_uninit — kernel ioctls that are safe during atexit. Without this,
+    // each brpc process exit leaks a UED task context in the kernel
+    // (ued_dev domain, task_max_num=32). After 32 leaked entries, new
+    // processes fail with "Task overflow" and urma_import_jetty returns EPERM.
+    if (g_owns_urma_init) {
+        const int rc = atexit(GlobalReleaseKernelOnly);
+        if (rc != 0) {
+            LOG(WARNING) << "Failed to register GlobalReleaseKernelOnly with atexit (rc="
+                         << rc << "), UED task contexts may leak on exit";
+        }
+    }
+    // Do not register full GlobalRelease with atexit. IOBuf keeps blocks in
     // thread-local chains whose destructors may run after atexit handlers.
     // Unmapping the registered pool here would leave those TLS chains
-    // pointing into unmapped memory. The process reclaims global URMA
-    // resources on exit; GlobalRelease remains available for init rollback.
+    // pointing into unmapped memory. The OS reclaims pool pages on process
+    // exit; GlobalRelease remains available for init rollback.
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
               << " max_sge=" << g_max_sge
