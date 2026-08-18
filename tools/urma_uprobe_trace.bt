@@ -26,8 +26,25 @@
 
 BEGIN
 {
-    printf("urma uprobe tracer attached. lib=__@__LIBURMA__@__\n");
-    printf("Press Ctrl-C for final stats.\n\n");
+    @enabled = 0;
+    printf("urma uprobe tracer attached. lib=@__LIBURMA__@ sample_rate=1/@__SAMPLE_RATE__@\n");
+    printf("Control-plane always traced (warm-up path).\n");
+    printf("Data-plane OFF by default; send SIGUSR1 to this bpftrace pid to toggle.\n");
+    printf("  kill -USR1 <bpftrace_pid>   # toggle data-plane on/off\n");
+    printf("Ctrl-C for final stats.\n\n");
+}
+
+/* Toggle data-plane tracing on/off via SIGUSR1. When OFF, data-plane probes
+ * still trap (unavoidable uprobe cost) but the BPF body is skipped — only the
+ * predicate `@enabled` (one map lookup) is evaluated. */
+signal:SIGUSR1
+{
+    @enabled = @enabled == 0;
+    if (@enabled) {
+        printf("[ON]  data-plane tracing ON  (sample 1/@__SAMPLE_RATE__@)\n");
+    } else {
+        printf("[OFF] data-plane tracing OFF\n");
+    }
 }
 
 /* ========================================================================
@@ -299,121 +316,168 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
 }
 
 /* ========================================================================
- * Data-plane: per-RPC hot path. Histograms + slow-call logging (>1ms).
- * At ~200k QPS the per-call printf would kill throughput, so we only log
- * outliers. The histogram captures the steady-state latency distribution.
+ * Data-plane: per-RPC hot path.
+ *
+ * Overhead control (3 layers):
+ *   1. @enabled gate: data-plane bodies skipped when @enabled == 0 (SIGUSR1).
+ *      When off, only the predicate is evaluated (one map lookup ~10ns) on
+ *      every uprobe trap; map writes are skipped entirely.
+ *   2. Sampling: only 1/SAMPLE_RATE entries record a timestamp. The return
+ *      probe checks for the entry map key; if absent (99% of calls), it does
+ *      nothing. This bounds per-hit work to the trap + predicate cost.
+ *   3. Integer @e keys (1..7): integer-keyed map lookups are ~5x faster than
+ *      string-keyed. Output maps (@cnt/@lat/@sum/@max) keep string keys for
+ *      readability since they are only updated on the sampled return path.
+ *
+ * Integer key legend:
+ *   1=urma_post_jetty_send_wr  2=urma_post_jetty_recv_wr  3=urma_post_jfr_wr
+ *   4=urma_poll_jfc            5=urma_rearm_jfc           6=urma_wait_jfc
+ *   7=urma_ack_jfc
+ *
+ * NOTE: uprobe trap cost (~200-500ns/hit on modern kernels) is paid on EVERY
+ * call regardless of @enabled/sampling — it is the kernel breakpoint cost.
+ * For TRUE zero overhead when not capturing, kill bpftrace and restart only
+ * for short capture windows.
  * ====================================================================== */
 
 uprobe:@__LIBURMA__@:urma_post_jetty_send_wr
-{ @e[tid, "urma_post_jetty_send_wr"] = nsecs; @cnt["urma_post_jetty_send_wr"] = count(); }
-uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
-/ @e[tid, "urma_post_jetty_send_wr"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_post_jetty_send_wr"];
-    @lat["urma_post_jetty_send_wr"] = hist($d / 1000);
+    @cnt["urma_post_jetty_send_wr"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 1] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
+/ @e[tid, 1] /
+{
+    $d = nsecs - @e[tid, 1];
+    @lat["urma_post_jetty_send_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jetty_send_wr"] = sum($d);
     @max["urma_post_jetty_send_wr"] = max($d);
     if ($d > 1000000) {
         @slow["urma_post_jetty_send_wr"] = count();
         printf("[SLOW] urma_post_jetty_send_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_post_jetty_send_wr"]);
+    delete(@e[tid, 1]);
 }
 
 uprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
-{ @e[tid, "urma_post_jetty_recv_wr"] = nsecs; @cnt["urma_post_jetty_recv_wr"] = count(); }
-uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
-/ @e[tid, "urma_post_jetty_recv_wr"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_post_jetty_recv_wr"];
-    @lat["urma_post_jetty_recv_wr"] = hist($d / 1000);
+    @cnt["urma_post_jetty_recv_wr"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 2] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
+/ @e[tid, 2] /
+{
+    $d = nsecs - @e[tid, 2];
+    @lat["urma_post_jetty_recv_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jetty_recv_wr"] = sum($d);
     @max["urma_post_jetty_recv_wr"] = max($d);
     if ($d > 1000000) {
         @slow["urma_post_jetty_recv_wr"] = count();
         printf("[SLOW] urma_post_jetty_recv_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_post_jetty_recv_wr"]);
+    delete(@e[tid, 2]);
 }
 
 uprobe:@__LIBURMA__@:urma_post_jfr_wr
-{ @e[tid, "urma_post_jfr_wr"] = nsecs; @cnt["urma_post_jfr_wr"] = count(); }
-uretprobe:@__LIBURMA__@:urma_post_jfr_wr
-/ @e[tid, "urma_post_jfr_wr"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_post_jfr_wr"];
-    @lat["urma_post_jfr_wr"] = hist($d / 1000);
+    @cnt["urma_post_jfr_wr"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 3] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_post_jfr_wr
+/ @e[tid, 3] /
+{
+    $d = nsecs - @e[tid, 3];
+    @lat["urma_post_jfr_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jfr_wr"] = sum($d);
     @max["urma_post_jfr_wr"] = max($d);
     if ($d > 1000000) {
         @slow["urma_post_jfr_wr"] = count();
         printf("[SLOW] urma_post_jfr_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_post_jfr_wr"]);
+    delete(@e[tid, 3]);
 }
 
 uprobe:@__LIBURMA__@:urma_poll_jfc
-{ @e[tid, "urma_poll_jfc"] = nsecs; @cnt["urma_poll_jfc"] = count(); }
-uretprobe:@__LIBURMA__@:urma_poll_jfc
-/ @e[tid, "urma_poll_jfc"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_poll_jfc"];
-    @lat["urma_poll_jfc"] = hist($d / 1000);
+    @cnt["urma_poll_jfc"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 4] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_poll_jfc
+/ @e[tid, 4] /
+{
+    $d = nsecs - @e[tid, 4];
+    @lat["urma_poll_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_poll_jfc"] = sum($d);
     @max["urma_poll_jfc"] = max($d);
     if ($d > 1000000) {
         @slow["urma_poll_jfc"] = count();
         printf("[SLOW] urma_poll_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_poll_jfc"]);
+    delete(@e[tid, 4]);
 }
 
 uprobe:@__LIBURMA__@:urma_rearm_jfc
-{ @e[tid, "urma_rearm_jfc"] = nsecs; @cnt["urma_rearm_jfc"] = count(); }
-uretprobe:@__LIBURMA__@:urma_rearm_jfc
-/ @e[tid, "urma_rearm_jfc"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_rearm_jfc"];
-    @lat["urma_rearm_jfc"] = hist($d / 1000);
+    @cnt["urma_rearm_jfc"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 5] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_rearm_jfc
+/ @e[tid, 5] /
+{
+    $d = nsecs - @e[tid, 5];
+    @lat["urma_rearm_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_rearm_jfc"] = sum($d);
     @max["urma_rearm_jfc"] = max($d);
     if ($d > 1000000) {
         @slow["urma_rearm_jfc"] = count();
         printf("[SLOW] urma_rearm_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_rearm_jfc"]);
+    delete(@e[tid, 5]);
 }
 
 uprobe:@__LIBURMA__@:urma_wait_jfc
-{ @e[tid, "urma_wait_jfc"] = nsecs; @cnt["urma_wait_jfc"] = count(); }
-uretprobe:@__LIBURMA__@:urma_wait_jfc
-/ @e[tid, "urma_wait_jfc"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_wait_jfc"];
-    @lat["urma_wait_jfc"] = hist($d / 1000);
+    @cnt["urma_wait_jfc"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 6] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_wait_jfc
+/ @e[tid, 6] /
+{
+    $d = nsecs - @e[tid, 6];
+    @lat["urma_wait_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_wait_jfc"] = sum($d);
     @max["urma_wait_jfc"] = max($d);
     if ($d > 1000000) {
         @slow["urma_wait_jfc"] = count();
         printf("[SLOW] urma_wait_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_wait_jfc"]);
+    delete(@e[tid, 6]);
 }
 
 uprobe:@__LIBURMA__@:urma_ack_jfc
-{ @e[tid, "urma_ack_jfc"] = nsecs; @cnt["urma_ack_jfc"] = count(); }
-uretprobe:@__LIBURMA__@:urma_ack_jfc
-/ @e[tid, "urma_ack_jfc"] /
+/ @enabled /
 {
-    $d = nsecs - @e[tid, "urma_ack_jfc"];
-    @lat["urma_ack_jfc"] = hist($d / 1000);
+    @cnt["urma_ack_jfc"] = count();
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 7] = nsecs; }
+}
+uretprobe:@__LIBURMA__@:urma_ack_jfc
+/ @e[tid, 7] /
+{
+    $d = nsecs - @e[tid, 7];
+    @lat["urma_ack_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_ack_jfc"] = sum($d);
     @max["urma_ack_jfc"] = max($d);
     if ($d > 1000000) {
         @slow["urma_ack_jfc"] = count();
         printf("[SLOW] urma_ack_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, "urma_ack_jfc"]);
+    delete(@e[tid, 7]);
 }
 
 /* ========================================================================
@@ -447,9 +511,6 @@ END
 
     printf("\n--- Latency histograms (us) per function (@lat) ---\n");
     print(@lat);
-
-    printf("\n--- Leftover entry timestamps (should be empty; non-empty = missed return) ---\n");
-    print(@e);
 
     printf("=====================================================\n");
 }

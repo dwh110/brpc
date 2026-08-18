@@ -8,6 +8,13 @@
 #   sudo ./urma_uprobe_trace.sh -n my_server    # trace by process name
 #   sudo ./urma_uprobe_trace.sh -l /opt/umdk/lib/liburma.so.0  # force lib path
 #
+# Data-plane tracing is OFF by default. After bpftrace attaches, toggle it:
+#   kill -USR1 <bpftrace_pid>          # ON: sample 1/${SAMPLE_RATE:-100} of calls
+#   kill -USR1 <bpftrace_pid>          # OFF again
+#
+# Override sample rate (default 100 = 1% of data-plane calls):
+#   sudo SAMPLE_RATE=50 ./urma_uprobe_trace.sh -n my_server   # sample 1/50
+#
 # Output goes to stdout (bpftrace). Pair with:
 #   sudo ./urma_uprobe_trace.sh <pid> 2>&1 | tee /tmp/urma_trace.log
 #
@@ -17,6 +24,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="${SCRIPT_DIR}/urma_uprobe_trace.bt"
+
+# Sample rate for data-plane probes (1/N). Higher = less overhead, coarser stats.
+SAMPLE_RATE="${SAMPLE_RATE:-100}"
 
 usage() {
     cat <<EOF
@@ -110,7 +120,11 @@ fi
 # --- render template ----------------------------------------------------------
 RENDERED="$(mktemp --tmpdir urma_uprobe_trace.XXXX.bt)"
 trap 'rm -f -- "${RENDERED}"' EXIT
-sed "s|@__LIBURMA__@|${LIB}|g" "${TEMPLATE}" > "${RENDERED}"
+sed -e "s|@__LIBURMA__@|${LIB}|g" \
+    -e "s|@__SAMPLE_RATE__@|${SAMPLE_RATE}|g" \
+    "${TEMPLATE}" > "${RENDERED}"
+
+echo "sample_rate: 1/${SAMPLE_RATE}  (override via SAMPLE_RATE=N)"
 
 # dry-run compile to catch template errors before attaching.
 # Prefer --dry-run (newer bpftrace); fall back to -d (older versions, still
@@ -135,6 +149,7 @@ rm -f -- "${DRY_ERR}"
 
 # --- attach -------------------------------------------------------------------
 echo "attaching... (Ctrl-C to stop and print final report)"
+echo "data-plane OFF; toggle with: kill -USR1 \$  (bpftrace pid, see below)"
 if [[ -n "${PID}" ]]; then
     exec bpftrace -p "${PID}" "${RENDERED}"
 else
