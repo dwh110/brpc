@@ -14,7 +14,7 @@
  *   - Control-plane APIs (init/create/import/advise/register/...): every call
  *     is logged with comm/tid/latency. This is the warm-up path and the most
  *     direct way to attribute the first-RPC ~50ms cost.
- *   - Data-plane APIs (post_*/poll_jfc/rearm_jfc/wait_jfc/ack_jfc):
+ *   - Data-plane APIs (post_jetty_send_wr, poll_jfc, rearm_jfc, wait_jfc, ack_jfc):
  *     per-function latency histogram + count + sum + max. Slow calls (>1ms)
  *     are still logged individually.
  *   - Every 5s: top callers by count.

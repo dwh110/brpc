@@ -112,10 +112,19 @@ RENDERED="$(mktemp --tmpdir urma_uprobe_trace.XXXX.bt)"
 trap 'rm -f -- "${RENDERED}"' EXIT
 sed "s|@__LIBURMA__@|${LIB}|g" "${TEMPLATE}" > "${RENDERED}"
 
-# dry-run compile to catch template errors before attaching
+# dry-run compile to catch template errors before attaching.
+# Prefer --dry-run (newer bpftrace); fall back to -d (older versions, still
+# only parses/compiles — does not attach).
+bpftrace_dry_run() {
+    if bpftrace --help 2>&1 | grep -q -- '--dry-run'; then
+        bpftrace --dry-run "$1" 2>"${DRY_ERR}"
+    else
+        bpftrace -d "$1" >/dev/null 2>"${DRY_ERR}"
+    fi
+}
 DRY_ERR="$(mktemp --tmpdir urma_dryrun.XXXX.log)"
-if ! bpftrace --dry-run "${RENDERED}" 2>"${DRY_ERR}"; then
-    echo "bpftrace --dry-run failed; actual error:" >&2
+if ! bpftrace_dry_run "${RENDERED}"; then
+    echo "bpftrace dry-run failed; actual error:" >&2
     cat -- "${DRY_ERR}" >&2
     echo "--- rendered script: ${RENDERED} ---" >&2
     cat -- "${RENDERED}" >&2
