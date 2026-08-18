@@ -324,12 +324,12 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
 uprobe:@__LIBURMA__@:urma_post_jetty_send_wr
 {
     @cnt["urma_post_jetty_send_wr"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 1] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 1] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
-/ @e[tid, 1] /
+/ @ed[tid, 1] /
 {
-    $d = nsecs - @e[tid, 1];
+    $d = nsecs - @ed[tid, 1];
     @lat["urma_post_jetty_send_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jetty_send_wr"] = sum($d);
     @max["urma_post_jetty_send_wr"] = max($d);
@@ -337,18 +337,18 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
         @slow["urma_post_jetty_send_wr"] = count();
         printf("[SLOW] urma_post_jetty_send_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 1]);
+    delete(@ed[tid, 1]);
 }
 
 uprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
 {
     @cnt["urma_post_jetty_recv_wr"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 2] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 2] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
-/ @e[tid, 2] /
+/ @ed[tid, 2] /
 {
-    $d = nsecs - @e[tid, 2];
+    $d = nsecs - @ed[tid, 2];
     @lat["urma_post_jetty_recv_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jetty_recv_wr"] = sum($d);
     @max["urma_post_jetty_recv_wr"] = max($d);
@@ -356,18 +356,18 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
         @slow["urma_post_jetty_recv_wr"] = count();
         printf("[SLOW] urma_post_jetty_recv_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 2]);
+    delete(@ed[tid, 2]);
 }
 
 uprobe:@__LIBURMA__@:urma_post_jfr_wr
 {
     @cnt["urma_post_jfr_wr"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 3] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 3] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jfr_wr
-/ @e[tid, 3] /
+/ @ed[tid, 3] /
 {
-    $d = nsecs - @e[tid, 3];
+    $d = nsecs - @ed[tid, 3];
     @lat["urma_post_jfr_wr"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_post_jfr_wr"] = sum($d);
     @max["urma_post_jfr_wr"] = max($d);
@@ -375,18 +375,18 @@ uretprobe:@__LIBURMA__@:urma_post_jfr_wr
         @slow["urma_post_jfr_wr"] = count();
         printf("[SLOW] urma_post_jfr_wr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 3]);
+    delete(@ed[tid, 3]);
 }
 
 uprobe:@__LIBURMA__@:urma_poll_jfc
 {
     @cnt["urma_poll_jfc"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 4] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 4] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_poll_jfc
-/ @e[tid, 4] /
+/ @ed[tid, 4] /
 {
-    $d = nsecs - @e[tid, 4];
+    $d = nsecs - @ed[tid, 4];
     @lat["urma_poll_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_poll_jfc"] = sum($d);
     @max["urma_poll_jfc"] = max($d);
@@ -394,18 +394,18 @@ uretprobe:@__LIBURMA__@:urma_poll_jfc
         @slow["urma_poll_jfc"] = count();
         printf("[SLOW] urma_poll_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 4]);
+    delete(@ed[tid, 4]);
 }
 
 uprobe:@__LIBURMA__@:urma_rearm_jfc
 {
     @cnt["urma_rearm_jfc"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 5] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 5] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_rearm_jfc
-/ @e[tid, 5] /
+/ @ed[tid, 5] /
 {
-    $d = nsecs - @e[tid, 5];
+    $d = nsecs - @ed[tid, 5];
     @lat["urma_rearm_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_rearm_jfc"] = sum($d);
     @max["urma_rearm_jfc"] = max($d);
@@ -413,18 +413,18 @@ uretprobe:@__LIBURMA__@:urma_rearm_jfc
         @slow["urma_rearm_jfc"] = count();
         printf("[SLOW] urma_rearm_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 5]);
+    delete(@ed[tid, 5]);
 }
 
 uprobe:@__LIBURMA__@:urma_wait_jfc
 {
     @cnt["urma_wait_jfc"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 6] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 6] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_wait_jfc
-/ @e[tid, 6] /
+/ @ed[tid, 6] /
 {
-    $d = nsecs - @e[tid, 6];
+    $d = nsecs - @ed[tid, 6];
     @lat["urma_wait_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_wait_jfc"] = sum($d);
     @max["urma_wait_jfc"] = max($d);
@@ -432,18 +432,18 @@ uretprobe:@__LIBURMA__@:urma_wait_jfc
         @slow["urma_wait_jfc"] = count();
         printf("[SLOW] urma_wait_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 6]);
+    delete(@ed[tid, 6]);
 }
 
 uprobe:@__LIBURMA__@:urma_ack_jfc
 {
     @cnt["urma_ack_jfc"] = count();
-    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 7] = nsecs; }
+    if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 7] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_ack_jfc
-/ @e[tid, 7] /
+/ @ed[tid, 7] /
 {
-    $d = nsecs - @e[tid, 7];
+    $d = nsecs - @ed[tid, 7];
     @lat["urma_ack_jfc"] = lhist($d / 1000, 0, 1000, 1);
     @sum["urma_ack_jfc"] = sum($d);
     @max["urma_ack_jfc"] = max($d);
@@ -451,7 +451,7 @@ uretprobe:@__LIBURMA__@:urma_ack_jfc
         @slow["urma_ack_jfc"] = count();
         printf("[SLOW] urma_ack_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
     }
-    delete(@e[tid, 7]);
+    delete(@ed[tid, 7]);
 }
 
 /* ========================================================================
