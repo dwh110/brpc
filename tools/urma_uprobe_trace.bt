@@ -26,25 +26,9 @@
 
 BEGIN
 {
-    @enabled = 0;
     printf("urma uprobe tracer attached. lib=@__LIBURMA__@ sample_rate=1/@__SAMPLE_RATE__@\n");
     printf("Control-plane always traced (warm-up path).\n");
-    printf("Data-plane OFF by default; send SIGUSR1 to this bpftrace pid to toggle.\n");
-    printf("  kill -USR1 <bpftrace_pid>   # toggle data-plane on/off\n");
-    printf("Ctrl-C for final stats.\n\n");
-}
-
-/* Toggle data-plane tracing on/off via SIGUSR1. When OFF, data-plane probes
- * still trap (unavoidable uprobe cost) but the BPF body is skipped — only the
- * predicate `@enabled` (one map lookup) is evaluated. */
-signal:SIGUSR1
-{
-    @enabled = @enabled == 0;
-    if (@enabled) {
-        printf("[ON]  data-plane tracing ON  (sample 1/@__SAMPLE_RATE__@)\n");
-    } else {
-        printf("[OFF] data-plane tracing OFF\n");
-    }
+    printf("Data-plane sampled at 1/@__SAMPLE_RATE__@. Ctrl-C for final stats.\n\n");
 }
 
 /* ========================================================================
@@ -318,14 +302,11 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
 /* ========================================================================
  * Data-plane: per-RPC hot path.
  *
- * Overhead control (3 layers):
- *   1. @enabled gate: data-plane bodies skipped when @enabled == 0 (SIGUSR1).
- *      When off, only the predicate is evaluated (one map lookup ~10ns) on
- *      every uprobe trap; map writes are skipped entirely.
- *   2. Sampling: only 1/SAMPLE_RATE entries record a timestamp. The return
+ * Overhead control (2 layers):
+ *   1. Sampling: only 1/SAMPLE_RATE entries record a timestamp. The return
  *      probe checks for the entry map key; if absent (99% of calls), it does
  *      nothing. This bounds per-hit work to the trap + predicate cost.
- *   3. Integer @e keys (1..7): integer-keyed map lookups are ~5x faster than
+ *   2. Integer @e keys (1..7): integer-keyed map lookups are ~5x faster than
  *      string-keyed. Output maps (@cnt/@lat/@sum/@max) keep string keys for
  *      readability since they are only updated on the sampled return path.
  *
@@ -335,13 +316,12 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
  *   7=urma_ack_jfc
  *
  * NOTE: uprobe trap cost (~200-500ns/hit on modern kernels) is paid on EVERY
- * call regardless of @enabled/sampling — it is the kernel breakpoint cost.
- * For TRUE zero overhead when not capturing, kill bpftrace and restart only
- * for short capture windows.
+ * call regardless of sampling — it is the kernel breakpoint cost. For TRUE
+ * zero overhead when not capturing, kill bpftrace and restart only for short
+ * capture windows.
  * ====================================================================== */
 
 uprobe:@__LIBURMA__@:urma_post_jetty_send_wr
-/ @enabled /
 {
     @cnt["urma_post_jetty_send_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 1] = nsecs; }
@@ -361,7 +341,6 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
 }
 
 uprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
-/ @enabled /
 {
     @cnt["urma_post_jetty_recv_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 2] = nsecs; }
@@ -381,7 +360,6 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
 }
 
 uprobe:@__LIBURMA__@:urma_post_jfr_wr
-/ @enabled /
 {
     @cnt["urma_post_jfr_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 3] = nsecs; }
@@ -401,7 +379,6 @@ uretprobe:@__LIBURMA__@:urma_post_jfr_wr
 }
 
 uprobe:@__LIBURMA__@:urma_poll_jfc
-/ @enabled /
 {
     @cnt["urma_poll_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 4] = nsecs; }
@@ -421,7 +398,6 @@ uretprobe:@__LIBURMA__@:urma_poll_jfc
 }
 
 uprobe:@__LIBURMA__@:urma_rearm_jfc
-/ @enabled /
 {
     @cnt["urma_rearm_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 5] = nsecs; }
@@ -441,7 +417,6 @@ uretprobe:@__LIBURMA__@:urma_rearm_jfc
 }
 
 uprobe:@__LIBURMA__@:urma_wait_jfc
-/ @enabled /
 {
     @cnt["urma_wait_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 6] = nsecs; }
@@ -461,7 +436,6 @@ uretprobe:@__LIBURMA__@:urma_wait_jfc
 }
 
 uprobe:@__LIBURMA__@:urma_ack_jfc
-/ @enabled /
 {
     @cnt["urma_ack_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @e[tid, 7] = nsecs; }

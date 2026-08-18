@@ -8,11 +8,7 @@
 #   sudo ./urma_uprobe_trace.sh -n my_server    # trace by process name
 #   sudo ./urma_uprobe_trace.sh -l /opt/umdk/lib/liburma.so.0  # force lib path
 #
-# Data-plane tracing is OFF by default. After bpftrace attaches, toggle it:
-#   kill -USR1 <bpftrace_pid>          # ON: sample 1/${SAMPLE_RATE:-100} of calls
-#   kill -USR1 <bpftrace_pid>          # OFF again
-#
-# Override sample rate (default 100 = 1% of data-plane calls):
+# Data-plane sampled at 1/SAMPLE_RATE (default 100 = 1%). Override:
 #   sudo SAMPLE_RATE=50 ./urma_uprobe_trace.sh -n my_server   # sample 1/50
 #
 # Output goes to stdout (bpftrace). Pair with:
@@ -126,32 +122,42 @@ sed -e "s|@__LIBURMA__@|${LIB}|g" \
 
 echo "sample_rate: 1/${SAMPLE_RATE}  (override via SAMPLE_RATE=N)"
 
-# dry-run compile to catch template errors before attaching.
-# Prefer --dry-run (newer bpftrace); fall back to -d (older versions, still
-# only parses/compiles — does not attach).
-bpftrace_dry_run() {
-    if bpftrace --help 2>&1 | grep -q -- '--dry-run'; then
-        bpftrace --dry-run "$1" 2>"${DRY_ERR}"
-    else
-        bpftrace -d "$1" >/dev/null 2>"${DRY_ERR}"
-    fi
-}
+# dry-run: parse/compile only (-d), does not attach. Catches template errors.
 DRY_ERR="$(mktemp --tmpdir urma_dryrun.XXXX.log)"
-if ! bpftrace_dry_run "${RENDERED}"; then
-    echo "bpftrace dry-run failed; actual error:" >&2
+if ! bpftrace -d "${RENDERED}" >/dev/null 2>"${DRY_ERR}"; then
+    echo "bpftrace dry-run failed:" >&2
     cat -- "${DRY_ERR}" >&2
-    echo "--- rendered script: ${RENDERED} ---" >&2
-    cat -- "${RENDERED}" >&2
     rm -f -- "${DRY_ERR}"
     exit 1
 fi
 rm -f -- "${DRY_ERR}"
 
 # --- attach -------------------------------------------------------------------
+LOGFILE="$(mktemp --tmpdir urma_trace.XXXX.log)"
+trap 'rm -f -- "${RENDERED}" "${LOGFILE}"' EXIT
+
 echo "attaching... (Ctrl-C to stop and print final report)"
-echo "data-plane OFF; toggle with: kill -USR1 \$  (bpftrace pid, see below)"
 if [[ -n "${PID}" ]]; then
-    exec bpftrace -p "${PID}" "${RENDERED}"
+    bpftrace -p "${PID}" "${RENDERED}" 2>&1 | tee "${LOGFILE}"
 else
-    exec bpftrace "${RENDERED}"
+    bpftrace "${RENDERED}" 2>&1 | tee "${LOGFILE}"
+fi
+
+# --- summary -----------------------------------------------------------------
+SUMMARY="${SCRIPT_DIR}/urma_trace_summary.py"
+if [[ -f "${SUMMARY}" ]]; then
+    PYTHON=""
+    for p in python3 python; do
+        if command -v "$p" &>/dev/null; then
+            PYTHON="$p"; break
+        fi
+    done
+    if [[ -n "${PYTHON}" ]]; then
+        echo ""
+        "${PYTHON}" "${SUMMARY}" "${LOGFILE}"
+    else
+        echo "python not found; raw log at ${LOGFILE}" >&2
+    fi
+else
+    echo "summary script not found: ${SUMMARY}; raw log at ${LOGFILE}" >&2
 fi
