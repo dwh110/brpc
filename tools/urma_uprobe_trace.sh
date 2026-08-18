@@ -113,11 +113,16 @@ trap 'rm -f -- "${RENDERED}"' EXIT
 sed "s|@__LIBURMA__@|${LIB}|g" "${TEMPLATE}" > "${RENDERED}"
 
 # dry-run compile to catch template errors before attaching
-if ! bpftrace --dry-run "${RENDERED}" >/dev/null 2>&1; then
-    echo "bpftrace --dry-run failed on rendered script; dumping it:" >&2
+DRY_ERR="$(mktemp --tmpdir urma_dryrun.XXXX.log)"
+if ! bpftrace --dry-run "${RENDERED}" 2>"${DRY_ERR}"; then
+    echo "bpftrace --dry-run failed; actual error:" >&2
+    cat -- "${DRY_ERR}" >&2
+    echo "--- rendered script: ${RENDERED} ---" >&2
     cat -- "${RENDERED}" >&2
+    rm -f -- "${DRY_ERR}"
     exit 1
 fi
+rm -f -- "${DRY_ERR}"
 
 # --- attach -------------------------------------------------------------------
 echo "attaching... (Ctrl-C to stop and print final report)"
