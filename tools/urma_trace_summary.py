@@ -45,6 +45,14 @@ def parse_bucket_line(line):
     The ASCII bar (|@@@@...) is stripped before parsing.
     """
     line = line.split("|")[0].strip()
+    # [low, ...) count  — lhist overflow (check BEFORE normal range!)
+    m = re.match(r"\[([^\],]+),\s*\.\.\.\)\s+(\d+)", line)
+    if m:
+        return (parse_num(m.group(1)), float("inf"), int(m.group(2)))
+    # (..., high) count  — lhist underflow (treat as [0, high))
+    m = re.match(r"\(\.\.\.,\s*([^\)]+)\)\s+(\d+)", line)
+    if m:
+        return (0, parse_num(m.group(1)), int(m.group(2)))
     # [low, high) count  — normal range bucket
     m = re.match(r"\[([^\],]+),\s*([^\]]+)\)\s+(\d+)", line)
     if m:
@@ -54,14 +62,6 @@ def parse_bucket_line(line):
     if m:
         v = parse_num(m.group(1))
         return (v, v + 1, int(m.group(2)))
-    # (..., high) count  — lhist underflow (treat as [0, high))
-    m = re.match(r"\(\.\.\.,\s*([^\)]+)\)\s+(\d+)", line)
-    if m:
-        return (0, parse_num(m.group(1)), int(m.group(2)))
-    # [low, ...) count  — lhist overflow
-    m = re.match(r"\[([^\],]+),\s*\.\.\.\)\s+(\d+)", line)
-    if m:
-        return (parse_num(m.group(1)), float("inf"), int(m.group(2)))
     return None
 
 
