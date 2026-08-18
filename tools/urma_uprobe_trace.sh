@@ -133,8 +133,8 @@ fi
 rm -f -- "${DRY_ERR}"
 
 # --- attach -------------------------------------------------------------------
-LOGFILE="$(mktemp --tmpdir urma_trace.XXXX.log)"
-trap 'rm -f -- "${RENDERED}" "${LOGFILE}"' EXIT
+LOGFILE="/tmp/urma_trace_$(date +%Y%m%d_%H%M%S).log"
+trap 'rm -f -- "${RENDERED}"' EXIT
 
 echo "attaching... (Ctrl-C to stop and print final report)"
 if [[ -n "${PID}" ]]; then
@@ -154,6 +154,7 @@ if [[ -f "${SUMMARY}" ]]; then
     done
     if [[ -n "${PYTHON}" ]]; then
         echo ""
+        echo "=== summary: ${PYTHON} ${SUMMARY} ${LOGFILE} ==="
         "${PYTHON}" "${SUMMARY}" "${LOGFILE}"
     else
         echo "python not found; raw log at ${LOGFILE}" >&2
