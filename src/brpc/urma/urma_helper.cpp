@@ -533,12 +533,48 @@ static bool GlobalUrmaInitializeImpl() {
         urma_free_device_list(devices);
         return false;
     }
+    // Device selection strategy (mirrors HCOM's ub_device_helper.cpp):
+    // 1. If FLAGS_urma_device is set, use the exact match.
+    // 2. Otherwise prefer "bonding_dev_0" (or any "bonding_dev_*") because
+    //    the bonding virtual device aggregates multiple physical UDMA
+    //    instances and provides a unified EID for cross-node communication.
+    //    Raw udma devices (e.g. udmac0d1e3, udmac0d1e4) are on different
+    //    physical ports and cannot establish a Transport Path (TP) between
+    //    each other — using them leads to TP-level AE errors and
+    //    URMA_CR_LOC_ACCESS_ERR (status=4) on the data path.
+    // 3. Fall back to the first device if no bonding device is found.
     urma_device_t* found = nullptr;
-    for (int i = 0; i < num_devices; ++i) {
-        if (FLAGS_urma_device.empty() ||
-            std::string(devices[i]->name) == FLAGS_urma_device) {
-            found = devices[i];
-            break;
+    if (!FLAGS_urma_device.empty()) {
+        for (int i = 0; i < num_devices; ++i) {
+            if (std::string(devices[i]->name) == FLAGS_urma_device) {
+                found = devices[i];
+                break;
+            }
+        }
+    } else {
+        // First pass: look for bonding_dev_0
+        for (int i = 0; i < num_devices; ++i) {
+            if (std::string(devices[i]->name) == "bonding_dev_0") {
+                found = devices[i];
+                break;
+            }
+        }
+        // Second pass: any bonding_dev_* device
+        if (!found) {
+            for (int i = 0; i < num_devices; ++i) {
+                if (IsBondingDeviceName(devices[i]->name)) {
+                    found = devices[i];
+                    break;
+                }
+            }
+        }
+        // Third pass: fall back to first available device
+        if (!found) {
+            found = devices[0];
+            LOG(WARNING) << "No bonding device found; falling back to '"
+                         << found->name << "'. Cross-node URMA communication "
+                         << "may fail with TP-level errors. Consider loading "
+                         << "the bonding kernel module (ubagg/bondp).";
         }
     }
     if (!found) {
