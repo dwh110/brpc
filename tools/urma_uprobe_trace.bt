@@ -305,10 +305,11 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
  * Overhead control (2 layers):
  *   1. Sampling: only 1/SAMPLE_RATE entries record a timestamp. The return
  *      probe checks for the entry map key; if absent (99% of calls), it does
- *      nothing. This bounds per-hit work to the trap + predicate cost.
- *   2. Integer @e keys (1..7): integer-keyed map lookups are ~5x faster than
- *      string-keyed. Output maps (@cnt/@lat/@sum/@max) keep string keys for
- *      readability since they are only updated on the sampled return path.
+ *      nothing. Entry probe is just one modulo + conditional map write.
+ *   2. Integer @ed keys (1..7): integer-keyed map lookups are ~5x faster than
+ *      string-keyed. @cnt is NOT used on data-plane (avoids string-keyed
+ *      per-CPU aggregation on every call). Call counts are derived from
+ *      @lat bucket sums in urma_trace_summary.py.
  *
  * Integer key legend:
  *   1=urma_post_jetty_send_wr  2=urma_post_jetty_recv_wr  3=urma_post_jfr_wr
@@ -323,7 +324,6 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
 
 uprobe:@__LIBURMA__@:urma_post_jetty_send_wr
 {
-    @cnt["urma_post_jetty_send_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 1] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
@@ -342,7 +342,6 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_send_wr
 
 uprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
 {
-    @cnt["urma_post_jetty_recv_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 2] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
@@ -361,7 +360,6 @@ uretprobe:@__LIBURMA__@:urma_post_jetty_recv_wr
 
 uprobe:@__LIBURMA__@:urma_post_jfr_wr
 {
-    @cnt["urma_post_jfr_wr"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 3] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_post_jfr_wr
@@ -380,7 +378,6 @@ uretprobe:@__LIBURMA__@:urma_post_jfr_wr
 
 uprobe:@__LIBURMA__@:urma_poll_jfc
 {
-    @cnt["urma_poll_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 4] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_poll_jfc
@@ -399,7 +396,6 @@ uretprobe:@__LIBURMA__@:urma_poll_jfc
 
 uprobe:@__LIBURMA__@:urma_rearm_jfc
 {
-    @cnt["urma_rearm_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 5] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_rearm_jfc
@@ -418,7 +414,6 @@ uretprobe:@__LIBURMA__@:urma_rearm_jfc
 
 uprobe:@__LIBURMA__@:urma_wait_jfc
 {
-    @cnt["urma_wait_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 6] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_wait_jfc
@@ -437,7 +432,6 @@ uretprobe:@__LIBURMA__@:urma_wait_jfc
 
 uprobe:@__LIBURMA__@:urma_ack_jfc
 {
-    @cnt["urma_ack_jfc"] = count();
     if ((nsecs % @__SAMPLE_RATE__@) == 0) { @ed[tid, 7] = nsecs; }
 }
 uretprobe:@__LIBURMA__@:urma_ack_jfc
@@ -455,23 +449,13 @@ uretprobe:@__LIBURMA__@:urma_ack_jfc
 }
 
 /* ========================================================================
- * Periodic summary: top callers by count every 5 seconds.
- * ====================================================================== */
-interval:s:5
-{
-    time("[%H:%M:%S] top callers @cnt:\n");
-    print(@cnt);
-    clear(@cnt);
-}
-
-/* ========================================================================
  * Final report on Ctrl-C.
  * ====================================================================== */
 END
 {
     printf("\n==================== FINAL REPORT ====================\n");
 
-    printf("\n--- Call counts (@cnt) ---\n");
+    printf("\n--- Control-plane call counts (@cnt) ---\n");
     print(@cnt);
 
     printf("\n--- Total time spent per function, in ms (@sum / 1e6) ---\n");
