@@ -137,11 +137,18 @@ LOGFILE="/tmp/urma_trace_$(date +%Y%m%d_%H%M%S).log"
 trap 'rm -f -- "${RENDERED}"' EXIT
 
 echo "attaching... (Ctrl-C to stop and print final report)"
+echo "trace log: ${LOGFILE}"
+# Ignore SIGINT in this script so Ctrl-C only stops bpftrace (which handles
+# SIGINT itself: runs END block, then exits). After bpftrace exits, the script
+# continues to the summary section. `|| true` absorbs the non-zero exit from
+# the pipeline under `set -e`/`pipefail`.
+trap '' INT
 if [[ -n "${PID}" ]]; then
-    bpftrace -p "${PID}" "${RENDERED}" 2>&1 | tee "${LOGFILE}"
+    bpftrace -p "${PID}" "${RENDERED}" 2>&1 | tee "${LOGFILE}" || true
 else
-    bpftrace "${RENDERED}" 2>&1 | tee "${LOGFILE}"
+    bpftrace "${RENDERED}" 2>&1 | tee "${LOGFILE}" || true
 fi
+trap - INT
 
 # --- summary -----------------------------------------------------------------
 SUMMARY="${SCRIPT_DIR}/urma_trace_summary.py"
