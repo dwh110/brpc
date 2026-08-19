@@ -220,6 +220,9 @@ def main():
         p90, of90 = percentile(buckets, 90)
         p99, of99 = percentile(buckets, 99)
         p999, of999 = percentile(buckets, 99.9)
+        avg_us = (
+            sum_ns.get(func, 0) / 1000.0 / calls if calls > 0 else 0.0
+        )  # ns->us / calls
         mx_us = max_ns.get(func, 0) / 1000.0  # ns -> us
         sw = slow.get(func, 0)
         total_ms = sum_ns.get(func, 0) / 1e6  # ns -> ms
@@ -235,6 +238,7 @@ def main():
                 of99,
                 p999,
                 of999,
+                avg_us,
                 mx_us,
                 sw,
                 total_ms,
@@ -243,7 +247,7 @@ def main():
 
     hdr = (
         f"{'Function':<28} {'Calls':>10} {'P50':>9} {'P90':>9} "
-        f"{'P99':>9} {'P99.9':>10} {'Max':>10} {'Slow':>6} {'Total':>10}"
+        f"{'P99':>9} {'P99.9':>10} {'Avg':>9} {'Max':>10} {'Slow':>6} {'Total':>10}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -259,6 +263,7 @@ def main():
         of99,
         p999,
         of999,
+        avg_us,
         mx_us,
         sw,
         total_ms,
@@ -268,7 +273,7 @@ def main():
             f"{func:<28} {fmt_count(calls):>10} "
             f"{fmt_lat(p50, of50):>9} {fmt_lat(p90, of90):>9} "
             f"{fmt_lat(p99, of99):>9} {fmt_lat(p999, of999):>10} "
-            f"{fmt_lat(mx_us):>10} {sw:>6} {fmt_total(total_ms):>10}{flag}"
+            f"{fmt_lat(avg_us):>9} {fmt_lat(mx_us):>10} {sw:>6} {fmt_total(total_ms):>10}{flag}"
         )
 
     print()
