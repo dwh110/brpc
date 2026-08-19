@@ -68,9 +68,8 @@ def parse_bucket_line(line):
 def parse(data):
     """Parse bpftrace output text.
 
-    Returns (lat_data, cnt, sum_ns, max_ns, slow, cp_data) where:
-      lat_data: {func: [(low, high, count), ...]}  — data-plane histograms
-      cp_data:  {func: [lat_us, ...]}               — control-plane per-call latencies
+    Returns (lat_data, cnt, sum_ns, max_ns, slow) where:
+      lat_data: {func: [(low, high, count), ...]}
       cnt/sum_ns/max_ns/slow: {func: int}
     """
     lat_data = {}
@@ -78,7 +77,6 @@ def parse(data):
     sum_ns = {}
     max_ns = {}
     slow = {}
-    cp_data = {}
 
     cur_func = None
     cur_buckets = []
@@ -107,12 +105,6 @@ def parse(data):
                 cur_func = None
                 cur_buckets = []
 
-        # Control-plane per-call printf: [func_name] pid=X tid=Y lat=Z us
-        # (excludes [SLOW] lines — those have "urma_xxx" after the bracket)
-        m = re.match(r"\[([^\]]+)\] pid=\d+ tid=\d+ lat=(\d+) us", line)
-        if m and m.group(1) != "SLOW":
-            cp_data.setdefault(m.group(1).strip(), []).append(int(m.group(2)))
-
         # @cnt[func]: value  (and @sum, @max, @slow — same format)
         for name, target in (
             ("@cnt", cnt),
@@ -128,7 +120,7 @@ def parse(data):
     if cur_func and cur_buckets:
         lat_data[cur_func] = cur_buckets
 
-    return lat_data, cnt, sum_ns, max_ns, slow, cp_data
+    return lat_data, cnt, sum_ns, max_ns, slow
 
 
 # ---------------------------------------------------------------------------
@@ -160,22 +152,6 @@ def percentile(buckets, p):
     # Beyond last bucket
     last = buckets[-1] if buckets else (0, 0, 0)
     return float(last[1]), last[1] == float("inf")
-
-
-def percentile_raw(values, p):
-    """Compute the p-th percentile (0..100) from a list of raw values via
-    linear interpolation between nearest ranks. Returns (value_us, False)."""
-    if not values:
-        return 0.0, False
-    sv = sorted(values)
-    n = len(sv)
-    if n == 1:
-        return float(sv[0]), False
-    target = p / 100.0 * (n - 1)
-    lower = int(target)
-    upper = min(lower + 1, n - 1)
-    frac = target - lower
-    return sv[lower] + frac * (sv[upper] - sv[lower]), False
 
 
 # ---------------------------------------------------------------------------
@@ -227,18 +203,16 @@ def main():
     else:
         data = sys.stdin.read()
 
-    lat_data, cnt, sum_ns, max_ns, slow, cp_data = parse(data)
+    lat_data, cnt, sum_ns, max_ns, slow = parse(data)
 
-    if not lat_data and not cp_data:
+    if not lat_data:
         print(
-            "No @lat or control-plane data found. Is this bpftrace output from urma_uprobe_trace.bt?",
+            "No @lat data found. Is this bpftrace output from urma_uprobe_trace.bt?",
             file=sys.stderr,
         )
         sys.exit(1)
 
     rows = []
-
-    # --- Data-plane: stats from @lat histograms ---
     for func in sorted(lat_data.keys()):
         buckets = lat_data[func]
         calls = sum(c for _, _, c in buckets)
@@ -268,44 +242,11 @@ def main():
                 mx_us,
                 sw,
                 total_ms,
-                "dp",
-            )
-        )
-
-    # --- Control-plane: stats from per-call printf latencies ---
-    for func in sorted(cp_data.keys()):
-        values = cp_data[func]
-        calls = len(values)
-        p50, of50 = percentile_raw(values, 50)
-        p90, of90 = percentile_raw(values, 90)
-        p99, of99 = percentile_raw(values, 99)
-        p999, of999 = percentile_raw(values, 99.9)
-        avg_us = sum(values) / calls if calls > 0 else 0.0
-        mx_us = float(max(values)) if values else 0.0
-        sw = sum(1 for v in values if v > 1000)
-        total_ms = sum(values) / 1000.0  # us -> ms
-        rows.append(
-            (
-                func,
-                calls,
-                p50,
-                of50,
-                p90,
-                of90,
-                p99,
-                of99,
-                p999,
-                of999,
-                avg_us,
-                mx_us,
-                sw,
-                total_ms,
-                "cp",
             )
         )
 
     hdr = (
-        f"{'Function':<28} {'Type':>4} {'Calls':>10} {'P50':>9} {'P90':>9} "
+        f"{'Function':<28} {'Calls':>10} {'P50':>9} {'P90':>9} "
         f"{'P99':>9} {'P99.9':>10} {'Avg':>9} {'Max':>10} {'Slow':>6} {'Total':>10}"
     )
     print(hdr)
@@ -326,24 +267,22 @@ def main():
         mx_us,
         sw,
         total_ms,
-        ftype,
     ) in rows:
         flag = " *" if (sw > 0 or p999 > 1000) else ""
         print(
-            f"{func:<28} {ftype:>4} {fmt_count(calls):>10} "
+            f"{func:<28} {fmt_count(calls):>10} "
             f"{fmt_lat(p50, of50):>9} {fmt_lat(p90, of90):>9} "
             f"{fmt_lat(p99, of99):>9} {fmt_lat(p999, of999):>10} "
             f"{fmt_lat(avg_us):>9} {fmt_lat(mx_us):>10} {sw:>6} {fmt_total(total_ms):>10}{flag}"
         )
 
     print()
-    print(
-        "Type: dp=data-plane (sampled, from @lat), cp=control-plane (full, from per-call printf)."
-    )
     print("Units: us=microseconds, ms=milliseconds, s=seconds.")
-    print("Calls  = sample count (dp) or actual call count (cp).")
-    print("Total  = cumulative time.")
-    print("Slow   = count of calls >1ms.")
+    print(
+        "Calls  = count of latency samples in @lat (sampled subset if SAMPLE_RATE>1)."
+    )
+    print("Total  = cumulative time from @sum.")
+    print("Slow   = count of calls >1ms (@slow).")
     print(
         "*      = function has slow calls or P99.9 > 1ms (investigate warm-up/outliers)."
     )

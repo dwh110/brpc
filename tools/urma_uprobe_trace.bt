@@ -45,7 +45,13 @@ uretprobe:@__LIBURMA__@:urma_init
 / @e[tid, 101] /
 {
     $d = nsecs - @e[tid, 101];
-    printf("[urma_init] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_init"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_init"] = sum($d);
+    @max["urma_init"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_init"] = count();
+        printf("[SLOW] urma_init pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 101]);
 }
 
@@ -55,7 +61,13 @@ uretprobe:@__LIBURMA__@:urma_uninit
 / @e[tid, 102] /
 {
     $d = nsecs - @e[tid, 102];
-    printf("[urma_uninit] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_uninit"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_uninit"] = sum($d);
+    @max["urma_uninit"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_uninit"] = count();
+        printf("[SLOW] urma_uninit pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 102]);
 }
 
@@ -65,7 +77,13 @@ uretprobe:@__LIBURMA__@:urma_get_device_list
 / @e[tid, 103] /
 {
     $d = nsecs - @e[tid, 103];
-    printf("[urma_get_device_list] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_get_device_list"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_get_device_list"] = sum($d);
+    @max["urma_get_device_list"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_get_device_list"] = count();
+        printf("[SLOW] urma_get_device_list pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 103]);
 }
 
@@ -75,7 +93,13 @@ uretprobe:@__LIBURMA__@:urma_free_device_list
 / @e[tid, 104] /
 {
     $d = nsecs - @e[tid, 104];
-    printf("[urma_free_device_list] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_free_device_list"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_free_device_list"] = sum($d);
+    @max["urma_free_device_list"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_free_device_list"] = count();
+        printf("[SLOW] urma_free_device_list pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 104]);
 }
 
@@ -85,7 +109,13 @@ uretprobe:@__LIBURMA__@:urma_query_device
 / @e[tid, 105] /
 {
     $d = nsecs - @e[tid, 105];
-    printf("[urma_query_device] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_query_device"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_query_device"] = sum($d);
+    @max["urma_query_device"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_query_device"] = count();
+        printf("[SLOW] urma_query_device pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 105]);
 }
 
@@ -95,7 +125,13 @@ uretprobe:@__LIBURMA__@:urma_get_eid_list
 / @e[tid, 106] /
 {
     $d = nsecs - @e[tid, 106];
-    printf("[urma_get_eid_list] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_get_eid_list"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_get_eid_list"] = sum($d);
+    @max["urma_get_eid_list"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_get_eid_list"] = count();
+        printf("[SLOW] urma_get_eid_list pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 106]);
 }
 
@@ -105,7 +141,13 @@ uretprobe:@__LIBURMA__@:urma_free_eid_list
 / @e[tid, 107] /
 {
     $d = nsecs - @e[tid, 107];
-    printf("[urma_free_eid_list] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_free_eid_list"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_free_eid_list"] = sum($d);
+    @max["urma_free_eid_list"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_free_eid_list"] = count();
+        printf("[SLOW] urma_free_eid_list pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 107]);
 }
 
@@ -115,7 +157,13 @@ uretprobe:@__LIBURMA__@:urma_create_context
 / @e[tid, 108] /
 {
     $d = nsecs - @e[tid, 108];
-    printf("[urma_create_context] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_create_context"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_create_context"] = sum($d);
+    @max["urma_create_context"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_create_context"] = count();
+        printf("[SLOW] urma_create_context pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 108]);
 }
 
@@ -125,7 +173,13 @@ uretprobe:@__LIBURMA__@:urma_delete_context
 / @e[tid, 109] /
 {
     $d = nsecs - @e[tid, 109];
-    printf("[urma_delete_context] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_delete_context"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_delete_context"] = sum($d);
+    @max["urma_delete_context"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_delete_context"] = count();
+        printf("[SLOW] urma_delete_context pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 109]);
 }
 
@@ -135,7 +189,13 @@ uretprobe:@__LIBURMA__@:urma_user_ctl
 / @e[tid, 110] /
 {
     $d = nsecs - @e[tid, 110];
-    printf("[urma_user_ctl] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_user_ctl"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_user_ctl"] = sum($d);
+    @max["urma_user_ctl"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_user_ctl"] = count();
+        printf("[SLOW] urma_user_ctl pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 110]);
 }
 
@@ -145,7 +205,13 @@ uretprobe:@__LIBURMA__@:urma_create_jfce
 / @e[tid, 111] /
 {
     $d = nsecs - @e[tid, 111];
-    printf("[urma_create_jfce] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_create_jfce"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_create_jfce"] = sum($d);
+    @max["urma_create_jfce"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_create_jfce"] = count();
+        printf("[SLOW] urma_create_jfce pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 111]);
 }
 
@@ -155,7 +221,13 @@ uretprobe:@__LIBURMA__@:urma_delete_jfce
 / @e[tid, 112] /
 {
     $d = nsecs - @e[tid, 112];
-    printf("[urma_delete_jfce] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_delete_jfce"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_delete_jfce"] = sum($d);
+    @max["urma_delete_jfce"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_delete_jfce"] = count();
+        printf("[SLOW] urma_delete_jfce pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 112]);
 }
 
@@ -165,7 +237,13 @@ uretprobe:@__LIBURMA__@:urma_create_jfc
 / @e[tid, 113] /
 {
     $d = nsecs - @e[tid, 113];
-    printf("[urma_create_jfc] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_create_jfc"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_create_jfc"] = sum($d);
+    @max["urma_create_jfc"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_create_jfc"] = count();
+        printf("[SLOW] urma_create_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 113]);
 }
 
@@ -175,7 +253,13 @@ uretprobe:@__LIBURMA__@:urma_delete_jfc
 / @e[tid, 114] /
 {
     $d = nsecs - @e[tid, 114];
-    printf("[urma_delete_jfc] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_delete_jfc"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_delete_jfc"] = sum($d);
+    @max["urma_delete_jfc"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_delete_jfc"] = count();
+        printf("[SLOW] urma_delete_jfc pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 114]);
 }
 
@@ -185,7 +269,13 @@ uretprobe:@__LIBURMA__@:urma_create_jfr
 / @e[tid, 115] /
 {
     $d = nsecs - @e[tid, 115];
-    printf("[urma_create_jfr] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_create_jfr"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_create_jfr"] = sum($d);
+    @max["urma_create_jfr"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_create_jfr"] = count();
+        printf("[SLOW] urma_create_jfr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 115]);
 }
 
@@ -195,7 +285,13 @@ uretprobe:@__LIBURMA__@:urma_delete_jfr
 / @e[tid, 116] /
 {
     $d = nsecs - @e[tid, 116];
-    printf("[urma_delete_jfr] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_delete_jfr"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_delete_jfr"] = sum($d);
+    @max["urma_delete_jfr"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_delete_jfr"] = count();
+        printf("[SLOW] urma_delete_jfr pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 116]);
 }
 
@@ -205,7 +301,13 @@ uretprobe:@__LIBURMA__@:urma_create_jetty
 / @e[tid, 117] /
 {
     $d = nsecs - @e[tid, 117];
-    printf("[urma_create_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_create_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_create_jetty"] = sum($d);
+    @max["urma_create_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_create_jetty"] = count();
+        printf("[SLOW] urma_create_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 117]);
 }
 
@@ -215,7 +317,13 @@ uretprobe:@__LIBURMA__@:urma_delete_jetty
 / @e[tid, 118] /
 {
     $d = nsecs - @e[tid, 118];
-    printf("[urma_delete_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_delete_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_delete_jetty"] = sum($d);
+    @max["urma_delete_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_delete_jetty"] = count();
+        printf("[SLOW] urma_delete_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 118]);
 }
 
@@ -225,7 +333,13 @@ uretprobe:@__LIBURMA__@:urma_modify_jetty
 / @e[tid, 119] /
 {
     $d = nsecs - @e[tid, 119];
-    printf("[urma_modify_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_modify_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_modify_jetty"] = sum($d);
+    @max["urma_modify_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_modify_jetty"] = count();
+        printf("[SLOW] urma_modify_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 119]);
 }
 
@@ -235,7 +349,13 @@ uretprobe:@__LIBURMA__@:urma_unbind_jetty
 / @e[tid, 120] /
 {
     $d = nsecs - @e[tid, 120];
-    printf("[urma_unbind_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_unbind_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_unbind_jetty"] = sum($d);
+    @max["urma_unbind_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_unbind_jetty"] = count();
+        printf("[SLOW] urma_unbind_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 120]);
 }
 
@@ -245,7 +365,13 @@ uretprobe:@__LIBURMA__@:urma_register_seg
 / @e[tid, 121] /
 {
     $d = nsecs - @e[tid, 121];
-    printf("[urma_register_seg] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_register_seg"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_register_seg"] = sum($d);
+    @max["urma_register_seg"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_register_seg"] = count();
+        printf("[SLOW] urma_register_seg pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 121]);
 }
 
@@ -255,7 +381,13 @@ uretprobe:@__LIBURMA__@:urma_unregister_seg
 / @e[tid, 122] /
 {
     $d = nsecs - @e[tid, 122];
-    printf("[urma_unregister_seg] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_unregister_seg"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_unregister_seg"] = sum($d);
+    @max["urma_unregister_seg"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_unregister_seg"] = count();
+        printf("[SLOW] urma_unregister_seg pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 122]);
 }
 
@@ -265,7 +397,13 @@ uretprobe:@__LIBURMA__@:urma_import_seg
 / @e[tid, 123] /
 {
     $d = nsecs - @e[tid, 123];
-    printf("[urma_import_seg] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_import_seg"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_import_seg"] = sum($d);
+    @max["urma_import_seg"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_import_seg"] = count();
+        printf("[SLOW] urma_import_seg pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 123]);
 }
 
@@ -275,7 +413,13 @@ uretprobe:@__LIBURMA__@:urma_unimport_seg
 / @e[tid, 124] /
 {
     $d = nsecs - @e[tid, 124];
-    printf("[urma_unimport_seg] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_unimport_seg"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_unimport_seg"] = sum($d);
+    @max["urma_unimport_seg"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_unimport_seg"] = count();
+        printf("[SLOW] urma_unimport_seg pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 124]);
 }
 
@@ -285,7 +429,13 @@ uretprobe:@__LIBURMA__@:urma_import_jetty
 / @e[tid, 125] /
 {
     $d = nsecs - @e[tid, 125];
-    printf("[urma_import_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_import_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_import_jetty"] = sum($d);
+    @max["urma_import_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_import_jetty"] = count();
+        printf("[SLOW] urma_import_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 125]);
 }
 
@@ -295,7 +445,13 @@ uretprobe:@__LIBURMA__@:urma_unimport_jetty
 / @e[tid, 126] /
 {
     $d = nsecs - @e[tid, 126];
-    printf("[urma_unimport_jetty] pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    @lat["urma_unimport_jetty"] = lhist($d / 1000, 0, 1000, 1);
+    @sum["urma_unimport_jetty"] = sum($d);
+    @max["urma_unimport_jetty"] = max($d);
+    if ($d > 1000000) {
+        @slow["urma_unimport_jetty"] = count();
+        printf("[SLOW] urma_unimport_jetty pid=%lu tid=%lu lat=%llu us\n", pid, tid, $d/1000);
+    }
     delete(@e[tid, 126]);
 }
 
