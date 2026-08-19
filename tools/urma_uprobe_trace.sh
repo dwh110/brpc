@@ -3,16 +3,18 @@
 # brpc actually uses, for brpc/URMA performance analysis.
 #
 # Usage:
-#   sudo ./urma_uprobe_trace.sh                 # trace all processes
-#   sudo ./urma_uprobe_trace.sh <pid>           # trace a specific brpc PID
-#   sudo ./urma_uprobe_trace.sh -n my_server    # trace by process name
+#   sudo ./urma_uprobe_trace.sh -e ./server -- --port 8080   # start & trace
+#   sudo ./urma_uprobe_trace.sh <pid>                         # trace running PID
+#   sudo ./urma_uprobe_trace.sh -n my_server                  # trace by name
 #   sudo ./urma_uprobe_trace.sh -l /opt/umdk/lib/liburma.so.0  # force lib path
+#
+# -e / --exec CMD: start bpftrace BEFORE CMD, so control-plane (warm-up)
+#   calls are captured. Use this when you need urma_init/create_*/import_*
+#   stats. Without -e, bpftrace attaches to a running process and misses
+#   startup.
 #
 # Data-plane sampled at 1/SAMPLE_RATE (default 100 = 1%). Override:
 #   sudo SAMPLE_RATE=50 ./urma_uprobe_trace.sh -n my_server   # sample 1/50
-#
-# Output goes to stdout (bpftrace). Pair with:
-#   sudo ./urma_uprobe_trace.sh <pid> 2>&1 | tee /tmp/urma_trace.log
 #
 # Requires: bpftrace (>= v0.11), root, CONFIG_UPROBES, liburma.so not stripped.
 
@@ -26,17 +28,17 @@ SAMPLE_RATE="${SAMPLE_RATE:-100}"
 
 usage() {
     cat <<EOF
-Usage: $0 [-n NAME] [-l LIBPATH] [-p PID] [PID]
+Usage: $0 [OPTIONS] [PID]
 
-  PID             trace this brpc PID (positional or -p)
+  -e, --exec CMD  start bpftrace, then exec CMD (captures warm-up/control-plane)
   -n, --name N    trace the process named N (resolved via pidof/pgrep)
+  -p PID          trace this brpc PID
   -l, --lib PATH  force liburma.so path (e.g. /opt/umdk/lib/liburma.so.0)
   -h, --help      this help
 
-If neither PID nor -n is given, traces ALL processes using liburma.so.
-If -l is omitted, the lib path is auto-detected:
-  - from /proc/<PID>/maps when a PID is given, else
-  - from ldconfig -p cache.
+If neither -e/-n/-p is given, traces ALL processes using liburma.so.
+If -l is omitted, the lib path is auto-detected from ldconfig -p cache,
+or from /proc/<PID>/maps when a PID is given.
 EOF
     exit 1
 }
@@ -44,13 +46,16 @@ EOF
 PID=""
 NAME=""
 LIB=""
+EXEC_CMD=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -e|--exec)  EXEC_CMD="$2"; shift 2 ;;
         -p)         PID="$2"; shift 2 ;;
         -n|--name)  NAME="$2"; shift 2 ;;
         -l|--lib)   LIB="$2"; shift 2 ;;
         -h|--help)  usage ;;
+        --)         shift; EXEC_CMD="$*"; shift $# ;;
         -*)         echo "unknown option: $1" >&2; usage ;;
         *)          PID="$1"; shift ;;
     esac
@@ -70,6 +75,11 @@ if [[ -n "${NAME}" ]]; then
         exit 1
     fi
     echo "resolved name '${NAME}' -> pid ${PID}"
+fi
+
+if [[ -n "${EXEC_CMD}" && -n "${PID}" ]]; then
+    echo "error: --exec and PID/-n are mutually exclusive" >&2
+    exit 1
 fi
 
 # --- locate liburma.so --------------------------------------------------------
@@ -136,16 +146,29 @@ rm -f -- "${DRY_ERR}"
 LOGFILE="/tmp/urma_trace_$(date +%Y%m%d_%H%M%S).log"
 trap 'rm -f -- "${RENDERED}"' EXIT
 
-echo "attaching... (Ctrl-C to stop and print final report)"
 echo "trace log: ${LOGFILE}"
-# Ignore SIGINT in this script so Ctrl-C only stops bpftrace (which handles
-# SIGINT itself: runs END block, then exits). After bpftrace exits, the script
-# continues to the summary section. `|| true` absorbs the non-zero exit from
-# the pipeline under `set -e`/`pipefail`.
+
+# Ignore SIGINT so Ctrl-C only stops bpftrace (or the target), not this script.
 trap '' INT
-if [[ -n "${PID}" ]]; then
+
+if [[ -n "${EXEC_CMD}" ]]; then
+    # --exec mode: start bpftrace (no PID filter, traces all procs), then run
+    # the target command. This captures control-plane/warm-up calls that happen
+    # before steady-state.
+    echo "starting bpftrace, then exec: ${EXEC_CMD}"
+    bpftrace "${RENDERED}" 2>&1 | tee "${LOGFILE}" &
+    BPID=$!
+    # Give bpftrace a moment to attach probes before the target starts.
+    sleep 1
+    # Run the target; when it exits, signal bpftrace to print END block.
+    bash -c "${EXEC_CMD}"
+    kill -INT "${BPID}" 2>/dev/null || true
+    wait "${BPID}" 2>/dev/null || true
+elif [[ -n "${PID}" ]]; then
+    echo "attaching to pid ${PID}... (Ctrl-C to stop and print final report)"
     bpftrace -p "${PID}" "${RENDERED}" 2>&1 | tee "${LOGFILE}" || true
 else
+    echo "attaching... (Ctrl-C to stop and print final report)"
     bpftrace "${RENDERED}" 2>&1 | tee "${LOGFILE}" || true
 fi
 trap - INT
