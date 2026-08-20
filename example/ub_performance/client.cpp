@@ -52,7 +52,6 @@ DEFINE_int32(test_seconds, 20, "Test running time");
 DEFINE_int32(test_iterations, 0, "Test iterations");
 DEFINE_int32(dummy_port, 8001, "Dummy server port number");
 DEFINE_int32(connect_timeout_ms, 2000, "connect timeout");
-DEFINE_int64(req_size, 0, "request size");
 DEFINE_bool(client_ignore_oc, false, "Client ignore eovercrowded, false by default");
 DEFINE_int32(max_retry, 3, "max retry times (0-1000)");
 DEFINE_int32(connect_retry_interval, 200, "connect retry interval(ms)");
@@ -71,7 +70,6 @@ int rr_index = 0;
 volatile bool g_stop = false;
 
 butil::atomic<int64_t> g_token(10000);
-std::string g_name;
 std::atomic<int64_t> g_totalSendNum(0);
 uint64_t g_test_duration = 0;
 #if BRPC_ENABLE_TRACE_SCOPE
@@ -158,7 +156,6 @@ public:
         }
         test::PerfTestRequest request;
         request.set_echo_attachment(_echo_attachment);
-        request.set_name(g_name);
         test::PerfTestService_Stub stub(_channel);
 
         int connect_retry_times = 0;
@@ -224,7 +221,6 @@ public:
             closure->cntl->ignore_eovercrowded();
         }
         request.set_echo_attachment(_echo_attachment);
-        request.set_name(g_name);
         closure->cntl->request_attachment().append(_attachment);
         closure->test = this;
         google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
@@ -246,12 +242,7 @@ public:
             g_server_cpu_recorder << atof(closure->resp->cpu_usage().c_str()) * 100;
         }
 
-        // 如果使用name字段request填充至指定长度，则计算name长度; 否则计算attachment长度
-        if (FLAGS_req_size != 0) {
-            g_total_bytes.fetch_add(closure->resp->name().size(), butil::memory_order_relaxed);
-        } else {
-            g_total_bytes.fetch_add(closure->cntl->request_attachment().size(), butil::memory_order_relaxed);
-        }
+        g_total_bytes.fetch_add(closure->cntl->request_attachment().size(), butil::memory_order_relaxed);
 
         g_total_cnt.fetch_add(1, butil::memory_order_relaxed);
 
@@ -329,7 +320,7 @@ void Test(int thread_num, int attachment_size) {
     std::cout << "[Threads: " << thread_num
         << ", Depth: " << FLAGS_queue_depth
         << ", Attachment: " << attachment_size << "B"
-        << ", string size: " << g_name.size() << "B"
+        << ", Attachment: " << attachment_size << "B"
         << ", use_urma=" << FLAGS_use_urma
         << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
         << std::endl;
@@ -415,7 +406,6 @@ int main(int argc, char* argv[]) {
         }
     }
 #endif
-    g_name.resize(FLAGS_req_size, 'r');
 
     g_token.store(FLAGS_initial_tokens);
 
