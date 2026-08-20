@@ -79,7 +79,7 @@ std::vector<size_t> g_request_pb_sizes;
 butil::atomic<size_t> g_pool_idx(0);
 std::atomic<int64_t> g_totalSendNum(0);
 uint64_t g_test_duration = 0;
-static const int64_t kMaxRpcIoNum = BRPC_TRACE_MAX_RPC_IO_NUM;
+static const int64_t kMaxRpcIoNum = 0;
 #if BRPC_ENABLE_TRACE_SCOPE
 int64_t g_step_capacity = 0;
 

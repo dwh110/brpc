@@ -74,7 +74,7 @@ butil::atomic<int64_t> g_token(10000);
 std::string g_name;
 std::atomic<int64_t> g_totalSendNum(0);
 uint64_t g_test_duration = 0;
-static const int64_t kMaxRpcIoNum = BRPC_TRACE_MAX_RPC_IO_NUM;
+static const int64_t kMaxRpcIoNum = 0;
 #if BRPC_ENABLE_TRACE_SCOPE
 int64_t g_step_capacity = 0;
 
@@ -329,7 +329,7 @@ void Test(int thread_num, int attachment_size) {
         << ", Attachment: " << attachment_size << "B"
         << ", string size: " << g_name.size() << "B"
         << ", use_urma=" << FLAGS_use_urma
-        << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no"])
+        << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
         << std::endl;
     g_total_bytes.store(0, butil::memory_order_relaxed);
     g_total_cnt.store(0, butil::memory_order_relaxed);
