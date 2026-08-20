@@ -31,7 +31,6 @@
 #include "press.pb.h"
 
 DEFINE_int32(port, 8002, "TCP Port of this server");
-DEFINE_bool(use_rdma, false, "Use RDMA or not");
 DEFINE_bool(use_ub, false, "Use UB or not");
 
 DEFINE_bool(server_ignore_oc, false, "Server ignore eovercrowded, false by default");
@@ -136,11 +135,8 @@ int main(int argc, char* argv[]) {
     }
 
     brpc::ServerOptions options;
-    if (FLAGS_use_ub) {
-        options.socket_mode = brpc::SOCKET_MODE_UBRING;
-    } else if (FLAGS_use_rdma) {
-        options.socket_mode = brpc::SOCKET_MODE_RDMA;
-    }
+    options.socket_mode = FLAGS_use_ub ? brpc::SOCKET_MODE_UBRING
+                                       : brpc::SOCKET_MODE_TCP;
     options.max_concurrency = FLAGS_max_concurrency;
     options.num_threads = FLAGS_num_threads;
     options.ignore_eovercrowded = FLAGS_server_ignore_oc;

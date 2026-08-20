@@ -29,9 +29,6 @@
 #include "butil/fast_rand.h"
 #include "butil/iobuf.h"
 #include "butil/logging.h"
-#ifdef WITH_RDMA
-#include "brpc/rdma/rdma_helper.h"
-#endif
 #include "brpc/server.h"
 #include "brpc/channel.h"
 #include "bthread/bthread.h"
@@ -49,7 +46,6 @@ DEFINE_bool(echo_attachment, false, "Select whether attachment should be echo");
 DEFINE_string(connection_type, "single", "Connection type of the channel");
 DEFINE_string(protocol, "baidu_std", "Protocol type.");
 DEFINE_string(servers, "0.0.0.0:8002+0.0.0.0:8002", "IP Address of servers");
-DEFINE_bool(use_rdma, false, "Use RDMA or not");
 DEFINE_bool(use_ub, false, "Use UB or not");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC call timeout");
 DEFINE_int32(test_seconds, 20, "Test running time");
@@ -144,11 +140,8 @@ public:
         }
 
         brpc::ChannelOptions options;
-        if (FLAGS_use_ub) {
-            options.socket_mode = brpc::SOCKET_MODE_UBRING;
-        } else if (FLAGS_use_rdma) {
-            options.socket_mode = brpc::SOCKET_MODE_RDMA;
-        }
+        options.socket_mode = FLAGS_use_ub ? brpc::SOCKET_MODE_UBRING
+                                           : brpc::SOCKET_MODE_TCP;
         options.protocol = FLAGS_protocol;
         options.connection_type = FLAGS_connection_type;
         options.timeout_ms = FLAGS_rpc_timeout_ms;
@@ -336,7 +329,6 @@ void Test(int thread_num, int attachment_size) {
         << ", Attachment: " << attachment_size << "B"
         << ", string size: " << g_name.size() << "B"
         << ", UB: " << (FLAGS_use_ub ? "yes" : "no")
-        << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
         << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
         << std::endl;
     g_total_bytes.store(0, butil::memory_order_relaxed);
@@ -424,13 +416,6 @@ int main(int argc, char* argv[]) {
     g_name.resize(FLAGS_req_size, 'r');
 
     g_token.store(FLAGS_initial_tokens);
-
-#ifdef WITH_RDMA
-    // Initialize RDMA environment in advance.
-    if (FLAGS_use_rdma) {
-        brpc::rdma::GlobalRdmaInitializeOrDie();
-    }
-#endif
 
     brpc::StartDummyServerAt(FLAGS_dummy_port);
 
