@@ -74,8 +74,8 @@ butil::atomic<int64_t> g_token(10000);
 std::string g_name;
 std::atomic<int64_t> g_totalSendNum(0);
 uint64_t g_test_duration = 0;
-static const int64_t kMaxRpcIoNum = 0;
 #if BRPC_ENABLE_TRACE_SCOPE
+static const int64_t kMaxRpcIoNum = BRPC_TRACE_MAX_RPC_IO_NUM;
 int64_t g_step_capacity = 0;
 
 static int64_t EstimateStepCapacity() {
@@ -203,6 +203,7 @@ public:
             }
             g_token.fetch_sub(1, butil::memory_order_relaxed);
         }
+#if BRPC_ENABLE_TRACE_SCOPE
         int64_t log_id = -1;
         if (kMaxRpcIoNum > 0) {
             log_id = g_totalSendNum.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -211,6 +212,7 @@ public:
                 return;
             }
         }
+#endif
         RespClosure* closure = new RespClosure;
         test::PerfTestRequest request;
         closure->resp = new test::PerfTestResponse();
