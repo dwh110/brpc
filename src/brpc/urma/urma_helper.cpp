@@ -79,6 +79,10 @@ DEFINE_int32(urma_zerocopy_min_size, 512,
 
 DEFINE_string(urma_device, "",
               "The name of the URMA device to use. Empty means the first one.");
+DEFINE_uint32(urma_uasid, 0,
+              "UASID for URMA transport. 0 means request kernel auto-assign. "
+              "If the kernel driver does not support auto-assignment (uasid "
+              "stays 0 after urma_init), specify a non-zero value manually.");
 DEFINE_int32(urma_max_sge, 0,
              "Max SGEs per WR. 0 means the device maximum.");
 DEFINE_int32(urma_bonding_mode, 0,
@@ -501,6 +505,7 @@ static bool GlobalUrmaInitializeImpl() {
     }
 
     urma_init_attr_t init_attr{};
+    init_attr.uasid = FLAGS_urma_uasid;
     LOG(INFO) << "Calling urma_init with init_attr.uasid=" << init_attr.uasid
               << " (0 means kernel will assign a random non-zero uasid)";
     const urma_status_t status = urma_init(&init_attr);
@@ -525,6 +530,24 @@ static bool GlobalUrmaInitializeImpl() {
     g_owns_urma_init = (status == URMA_SUCCESS);
     LOG(INFO) << "urma_init " << (g_owns_urma_init ? "succeeded" : "returned EEXIST")
               << ", g_owns_urma_init=" << g_owns_urma_init;
+
+    // If urma_init did not assign a non-zero uasid (kernel driver may not
+    // support auto-assignment), try urma_get_uasid as a fallback.
+    if (init_attr.uasid == 0) {
+        uint32_t fallback_uasid = 0;
+        const urma_status_t ustat = urma_get_uasid(&fallback_uasid);
+        if (ustat == URMA_SUCCESS && fallback_uasid != 0) {
+            LOG(INFO) << "urma_init returned uasid=0; urma_get_uasid fallback "
+                      << "assigned uasid=" << fallback_uasid;
+            init_attr.uasid = fallback_uasid;
+        } else {
+            LOG(WARNING) << "urma_init returned uasid=0 and urma_get_uasid "
+                         << "failed (status=" << ustat << "). The kernel driver "
+                         << "does not support uasid auto-assignment. Peer will "
+                         << "fail to import our jetty with EPERM. Specify a "
+                         << "non-zero uasid via --urma_uasid=N.";
+        }
+    }
 
     int num_devices = 0;
     urma_device_t** devices = urma_get_device_list(&num_devices);
