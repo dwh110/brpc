@@ -46,7 +46,7 @@ DEFINE_bool(echo_attachment, false, "Select whether attachment should be echo");
 DEFINE_string(connection_type, "single", "Connection type of the channel");
 DEFINE_string(protocol, "baidu_std", "Protocol type.");
 DEFINE_string(servers, "0.0.0.0:8002+0.0.0.0:8002", "IP Address of servers");
-DEFINE_bool(use_ub, false, "Use UB or not");
+DEFINE_bool(use_urma, true, "Use URMA transport (true) or TCP (false)");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC call timeout");
 DEFINE_int32(test_seconds, 20, "Test running time");
 DEFINE_int32(test_iterations, 0, "Test iterations");
@@ -140,7 +140,7 @@ public:
         }
 
         brpc::ChannelOptions options;
-        options.socket_mode = FLAGS_use_ub ? brpc::SOCKET_MODE_UBRING
+        options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA
                                            : brpc::SOCKET_MODE_TCP;
         options.protocol = FLAGS_protocol;
         options.connection_type = FLAGS_connection_type;
@@ -328,8 +328,8 @@ void Test(int thread_num, int attachment_size) {
         << ", Depth: " << FLAGS_queue_depth
         << ", Attachment: " << attachment_size << "B"
         << ", string size: " << g_name.size() << "B"
-        << ", UB: " << (FLAGS_use_ub ? "yes" : "no")
-        << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
+        << ", use_urma=" << FLAGS_use_urma
+        << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no"])
         << std::endl;
     g_total_bytes.store(0, butil::memory_order_relaxed);
     g_total_cnt.store(0, butil::memory_order_relaxed);

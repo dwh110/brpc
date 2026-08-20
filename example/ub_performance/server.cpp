@@ -30,7 +30,7 @@
 #include "test.pb.h"
 
 DEFINE_int32(port, 8002, "TCP Port of this server");
-DEFINE_bool(use_ub, false, "Use UB or not");
+DEFINE_bool(use_urma, true, "Use URMA transport (true) or TCP (false)");
 
 DEFINE_bool(server_ignore_oc, false, "Server ignore eovercrowded, false by default");
 DEFINE_int32(num_threads, 5, "The max number of threads are used");
@@ -151,7 +151,7 @@ int main(int argc, char* argv[]) {
     g_last_time.store(0, butil::memory_order_relaxed);
 
     brpc::ServerOptions options;
-    options.socket_mode = FLAGS_use_ub ? brpc::SOCKET_MODE_UBRING
+    options.socket_mode = FLAGS_use_urma ? brpc::SOCKET_MODE_URMA
                                        : brpc::SOCKET_MODE_TCP;
     options.max_concurrency = FLAGS_max_concurrency;
     options.num_threads = FLAGS_num_threads;
