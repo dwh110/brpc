@@ -21,11 +21,13 @@ option cc_generic_services = true;
 package test;
 
 message PerfTestRequest {
-    required bool echo_attachment = 1;
+      required bool echo_attachment = 1;
+      required bytes name = 2;
 };
 
 message PerfTestResponse {
-    required string cpu_usage = 1;
+      required string cpu_usage = 1;
+      required bytes name = 2;
 };
 
 service PerfTestService {

@@ -36,11 +36,13 @@ DEFINE_bool(server_ignore_oc, false, "Server ignore eovercrowded, false by defau
 DEFINE_int32(num_threads, 5, "The max number of threads are used");
 DEFINE_int32(max_concurrency, 128, "max concurrency");
 DEFINE_int32(server_bthread_concurrency, 5, "server bthread concurrency");
+DEFINE_int64(rsp_size, 0, "response size");
 DEFINE_int32(stats_timeout_seconds, 20, "Timeout in seconds before collecting statistics. (default 20)");
 DEFINE_bool(sort, false, "sort");
 
 butil::atomic<uint64_t> g_last_time(0);
 butil::atomic<uint64_t> g_total_cnt(0);
+std::string g_name;
 #if BRPC_ENABLE_TRACE_SCOPE
 static const int64_t kMaxRpcIoNum = BRPC_TRACE_MAX_RPC_IO_NUM;
 int64_t g_step_capacity = 0;
@@ -89,6 +91,7 @@ public:
         } else {
             response->set_cpu_usage("");
         }
+        response->set_name(g_name);
         if (request->echo_attachment()) {
             brpc::Controller* cntl =
                 static_cast<brpc::Controller*>(cntl_base);
@@ -135,6 +138,9 @@ int main(int argc, char* argv[]) {
     brpc::Server server;
     test::PerfTestServiceImpl perf_test_service_impl;
 
+    g_name.resize(FLAGS_rsp_size, 'r');
+    std::cout << "server rsp/name len is " << g_name.size() << "B" << std::endl;
+ 
     g_total_cnt.store(0, butil::memory_order_relaxed);
 
     if (server.AddService(&perf_test_service_impl, 
