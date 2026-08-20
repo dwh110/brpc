@@ -66,6 +66,20 @@ brpc_proto_library(
     proto_deps = [],
 )
 
+brpc_proto_library(
+    name = "cc_ub_performance_proto",
+    srcs = ["ub_performance/test.proto"],
+    include = "ub_performance",
+    proto_deps = [],
+)
+
+brpc_proto_library(
+    name = "cc_ub_performance_press_proto",
+    srcs = ["ub_performance_press/press.proto"],
+    include = "ub_performance_press",
+    proto_deps = [],
+)
+
 cc_binary(
     name = "echo_c++_server",
     srcs = [
@@ -160,6 +174,66 @@ cc_binary(
         "//bazel/config:brpc_with_urma": ["@umdk//:urma_headers"],
         "//conditions:default": [],
     }),
+)
+
+cc_binary(
+    name = "ub_performance_server",
+    srcs = [
+        "ub_performance/server.cpp",
+    ],
+    includes = [
+        "ub_performance",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_performance_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_performance_client",
+    srcs = [
+        "ub_performance/client.cpp",
+    ],
+    includes = [
+        "ub_performance",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_performance_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_performance_press_server",
+    srcs = [
+        "ub_performance_press/server.cpp",
+    ],
+    includes = [
+        "ub_performance_press",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_performance_press_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_performance_press_client",
+    srcs = [
+        "ub_performance_press/client.cpp",
+    ],
+    includes = [
+        "ub_performance_press",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_performance_press_proto",
+        "//:brpc",
+    ],
 )
 
 cc_binary(

@@ -1,0 +1,37 @@
+syntax = "proto3";
+package press;
+
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+message Request {
+    ValueMap common_feat = 1;
+    repeated ValueMap ad_feat = 2;
+    repeated ValueMap labels = 3;
+}
+
+message Value {
+    message StringList { repeated string value = 1; }
+    message DoubleList { repeated double value = 1; }
+    message IntList { repeated int64 value = 1; }
+    message ByteList { repeated bytes value = 1; }
+
+    oneof value {
+        string s_value = 1;
+        double d_value = 2;
+        int64 i_value = 3;
+        bytes b_value = 4;
+        StringList s_list = 5;
+        DoubleList d_list = 6;
+        IntList i_list = 7;
+        ByteList b_list = 8;
+    }
+}
+
+message ValueMap {
+    map<string, Value> value_map = 1;
+}
+
+service PerfTestService {
+    rpc Test(Request) returns (Request);
+}
