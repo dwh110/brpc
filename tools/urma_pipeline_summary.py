@@ -25,6 +25,21 @@ import sys
 # The function_name must match the string used in @lat["name"] in the .bt file.
 # ---------------------------------------------------------------------------
 PIPELINE = [
+    # --- URMA control-plane (warm-up / connection setup) ---
+    ("控制面(warm-up)", None, None),  # synthetic root
+    ("  设备初始化", "CP1.urma_init", "控制面(warm-up)"),
+    ("  查询设备列表", "CP3.urma_get_device_list", "控制面(warm-up)"),
+    ("  查询设备属性", "CP5.urma_query_device", "控制面(warm-up)"),
+    ("  查询EID列表", "CP6.urma_get_eid_list", "控制面(warm-up)"),
+    ("  创建context", "CP8.urma_create_context", "控制面(warm-up)"),
+    ("  创建JFCE", "CP11.urma_create_jfce", "控制面(warm-up)"),
+    ("  创建JFC", "CP13.urma_create_jfc", "控制面(warm-up)"),
+    ("  创建JFR", "CP15.urma_create_jfr", "控制面(warm-up)"),
+    ("  创建Jetty", "CP17.urma_create_jetty", "控制面(warm-up)"),
+    ("  注册内存段", "CP21.urma_register_seg", "控制面(warm-up)"),
+    ("  导入对端内存段", "CP23.urma_import_seg", "控制面(warm-up)"),
+    ("  导入对端Jetty", "CP25.urma_import_jetty", "控制面(warm-up)"),
+    ("  用户控制", "CP10.urma_user_ctl", "控制面(warm-up)"),
     # --- Client side ---
     ("Client总时长", "1.CallMethod", None),
     ("  编码(发送前)", "2.PackRpcRequest", "Client总时长"),

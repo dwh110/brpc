@@ -119,6 +119,36 @@ URMA_STAGES=(
     "207|17.urma_ack_jfc|urma_ack_jfc"
 )
 
+# URMA control-plane stages (warm-up / connection setup)
+URMA_CP_STAGES=(
+    "301|CP1.urma_init|urma_init"
+    "302|CP2.urma_uninit|urma_uninit"
+    "303|CP3.urma_get_device_list|urma_get_device_list"
+    "304|CP4.urma_free_device_list|urma_free_device_list"
+    "305|CP5.urma_query_device|urma_query_device"
+    "306|CP6.urma_get_eid_list|urma_get_eid_list"
+    "307|CP7.urma_free_eid_list|urma_free_eid_list"
+    "308|CP8.urma_create_context|urma_create_context"
+    "309|CP9.urma_delete_context|urma_delete_context"
+    "310|CP10.urma_user_ctl|urma_user_ctl"
+    "311|CP11.urma_create_jfce|urma_create_jfce"
+    "312|CP12.urma_delete_jfce|urma_delete_jfce"
+    "313|CP13.urma_create_jfc|urma_create_jfc"
+    "314|CP14.urma_delete_jfc|urma_delete_jfc"
+    "315|CP15.urma_create_jfr|urma_create_jfr"
+    "316|CP16.urma_delete_jfr|urma_delete_jfr"
+    "317|CP17.urma_create_jetty|urma_create_jetty"
+    "318|CP18.urma_delete_jetty|urma_delete_jetty"
+    "319|CP19.urma_modify_jetty|urma_modify_jetty"
+    "320|CP20.urma_unbind_jetty|urma_unbind_jetty"
+    "321|CP21.urma_register_seg|urma_register_seg"
+    "322|CP22.urma_unregister_seg|urma_unregister_seg"
+    "323|CP23.urma_import_seg|urma_import_seg"
+    "324|CP24.urma_unimport_seg|urma_unimport_seg"
+    "325|CP25.urma_import_jetty|urma_import_jetty"
+    "326|CP26.urma_unimport_jetty|urma_unimport_jetty"
+)
+
 echo "resolving symbols..."
 FOUND=0
 declare -A SYM_MAP
@@ -136,7 +166,13 @@ done
 for entry in "${URMA_STAGES[@]}"; do
     IFS='|' read -r sid sname sfunc <<< "$entry"
     SYM_MAP[$sid]="$sfunc"
-    echo "  [URMA] ${sname} -> ${sfunc}"
+    echo "  [URMA-DP] ${sname} -> ${sfunc}"
+    FOUND=$((FOUND + 1))
+done
+for entry in "${URMA_CP_STAGES[@]}"; do
+    IFS='|' read -r sid sname sfunc <<< "$entry"
+    SYM_MAP[$sid]="$sfunc"
+    echo "  [URMA-CP] ${sname} -> ${sfunc}"
     FOUND=$((FOUND + 1))
 done
 echo "resolved ${FOUND} stages"
@@ -191,6 +227,30 @@ uretprobe:${LIBURMA}:${sfunc}
 {
     \$d = nsecs - @el[tid, ${sid}];
     @lat["${sname}"] = lhist(\$d / 1000, 0, 1000, 1);
+    @sum["${sname}"] = sum(\$d);
+    @max["${sname}"] = max(\$d);
+    if (\$d > 1000000) {
+        @slow["${sname}"] = count();
+        printf("[SLOW] ${sname} pid=%lu tid=%lu lat=%llu us\n", pid, tid, \$d/1000);
+    }
+    delete(@el[tid, ${sid}]);
+}
+PROBE
+done
+
+# liburma.so control-plane probes (warm-up / connection setup)
+for entry in "${URMA_CP_STAGES[@]}"; do
+    IFS='|' read -r sid sname sfunc <<< "$entry"
+    cat >> "${BTFILE}" <<PROBE
+
+/* ${sname} (liburma.so control-plane) */
+uprobe:${LIBURMA}:${sfunc}
+{ @el[tid, ${sid}] = nsecs; }
+uretprobe:${LIBURMA}:${sfunc}
+/ @el[tid, ${sid}] /
+{
+    \$d = nsecs - @el[tid, ${sid}];
+    @lat["${sname}"] = lhist(\$d / 1000, 0, 10000, 10);
     @sum["${sname}"] = sum(\$d);
     @max["${sname}"] = max(\$d);
     if (\$d > 1000000) {
