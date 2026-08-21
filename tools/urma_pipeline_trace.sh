@@ -202,7 +202,7 @@ uretprobe:${BRPC_BIN}:${sym}
 / @el[tid, ${sid}] /
 {
     \$d = nsecs - @el[tid, ${sid}];
-    @lat["${sname}"] = lhist(\$d / 1000, 0, 1000, 1);
+    @lat["${sname}"] = lhist(\$d / 1000, 0, 1000, 10);
     @sum["${sname}"] = sum(\$d);
     @max["${sname}"] = max(\$d);
     if (\$d > 1000000) {
@@ -226,7 +226,7 @@ uretprobe:${LIBURMA}:${sfunc}
 / @el[tid, ${sid}] /
 {
     \$d = nsecs - @el[tid, ${sid}];
-    @lat["${sname}"] = lhist(\$d / 1000, 0, 1000, 1);
+    @lat["${sname}"] = lhist(\$d / 1000, 0, 1000, 10);
     @sum["${sname}"] = sum(\$d);
     @max["${sname}"] = max(\$d);
     if (\$d > 1000000) {
@@ -250,7 +250,7 @@ uretprobe:${LIBURMA}:${sfunc}
 / @el[tid, ${sid}] /
 {
     \$d = nsecs - @el[tid, ${sid}];
-    @lat["${sname}"] = lhist(\$d / 1000, 0, 10000, 10);
+    @lat["${sname}"] = lhist(\$d / 1000, 0, 10000, 100);
     @sum["${sname}"] = sum(\$d);
     @max["${sname}"] = max(\$d);
     if (\$d > 1000000) {

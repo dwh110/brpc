@@ -98,6 +98,33 @@ def parse_bucket_line(line):
     return None
 
 
+def compress_buckets(buckets):
+    """Merge consecutive zero-count buckets into a single range.
+
+    e.g. [0,1):100  [1,2):0  [2,3):0  [3,4):0  [4,5):50
+    ->    [0,1):100  [1,4):0  [4,5):50
+    """
+    if not buckets:
+        return buckets
+    result = []
+    empty_low = None
+    empty_high = None
+    for low, high, count in buckets:
+        if count == 0:
+            if empty_low is None:
+                empty_low = low
+            empty_high = high
+        else:
+            if empty_low is not None:
+                result.append((empty_low, empty_high, 0))
+                empty_low = None
+                empty_high = None
+            result.append((low, high, count))
+    if empty_low is not None:
+        result.append((empty_low, empty_high, 0))
+    return result
+
+
 def parse(data):
     lat_data = {}
     cnt = {}
@@ -112,7 +139,7 @@ def parse(data):
         m = re.match(r"@lat\[([^\]]+)\]:", line)
         if m:
             if cur_func and cur_buckets:
-                lat_data[cur_func] = cur_buckets
+                lat_data[cur_func] = compress_buckets(cur_buckets)
             cur_func = m.group(1).strip()
             cur_buckets = []
             continue
@@ -125,7 +152,7 @@ def parse(data):
             stripped = line.split("|")[0].strip()
             if stripped and not stripped.startswith("["):
                 if cur_buckets:
-                    lat_data[cur_func] = cur_buckets
+                    lat_data[cur_func] = compress_buckets(cur_buckets)
                 cur_func = None
                 cur_buckets = []
 
@@ -140,7 +167,7 @@ def parse(data):
                 target[m.group(1).strip()] = int(m.group(2))
 
     if cur_func and cur_buckets:
-        lat_data[cur_func] = cur_buckets
+        lat_data[cur_func] = compress_buckets(cur_buckets)
 
     return lat_data, cnt, sum_ns, max_ns, slow
 
