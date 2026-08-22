@@ -1,29 +1,21 @@
 #!/bin/bash
-# urma_fullstack_trace.sh — full-stack tracing for the brpc→ubsocket→umq→URMA
-# chain, combining ubsocket built-in profiling + LD_PRELOAD URMA wrapping.
+# urma_fullstack_trace.sh — full-stack tracing for brpc→ubsocket→umq→URMA.
 #
-# Architecture:
-#   brpc ──→ ubsocket (LD_PRELOAD) ──→ umq ──→ URMA (liburma.so)
-#             [built-in prof]          [built-in prof]  [LD_PRELOAD wrap]
-#
-# Traced layers:
-#   1. brpc framework:        ubsocket built-in PROF_START/PROF_END tracepoints
-#      (BRPC_CLIENT_CALL, BRPC_SERIALIZE, BRPC_WRITEV, BRPC_DESERIALIZE, etc.)
-#   2. ubsocket transport:    ubsocket built-in SplitTrace
-#      (CORE_CONNECT, CORE_READ, CORE_WRITE, CORE_EPOLL_*, etc.)
-#   3. umq messaging queue:   ubsocket built-in SplitTrace
-#      (CORE_WRITE_UMQ_POLL, CORE_EPOLL_UMQ_POLL, etc.)
-#   4. URMA hardware:         LD_PRELOAD wrapping (this tool's .so)
-#      (urma_post_jetty_send_wr, urma_poll_jfc, urma_wait_jfc, etc.)
+# Injects into the user's existing ubsocket launch command:
+#   1. Prepends liburma_trace_wrap.so to LD_PRELOAD (before libubsocket.so)
+#   2. Adds ubsocket profiling env vars (UBSOCKET_SPLIT_TRACE_*, UBSOCKET_PROF_*)
 #
 # Usage:
-#   sudo ./urma_fullstack_trace.sh -- ./server --port 8003
-#   sudo ./urma_fullstack_trace.sh -- ./client --server=127.0.0.1:8003
+#   # Your normal command (with all your env vars):
+#   LD_PRELOAD=/home/phz/lib/libubsocket.so UBSOCKET_DEV_NAME="udmac0d1e2" \
+#       taskset -c 80-95 ./server --port=8333
 #
-# Requires:
-#   - gcc (for compiling liburma_trace_wrap.so)
-#   - libubsocket.so (the ubsocket LD_PRELOAD library)
-#   - liburma.so (the URMA transport library)
+#   # Just wrap it with this script:
+#   LD_PRELOAD=/home/phz/lib/libubsocket.so UBSOCKET_DEV_NAME="udmac0d1e2" \
+#       ./urma_fullstack_trace.sh taskset -c 80-95 ./server --port=8333
+#
+# The script reads your existing LD_PRELOAD and env vars, adds tracing, and
+# execs your command. All your UBSOCKET_* env vars pass through unchanged.
 
 set -euo pipefail
 
@@ -33,146 +25,64 @@ WRAP_SO="/tmp/liburma_trace_wrap.so"
 
 # --- compile the URMA wrapping library ----------------------------------------
 if [[ ! -f "${WRAP_SO}" ]] || [[ "${WRAP_SRC}" -nt "${WRAP_SO}" ]]; then
-    echo "compiling URMA trace wrap library..."
+    echo "[trace] compiling URMA wrap library..." >&2
     command -v gcc >/dev/null 2>&1 || { echo "error: gcc not found" >&2; exit 1; }
     gcc -shared -fPIC -O2 -Wall -o "${WRAP_SO}" "${WRAP_SRC}" -ldl -lpthread
-    echo "compiled: ${WRAP_SO}"
+    echo "[trace] compiled: ${WRAP_SO}" >&2
 fi
 
-# --- locate libubsocket.so ----------------------------------------------------
-UBSOCKET_LIB="${UBSOCKET_LIB:-}"
-if [[ -z "${UBSOCKET_LIB}" ]]; then
-    # Try common paths
-    for p in \
-        "/usr/local/lib/libubsocket.so" \
-        "/usr/lib64/libubsocket.so" \
-        "$(ldconfig -p 2>/dev/null | awk '/libubsocket\.so/ {print $NF; exit}')" \
-        "${SCRIPT_DIR}/../ubs-comm_rpc-720/build/output/libubsocket.so"; do
-        if [[ -f "$p" ]]; then
-            UBSOCKET_LIB="$p"
-            break
-        fi
-    done
-fi
-if [[ -z "${UBSOCKET_LIB}" ]]; then
-    echo "error: libubsocket.so not found. Set UBSOCKET_LIB=/path/to/libubsocket.so" >&2
-    exit 1
-fi
-echo "ubsocket: ${UBSOCKET_LIB}"
-
-# --- determine target command --------------------------------------------------
-TARGET_CMD=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)
-            cat <<EOF
-Usage: $0 [OPTIONS] -- TARGET_CMD [TARGET_ARGS...]
-
-  --             separator: everything after is the target command
-  TARGET_CMD     the binary to trace
-
-Examples:
-  $0 -- ./bazel-bin/example/urma_performance_server --port 8003
-  $0 -- ./bazel-bin/example/urma_performance_client --server=127.0.0.1:8003
-
-Environment variables (ubsocket built-in profiling):
-  UBSOCKET_SPLIT_TRACE_ENABLE=true    Enable SplitTrace (default: true)
-  UBSOCKET_SPLIT_TRACE_LEVEL=all      Trace level: all|ubsocket|umq (default: all)
-  UBSOCKET_SPLIT_TRACE_BUF_CAPACITY  Trace buffer size (default: 65535)
-  UBSOCKET_SPLIT_TRACE_DRAIN_INTERVAL_MS  Drain interval (default: 10)
-  UBSOCKET_PROF_ENABLE=true           Enable PROF_START/PROF_END stats (default: true)
-  UBSOCKET_PROF_MODE=fast             Profiling mode: fast|detail (default: fast)
-  UBSOCKET_PROF_DUMP_FILE_PATH        Stats dump path (default: /tmp/ubsocket/profiling)
-
-Environment variables (URMA LD_PRELOAD wrap):
-  URMA_TRACE_FILE                      URMA stats output (default: /tmp/urma_ldpreload_*.log)
-  UBSOCKET_LIB                         Path to libubsocket.so (auto-detected)
-EOF
-            exit 0
-            ;;
-        --) shift; TARGET_CMD="$*"; break ;;
-        *)  TARGET_CMD="$*"; break ;;
-    esac
-done
-
-[[ -z "${TARGET_CMD}" ]] && { echo "error: no target command. Usage: $0 -- ./server [args...]" >&2; exit 1; }
-
-# --- set up environment -------------------------------------------------------
+# --- set up tracing env vars (don't override user's values) -------------------
 LOGDIR="/tmp/urma_fullstack_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${LOGDIR}"
 
-# URMA LD_PRELOAD wrap output
-export URMA_TRACE_FILE="${LOGDIR}/urma_layer.log"
+# URMA LD_PRELOAD wrap output file
+export URMA_TRACE_FILE="${URMA_TRACE_FILE:-${LOGDIR}/urma_layer.log}"
 
-# ubsocket built-in profiling
-export UBSOCKET_SPLIT_TRACE_ENABLE="${UBSOCKET_SPLIT_TRACE_ENABLE:-true}"
-export UBSOCKET_SPLIT_TRACE_LEVEL="${UBSOCKET_SPLIT_TRACE_LEVEL:-all}"
-export UBSOCKET_SPLIT_TRACE_BUF_CAPACITY="${UBSOCKET_SPLIT_TRACE_BUF_CAPACITY:-65535}"
-export UBSOCKET_SPLIT_TRACE_DRAIN_INTERVAL_MS="${UBSOCKET_SPLIT_TRACE_DRAIN_INTERVAL_MS:-10}"
-export UBSOCKET_PROF_ENABLE="${UBSOCKET_PROF_ENABLE:-true}"
-export UBSOCKET_PROF_MODE="${UBSOCKET_PROF_MODE:-fast}"
-export UBSOCKET_PROF_DUMP_FILE_PATH="${LOGDIR}/ubsocket_prof.log"
+# ubsocket built-in profiling (only set if not already set by user)
+: "${UBSOCKET_SPLIT_TRACE_ENABLE:=true}"
+: "${UBSOCKET_SPLIT_TRACE_LEVEL:=all}"
+: "${UBSOCKET_SPLIT_TRACE_BUF_CAPACITY:=65535}"
+: "${UBSOCKET_SPLIT_TRACE_DRAIN_INTERVAL_MS:=10}"
+: "${UBSOCKET_PROF_ENABLE:=true}"
+: "${UBSOCKET_PROF_MODE:=fast}"
+: "${UBSOCKET_PROF_DUMP_FILE_PATH:=${LOGDIR}/ubsocket_prof.log}"
+export UBSOCKET_SPLIT_TRACE_ENABLE UBSOCKET_SPLIT_TRACE_LEVEL
+export UBSOCKET_SPLIT_TRACE_BUF_CAPACITY UBSOCKET_SPLIT_TRACE_DRAIN_INTERVAL_MS
+export UBSOCKET_PROF_ENABLE UBSOCKET_PROF_MODE UBSOCKET_PROF_DUMP_FILE_PATH
+export URMA_TRACE_FILE
 
-# LD_PRELOAD: trace lib FIRST, then ubsocket lib
-# This ensures our URMA wrappers resolve RTLD_NEXT to the real urma functions
-export LD_PRELOAD="${WRAP_SO}:${UBSOCKET_LIB}"
-
-echo "========================================"
-echo " Full-Stack Trace: brpc→ubsocket→umq→URMA"
-echo "========================================"
-echo " trace dir:        ${LOGDIR}"
-echo " URMA layer log:   ${URMA_TRACE_FILE}"
-echo " ubsocket prof:    ${UBSOCKET_PROF_DUMP_FILE_PATH}"
-echo " LD_PRELOAD:       ${LD_PRELOAD}"
-echo " target:           ${TARGET_CMD}"
-echo "========================================"
-echo ""
-
-# --- run target ---------------------------------------------------------------
-# We DON'T use exec so we can collect stats after the target exits.
-bash -c "${TARGET_CMD}" &
-TARGET_PID=$!
-
-# Wait for target to exit
-wait "${TARGET_PID}" 2>/dev/null || true
-TARGET_EXIT=$?
-
-# --- collect results ----------------------------------------------------------
-echo ""
-echo "========================================"
-echo " Trace Results"
-echo "========================================"
-
-# URMA layer (from LD_PRELOAD wrap destructor)
-if [[ -f "${URMA_TRACE_FILE}" ]]; then
-    echo ""
-    echo "--- URMA Layer (LD_PRELOAD wrap) ---"
-    cat "${URMA_TRACE_FILE}"
+# --- inject wrap .so into LD_PRELOAD (before libubsocket.so) -----------------
+# Read the user's existing LD_PRELOAD and prepend our wrap lib.
+USER_LD_PRELOAD="${LD_PRELOAD:-}"
+if [[ -n "${USER_LD_PRELOAD}" ]]; then
+    # Check if libubsocket.so is in LD_PRELOAD
+    if echo "${USER_LD_PRELOAD}" | grep -q 'libubsocket'; then
+        # Insert wrap .so BEFORE libubsocket.so
+        export LD_PRELOAD="${WRAP_SO}:${USER_LD_PRELOAD}"
+    else
+        # No ubsocket in LD_PRELOAD, just prepend
+        export LD_PRELOAD="${WRAP_SO}:${USER_LD_PRELOAD}"
+    fi
+else
+    export LD_PRELOAD="${WRAP_SO}"
 fi
 
-# ubsocket built-in profiling
-if [[ -f "${UBSOCKET_PROF_DUMP_FILE_PATH}" ]]; then
-    echo ""
-    echo "--- ubsocket Built-in Profiling ---"
-    cat "${UBSOCKET_PROF_DUMP_FILE_PATH}"
-elif [[ -d "/tmp/ubsocket/profiling" ]]; then
-    echo ""
-    echo "--- ubsocket Profiling (default path) ---"
-    cat /tmp/ubsocket/profiling/* 2>/dev/null || echo "(no files)"
-fi
+# --- print trace config --------------------------------------------------------
+echo "[trace] ========================================" >&2
+echo "[trace] Full-Stack Trace: brpc→ubsocket→umq→URMA" >&2
+echo "[trace] ========================================" >&2
+echo "[trace] trace dir:     ${LOGDIR}" >&2
+echo "[trace] URMA log:      ${URMA_TRACE_FILE}" >&2
+echo "[trace] ubsocket prof: ${UBSOCKET_PROF_DUMP_FILE_PATH}" >&2
+echo "[trace] LD_PRELOAD:    ${LD_PRELOAD}" >&2
+echo "[trace] split_trace:   ${UBSOCKET_SPLIT_TRACE_ENABLE} level=${UBSOCKET_SPLIT_TRACE_LEVEL}" >&2
+echo "[trace] prof:          ${UBSOCKET_PROF_ENABLE} mode=${UBSOCKET_PROF_MODE}" >&2
+echo "[trace] target cmd:    $*" >&2
+echo "[trace] ========================================" >&2
+echo "" >&2
 
-# SplitTrace data (if ubsocket writes to a trace file)
-SPLITTRACE_DIR="${LOGDIR}/splittrace"
-if [[ -d "${SPLITTRACE_DIR}" ]]; then
-    echo ""
-    echo "--- SplitTrace Data ---"
-    ls -la "${SPLITTRACE_DIR}/"
-fi
-
-echo ""
-echo "========================================"
-echo " Target exit code: ${TARGET_EXIT}"
-echo " All logs in: ${LOGDIR}"
-echo "========================================"
-
-exit ${TARGET_EXIT}
+# --- exec the target command ---------------------------------------------------
+# Use exec so the target inherits all env vars. The target's exit triggers
+# the destructor in liburma_trace_wrap.so which writes URMA stats.
+# ubsocket's destructor writes its profiling stats too.
+exec "$@"
