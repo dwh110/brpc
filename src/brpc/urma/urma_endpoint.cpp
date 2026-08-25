@@ -774,9 +774,13 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // produce asymmetric completions with the bonding provider.
         wr.opcode = URMA_OPC_SEND;
         wr.flag.bs.complete_enable = 1;
+        wr.flag.bs.solicited_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
-        wr.user_ctx = 1;
+        // Use the SQ slot index as user_ctx so that error completions can
+        // identify which _sbuf slot to reclaim. umq_ub uses the buffer
+        // pointer; we use the slot index for the same purpose.
+        wr.user_ctx = static_cast<uint64_t>(_sq_current + 1);
         urma_jfs_wr_t* bad_wr = nullptr;
         const uint16_t sq_slot = _sq_current;
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
@@ -1003,6 +1007,11 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                 }
             } else {
                 // Data WR error: reclaim the send buffer and SQ window.
+                // user_ctx is the SQ slot index + 1 (0 reserved for ack).
+                uint16_t slot = static_cast<uint16_t>(cr.user_ctx - 1);
+                if (slot < (_sq_size - RESERVED_WR_NUM)) {
+                    _sbuf[slot].clear();
+                }
                 uint16_t old = _sq_window_size.load(
                     butil::memory_order_relaxed);
                 if (old < _local_window_capacity) {
@@ -1010,8 +1019,6 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                         static_cast<uint16_t>(old + 1),
                         butil::memory_order_relaxed);
                 }
-                _sbuf[_sq_sent].clear();
-                _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
             }
             butil::subtle::MemoryBarrier();
             if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
