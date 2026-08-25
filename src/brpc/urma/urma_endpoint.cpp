@@ -967,9 +967,67 @@ int UrmaEndpoint::SendAck(int num) {
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        LOG(WARNING) << "URMA completion failed, status=" << cr.status;
-        errno = EIO;
-        return -1;
+        // Mirrors umq_ub_dequeue_plus_with_poll_tx: distinguish TX vs RX
+        // errors and only treat FLUSH-type errors as fatal. Transient errors
+        // (REM_ACCESS_ABORT, RNR_RETRY, ACK_TIMEOUT, etc.) must not kill the
+        // connection — the SQ/RQ windows are still replenished and the loop
+        // continues processing subsequent CQEs.
+        if (cr.status == URMA_CR_WR_FLUSH_ERR ||
+            cr.status == URMA_CR_WR_UNHANDLED) {
+            // Jetty is being torn down — this IS fatal.
+            LOG(ERROR) << "URMA fatal completion error (jetty flush): status="
+                       << cr.status << " on " << _socket->description();
+            errno = EIO;
+            return -1;
+        }
+        if (cr.status == URMA_CR_WR_SUSPEND_DONE ||
+            cr.status == URMA_CR_WR_FLUSH_ERR_DONE) {
+            // Hardware-generated fake CQE; user_ctx is invalid.
+            // Just log and skip — do NOT touch user_ctx.
+            LOG(WARNING) << "URMA fake CQE: status=" << cr.status
+                         << " on " << _socket->description();
+            return 0;
+        }
+        // Transient error: REM_ACCESS_ABORT_ERR, RNR_RETRY_CNT_EXC_ERR,
+        // ACK_TIMEOUT_ERR, LOC_ACCESS_ERR, etc. Recover resources and
+        // continue, mirroring umq_ub which counts failed_cnt and continues.
+        if (cr.flag.bs.s_r == 0) {
+            // --- TX (send) completion error ---
+            LOG(WARNING) << "URMA TX completion error: status=" << cr.status
+                         << " user_ctx=" << cr.user_ctx
+                         << " on " << _socket->description();
+            if (cr.user_ctx == 0) {
+                // Pure-ack WR error: replenish imm budget only.
+                if (_sq_imm_window_size < RESERVED_WR_NUM) {
+                    _sq_imm_window_size += 1;
+                }
+            } else {
+                // Data WR error: reclaim the send buffer and SQ window.
+                uint16_t old = _sq_window_size.load(
+                    butil::memory_order_relaxed);
+                if (old < _local_window_capacity) {
+                    _sq_window_size.store(
+                        static_cast<uint16_t>(old + 1),
+                        butil::memory_order_relaxed);
+                }
+                _sbuf[_sq_sent].clear();
+                _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
+            }
+            butil::subtle::MemoryBarrier();
+            if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
+                _local_window_capacity / 8) {
+                _socket->WakeAsEpollOut();
+            }
+            return 0;  // Non-fatal: continue processing CQEs.
+        } else {
+            // --- RX (recv) completion error ---
+            LOG(WARNING) << "URMA RX completion error: status=" << cr.status
+                         << " on " << _socket->description();
+            // Replenish the recv buffer that was consumed by this failed
+            // completion, so subsequent receives can proceed.
+            PostRecv(1, zerocopy);
+            return 0;  // Non-fatal: continue processing CQEs.
+        }
     }
     if (cr.flag.bs.s_r == 0) {
         // Send completion: reclaim SQ window and wake the writer.
