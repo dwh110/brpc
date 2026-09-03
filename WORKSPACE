@@ -281,8 +281,19 @@ http_archive(
 
 # URMA (UMDK) headers.  By default the UMDK repo is fetched (mirrors CMake
 # DOWNLOAD_URMA_HEADERS=ON) so that --define BRPC_WITH_URMA=true works
-# out of the box.  To skip the download (e.g. when headers are installed
-# system-wide), build with --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0.
+# out of the box.
+#
+# To use a local URMA installation instead of downloading:
+#   --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
+#   --repo_env=BRPC_URMA_INCLUDE=/path/to/urma/include
+#   --repo_env=BRPC_URMA_LIB=/path/to/liburma.so   (optional)
+#
+# Example:
+#   bazel build //example:urma_performance_server \
+#     --define BRPC_WITH_URMA=true \
+#     --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0 \
+#     --repo_env=BRPC_URMA_INCLUDE=/usr/include/urma \
+#     --repo_env=BRPC_URMA_LIB=/usr/lib64/liburma.so
 load("//bazel/third_party/umdk:urma_deps.bzl", "maybe_fetch_umdk")
 
 maybe_fetch_umdk()

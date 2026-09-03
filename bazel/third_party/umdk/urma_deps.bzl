@@ -81,7 +81,15 @@ _umdk_stub = repository_rule(
 # ---------------------------------------------------------------------------
 
 def _umdk_repo_impl(repository_ctx):
-    """Fetches UMDK unless BRPC_DOWNLOAD_URMA_HEADERS=0."""
+    """Fetches UMDK unless BRPC_DOWNLOAD_URMA_HEADERS=0.
+
+    When BRPC_DOWNLOAD_URMA_HEADERS=0, the user can supply URMA headers and
+    libraries from a local path via:
+      --repo_env=BRPC_URMA_INCLUDE=/path/to/urma/include
+      --repo_env=BRPC_URMA_LIB=/path/to/liburma.so
+
+    If neither env var is set, an empty stub is created (no URMA support).
+    """
     if repository_ctx.os.environ.get("BRPC_DOWNLOAD_URMA_HEADERS", "1") != "0":
         repository_ctx.download_and_extract(
             url = _UMDK_REMOTE + "/repository/archive/" + _UMDK_COMMIT + ".tar.gz",
@@ -89,11 +97,45 @@ def _umdk_repo_impl(repository_ctx):
         )
         repository_ctx.file("BUILD.bazel", content = _UMDK_BUILD_CONTENT)
     else:
-        repository_ctx.file("BUILD.bazel", content = _UMDK_STUB_BUILD_CONTENT)
+        urma_include = repository_ctx.os.environ.get("BRPC_URMA_INCLUDE", "")
+        urma_lib = repository_ctx.os.environ.get("BRPC_URMA_LIB", "")
+        if urma_include != "":
+            # User-supplied local URMA headers (+ optional lib).
+            build_content = """\
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "urma_headers",
+    hdrs = glob([
+"""
+            # Auto-glob common URMA header layouts.
+            build_content += '        "*.h",\n'
+            build_content += '        "**/*.h",\n'
+            build_content += """    ]),
+    includes = ["."],
+"""
+            if urma_lib != "":
+                build_content += '    srcs = ["' + urma_lib + '"],\n'
+            build_content += ")\n"
+            # Symlink the user's include dir into the repo root.
+            repository_ctx.symlink(urma_include, "urma_include")
+            build_content = build_content.replace(
+                'hdrs = glob([\n        "*.h",\n        "**/*.h",\n    ]),\n    includes = ["."],',
+                'hdrs = glob([\n        "urma_include/*.h",\n        "urma_include/**/*.h",\n    ]),\n    includes = ["urma_include"],')
+            if urma_lib != "":
+                # Symlink the lib file too.
+                lib_name = urma_lib.rsplit("/", 1)[-1] if "/" in urma_lib else urma_lib
+                repository_ctx.symlink(urma_lib, lib_name)
+                build_content = build_content.replace(
+                    'srcs = ["' + urma_lib + '"],',
+                    'srcs = ["' + lib_name + '"],')
+            repository_ctx.file("BUILD.bazel", content = build_content)
+        else:
+            repository_ctx.file("BUILD.bazel", content = _UMDK_STUB_BUILD_CONTENT)
 
 _umdk_repo = repository_rule(
     implementation = _umdk_repo_impl,
-    environ = ["BRPC_DOWNLOAD_URMA_HEADERS"],
+    environ = ["BRPC_DOWNLOAD_URMA_HEADERS", "BRPC_URMA_INCLUDE", "BRPC_URMA_LIB"],
 )
 
 def maybe_fetch_umdk():
