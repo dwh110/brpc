@@ -453,7 +453,8 @@ int UrmaEndpoint::AllocateResources() {
         urma_jfr_cfg_t jfr_cfg{};
         jfr_cfg.depth = static_cast<uint32_t>(_rq_size);
         jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
+        jfr_cfg.max_sge =
+            static_cast<uint8_t>(GetUrmaMaxJfrSge());
         jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         jfr_cfg.jfc = _resource->jfc;
         _resource->jfr = urma_create_jfr(ctx, &jfr_cfg);
@@ -1575,7 +1576,7 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
-        ep->DispatchReceivedBytes(s, 0);
+        ep->DispatchReceivedBytes(s, 0);   // todo 设
     } else {
         ep->FallbackToTcp(tp, true);
     }
@@ -1900,7 +1901,8 @@ int UrmaEndpoint::GlobalInitialize() {
         urma_jfr_cfg_t jfr_cfg{};
         jfr_cfg.depth = static_cast<uint32_t>(FLAGS_urma_rq_size);
         jfr_cfg.trans_mode = URMA_TM_RM;
-        jfr_cfg.max_sge = 1;
+        jfr_cfg.max_sge =
+            static_cast<uint8_t>(GetUrmaMaxJfrSge());
         jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
         jfr_cfg.jfc = r->jfc;
         r->jfr = urma_create_jfr(ctx, &jfr_cfg);

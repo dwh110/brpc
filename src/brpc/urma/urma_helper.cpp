@@ -121,6 +121,7 @@ static urma_eid_t g_local_eid{};
 static bool g_has_local_eid = false;
 static urma_device_attr_t g_device_attr{};
 static int g_max_sge = 1;
+static int g_max_jfr_sge = 1;
 static size_t g_recv_block_size = 8 * 1024;
 static bool g_is_bonding_device = false;
 // Prefer the device capability table and retain priority 6 as a compatibility
@@ -687,6 +688,14 @@ static bool GlobalUrmaInitializeImpl() {
             g_max_sge = FLAGS_urma_max_sge;
         }
     }
+    uint32_t device_max_jfr_sge = g_device_attr.dev_cap.max_jfr_sge;
+    if (device_max_jfr_sge == 0) {
+        device_max_jfr_sge = 1;
+    }
+    if (device_max_jfr_sge > 255) {
+        device_max_jfr_sge = 255;
+    }
+    g_max_jfr_sge = static_cast<int>(device_max_jfr_sge);
     g_recv_block_size =
         static_cast<size_t>(FLAGS_urma_buffer_size) -
         sizeof(butil::IOBuf::Block);
@@ -751,7 +760,8 @@ static bool GlobalUrmaInitializeImpl() {
     // exit; GlobalRelease remains available for init rollback.
     LOG(INFO) << "URMA initialized: device=" << device_name
               << " bonding=" << g_is_bonding_device
-              << " max_sge=" << g_max_sge
+              << " max_sge(jfs)=" << g_max_sge
+              << " max_sge(jfr)=" << g_max_jfr_sge
               << " buffer_size=" << g_pool_buffer_size
               << " buffer_count=" << g_pool->buffer_count()
               << " context_uasid=" << g_context->uasid
@@ -814,6 +824,7 @@ int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
 }
 uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
 int GetUrmaMaxSge() { return g_max_sge; }
+int GetUrmaMaxJfrSge() { return g_max_jfr_sge; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }
 
 // ============================================================================

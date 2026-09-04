@@ -96,8 +96,11 @@ bool SupportedByUrma(const std::string& protocol);
 // Return the configured recv buffer size (one URMA recv WR's payload size).
 size_t GetUrmaRecvBlockSize();
 
-// Return max_sge supported by the device.
+// Return max_sge supported by the device (for JFS / send path).
 int GetUrmaMaxSge();
+
+// Return max_jfr_sge supported by the device (for JFR / receive path).
+int GetUrmaMaxJfrSge();
 
 }  // namespace urma
 }  // namespace brpc
