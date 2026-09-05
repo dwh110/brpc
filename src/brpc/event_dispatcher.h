@@ -89,6 +89,9 @@ friend class VersionedRefWithId<IOEventData>;
 namespace rdma {
 class RdmaEndpoint;
 }
+namespace urma {
+class UrmaEndpoint;
+}
 
 // Dispatch edge-triggered events of file descriptors to consumers.
 // By default callbacks run in spawned bthreads; when usercode-in-coroutine is
@@ -96,6 +99,7 @@ class RdmaEndpoint;
 class EventDispatcher {
 friend class Socket;
 friend class rdma::RdmaEndpoint;
+friend class urma::UrmaEndpoint;
 template <typename T> friend class IOEvent;
 public:
     EventDispatcher();

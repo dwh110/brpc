@@ -32,6 +32,7 @@
 #include "brpc/urma_transport.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake_constants.h"
+#include "brpc/urma/urma_handshake_server.h"
 
 DECLARE_int32(task_group_ntags);
 
@@ -52,11 +53,14 @@ DEFINE_int32(urma_prepared_qp_size, 128, "SQ and RQ size for prepared Jetty.");
 
 static const size_t IOBUF_BLOCK_HEADER_LEN = 32;
 
+namespace brpc {
+namespace urma {
+
 extern const size_t RESERVED_WR_NUM = 3;
 
 uint32_t g_urma_recv_block_size = 0;
 
-static const uint16_t MIN_JETTY_SIZE = 16;
+extern const uint16_t MIN_JETTY_SIZE = 16;
 static const uint16_t MAX_JETTY_SIZE = 4096;
 extern const uint16_t MIN_BLOCK_SIZE = 1024;
 
@@ -885,7 +889,7 @@ static UrmaResource* AllocateJettyCq(uint16_t sq_size, uint16_t rq_size) {
     jfr_cfg.trans_mode = URMA_TM_RM;
     jfr_cfg.max_sge = 1;
     jfr_cfg.jfc = resource->jfc;
-    jfr_cfg.token_policy = URMA_TOKEN_NONE;
+    jfr_cfg.flag.bs.token_policy = URMA_TOKEN_NONE;
     resource->jfr = urma_create_jfr(ctx, &jfr_cfg);
     if (NULL == resource->jfr) {
         PLOG(WARNING) << "Fail to create jfr";
@@ -894,7 +898,7 @@ static UrmaResource* AllocateJettyCq(uint16_t sq_size, uint16_t rq_size) {
 
     urma_jetty_cfg_t jetty_cfg;
     memset(&jetty_cfg, 0, sizeof(jetty_cfg));
-    jetty_cfg.share_jfr = URMA_SHARE_JFR;
+    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
     jetty_cfg.shared.jfr = resource->jfr;
     jetty_cfg.jfs_cfg.depth = sq_size;
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RM;
@@ -983,23 +987,26 @@ int UrmaEndpoint::BringUpQp(const ParsedHello& remote, bool is_server) {
 
     urma_context_t* ctx = GetUrmaContext();
 
-    urma_seg_import_attr_t rseg_attr;
-    memset(&rseg_attr, 0, sizeof(rseg_attr));
-    rseg_attr.eid = remote.eid;
-    _resource->remote_seg = urma_import_seg(ctx, &rseg_attr);
+    urma_seg_t rseg;
+    memset(&rseg, 0, sizeof(rseg));
+    rseg.ubva.eid = remote.eid;
+    urma_token_t rseg_token = {};
+    urma_import_seg_flag_t rseg_flag = {};
+    _resource->remote_seg = urma_import_seg(ctx, &rseg, &rseg_token, 0, rseg_flag);
     if (NULL == _resource->remote_seg) {
         PLOG(WARNING) << "Fail to import remote seg";
         return -1;
     }
 
-    urma_jetty_import_attr_t rjetty_attr;
+    urma_rjetty_t rjetty_attr;
     memset(&rjetty_attr, 0, sizeof(rjetty_attr));
-    rjetty_attr.eid = remote.eid;
-    rjetty_attr.jpn = remote.jpn;
+    rjetty_attr.jetty_id.eid = remote.eid;
+    rjetty_attr.jetty_id.id = remote.jpn;
     rjetty_attr.trans_mode = URMA_TM_RM;
     rjetty_attr.tp_type = URMA_CTP;
     rjetty_attr.type = URMA_JETTY;
-    _resource->remote_jetty = urma_import_jetty(ctx, &rjetty_attr);
+    urma_token_t rjetty_token = {};
+    _resource->remote_jetty = urma_import_jetty(ctx, &rjetty_attr, &rjetty_token);
     if (NULL == _resource->remote_jetty) {
         PLOG(WARNING) << "Fail to import remote jetty";
         return -1;

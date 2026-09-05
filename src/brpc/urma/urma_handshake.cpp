@@ -138,7 +138,7 @@ int UrmaHandshakeClientV2::SendLocalHello() {
     local_msg.rq_size = ep->_rq_size;
     local_msg.eid = GetUrmaEid();
     if (BAIDU_LIKELY(ep->_resource)) {
-        local_msg.jpn = ep->_resource->jetty->jetty_id.jpn;
+        local_msg.jpn = ep->_resource->jetty->jetty_id.id;
     } else {
         local_msg.jpn = 0;
     }
@@ -219,7 +219,7 @@ int UrmaHandshakeServerV2::SendLocalHello() {
         local_msg.rq_size = _ep->_rq_size;
         local_msg.eid = GetUrmaEid();
         if (BAIDU_LIKELY(_ep->_resource)) {
-            local_msg.jpn = _ep->_resource->jetty->jetty_id.jpn;
+            local_msg.jpn = _ep->_resource->jetty->jetty_id.id;
         } else {
             local_msg.jpn = 0;
         }

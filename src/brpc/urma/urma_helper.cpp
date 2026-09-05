@@ -31,6 +31,17 @@
 #include "butil/macros.h"
 #include "brpc/socket.h"
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma/urma_endpoint.h"
+
+namespace butil {
+namespace iobuf {
+extern void* (*blockmem_allocate)(size_t);
+extern void  (*blockmem_deallocate)(void*);
+}
+}
+
+namespace brpc {
+namespace urma {
 
 DEFINE_bool(urma_use_polling, false,
             "Use polling mode for JFC instead of event mode");
@@ -68,16 +79,6 @@ DEFINE_bool(urma_poller_yield, false,
             "Actively yield bthread in busy-polling loop");
 DEFINE_int32(urma_client_handshake_version, 2,
              "Client handshake version: 2=binary, 3=protobuf");
-
-namespace butil {
-namespace iobuf {
-extern void* (*blockmem_allocate)(size_t);
-extern void  (*blockmem_deallocate)(void*);
-}
-}
-
-namespace brpc {
-namespace urma {
 
 class UrmaEndpoint;
 
@@ -233,7 +234,7 @@ static void GlobalRelease() {
     g_user_segs_lock = NULL;
 
     if (g_context) {
-        urma_destroy_context(g_context);
+        urma_delete_context(g_context);
         g_context = NULL;
     }
 
@@ -253,7 +254,7 @@ static void GlobalUrmaInitializeOrDieImpl() {
         return;
     }
 
-    if (urma_init() != 0) {
+    if (urma_init(NULL) != 0) {
         PLOG(ERROR) << "Fail to urma_init";
         ExitWithError();
     }
@@ -268,7 +269,7 @@ static void GlobalUrmaInitializeOrDieImpl() {
     urma_device_t* chosen_dev = NULL;
     int available_devices = 0;
     for (int i = 0; i < num; ++i) {
-        const char* dev_name = urma_get_device_name(g_devices[i]);
+        const char* dev_name = g_devices[i]->name;
         if (!FLAGS_urma_device.empty()) {
             if (FLAGS_urma_device == dev_name) {
                 chosen_dev = g_devices[i];
@@ -289,18 +290,18 @@ static void GlobalUrmaInitializeOrDieImpl() {
         ExitWithError();
     }
 
-    g_context = urma_create_context(chosen_dev);
+    g_context = urma_create_context(chosen_dev, 0);
     if (!g_context) {
         PLOG(ERROR) << "Fail to create urma context";
         ExitWithError();
     }
 
     LOG(INFO) << "URMA device: "
-              << urma_get_device_name(chosen_dev);
+              << chosen_dev->name;
     if (available_devices > 1 && FLAGS_urma_device.empty()) {
         LOG(INFO) << "This server has more than one available URMA device. "
                   << "Only the first one ("
-                  << urma_get_device_name(chosen_dev)
+                  << chosen_dev->name
                   << ") will be used. If you want to use other device, "
                   << "please specify it with --urma_device.";
     }
@@ -313,16 +314,16 @@ static void GlobalUrmaInitializeOrDieImpl() {
 #endif
 
     urma_device_attr_t dev_attr;
-    if (urma_query_device(g_context, &dev_attr) != 0) {
+    if (urma_query_device(chosen_dev, &dev_attr) != 0) {
         PLOG(ERROR) << "Fail to query urma device";
         ExitWithError();
     }
     if (FLAGS_urma_max_sge > 0) {
-        g_max_sge = dev_attr.max_sge < FLAGS_urma_max_sge
-                        ? dev_attr.max_sge
+        g_max_sge = dev_attr.dev_cap.max_jfs_sge < FLAGS_urma_max_sge
+                        ? dev_attr.dev_cap.max_jfs_sge
                         : FLAGS_urma_max_sge;
     } else {
-        g_max_sge = dev_attr.max_sge;
+        g_max_sge = dev_attr.dev_cap.max_jfs_sge;
     }
 
     g_user_segs_lock = new (std::nothrow) butil::Mutex;
@@ -351,11 +352,11 @@ static void GlobalUrmaInitializeOrDieImpl() {
         ExitWithError();
     }
 
-    urma_seg_register_attr_t reg_attr = {};
-    reg_attr.addr = pool_base;
+    urma_seg_cfg_t reg_attr = {};
+    reg_attr.va = (uint64_t)pool_base;
     reg_attr.len = pool_size;
-    reg_attr.access = URMA_ACCESS_LOCAL_ONLY;
-    reg_attr.token_policy = URMA_TOKEN_NONE;
+    reg_attr.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+    reg_attr.flag.bs.token_policy = URMA_TOKEN_NONE;
     g_pool_seg = urma_register_seg(g_context, &reg_attr);
     if (!g_pool_seg) {
         PLOG(ERROR) << "Fail to register URMA memory pool";
@@ -387,10 +388,10 @@ static void GlobalUrmaInitializeOrDieImpl() {
     butil::SetDefaultBlockSize(FLAGS_urma_buffer_size);
 
     SocketOptions opt;
-    opt.fd = g_context->event_fd;
+    opt.fd = g_context->async_fd;
     butil::make_close_on_exec(opt.fd);
     if (butil::make_non_blocking(opt.fd) < 0) {
-        PLOG(WARNING) << "Fail to set event_fd to nonblocking";
+        PLOG(WARNING) << "Fail to set async_fd to nonblocking";
         ExitWithError();
     }
     opt.on_edge_triggered_events = OnUrmaAsyncEvent;
@@ -417,11 +418,11 @@ void GlobalUrmaInitializeOrDie() {
 }
 
 uint32_t RegisterMemoryForUrma(void* buf, size_t len) {
-    urma_seg_register_attr_t attr = {};
-    attr.addr = buf;
+    urma_seg_cfg_t attr = {};
+    attr.va = (uint64_t)buf;
     attr.len = len;
-    attr.access = URMA_ACCESS_LOCAL_ONLY;
-    attr.token_policy = URMA_TOKEN_NONE;
+    attr.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+    attr.flag.bs.token_policy = URMA_TOKEN_NONE;
     urma_target_seg_t* seg = urma_register_seg(g_context, &attr);
     if (!seg) {
         PLOG(ERROR) << "Fail to register memory for urma";

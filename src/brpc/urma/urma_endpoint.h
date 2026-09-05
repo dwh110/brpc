@@ -33,6 +33,7 @@
 #include "butil/containers/mpsc_queue.h"
 #include "butil/containers/optional.h"
 #include "brpc/socket.h"
+#include "brpc/parse_result.h"
 #include "brpc/urma/urma_helper.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake_constants.h"

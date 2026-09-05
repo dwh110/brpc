@@ -29,6 +29,9 @@ namespace brpc {
 namespace rdma {
 class RdmaEndpoint;
 }
+namespace urma {
+class UrmaEndpoint;
+}
 namespace ubring {
 class UBShmEndpoint;
 }
@@ -99,6 +102,7 @@ class InputMessenger : public SocketUser {
     friend class RdmaTransport;
     friend class UrmaTransport;
     friend class rdma::RdmaEndpoint;
+    friend class urma::UrmaEndpoint;
     friend class ubring::UBShmEndpoint;
 public:
     explicit InputMessenger(size_t capacity = 128);

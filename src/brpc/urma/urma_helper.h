@@ -72,6 +72,8 @@ DECLARE_string(urma_device);
 DECLARE_int32(urma_max_sge);
 DECLARE_bool(urma_poller_yield);
 DECLARE_int32(urma_prepared_jetty_cnt);
+DECLARE_int32(urma_buffer_size);
+DECLARE_int32(urma_buffer_count);
 DECLARE_int32(urma_client_handshake_version);
 
 }  // namespace urma
