@@ -304,9 +304,8 @@ private:
     butil::atomic<uint16_t> _new_rq_wrs{0};              // new recv WRs (to ack)
     uint16_t _sq_imm_window_size{0};                     // budget for pure-ack WRs
 
-    // SQ producer / consumer indices.
+    // SQ producer index (next slot to post).
     uint16_t _sq_current{0};
-    uint16_t _sq_sent{0};
     // RQ consumer index.
     uint16_t _rq_received{0};
 

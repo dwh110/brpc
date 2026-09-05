@@ -123,6 +123,7 @@ static urma_device_attr_t g_device_attr{};
 static int g_max_sge = 1;
 static int g_max_jfr_sge = 1;
 static size_t g_recv_block_size = 8 * 1024;
+static uint32_t g_local_uasid = 0;
 static bool g_is_bonding_device = false;
 // Prefer the device capability table and retain priority 6 as a compatibility
 // fallback for CTP providers that do not report a priority.
@@ -453,6 +454,7 @@ static void GlobalRelease() {
     }
     g_local_eid = urma_eid_t{};
     g_has_local_eid = false;
+    g_local_uasid = 0;
     g_is_bonding_device = false;
     g_jetty_priority = 6;
     if (g_owns_urma_init) {
@@ -532,6 +534,12 @@ static bool GlobalUrmaInitializeImpl() {
     LOG(INFO) << "urma_init " << (g_owns_urma_init ? "succeeded" : "returned EEXIST")
               << ", g_owns_urma_init=" << g_owns_urma_init;
 
+    // Save the process-level uasid assigned by urma_init. This is the value
+    // that must be advertised to peers during handshake — NOT
+    // g_context->uasid which is always 0 on bonding devices (the context
+    // struct does not inherit the init-time uasid).
+    g_local_uasid = init_attr.uasid;
+
     // If urma_init did not assign a non-zero uasid (kernel driver may not
     // support auto-assignment), try urma_get_uasid as a fallback.
     if (init_attr.uasid == 0) {
@@ -541,6 +549,7 @@ static bool GlobalUrmaInitializeImpl() {
             LOG(INFO) << "urma_init returned uasid=0; urma_get_uasid fallback "
                       << "assigned uasid=" << fallback_uasid;
             init_attr.uasid = fallback_uasid;
+            g_local_uasid = fallback_uasid;
         } else {
             LOG(WARNING) << "urma_init returned uasid=0 and urma_get_uasid "
                          << "failed (status=" << ustat << "). The kernel driver "
@@ -810,6 +819,7 @@ urma_context_t* GetUrmaContext() { return g_context; }
 const urma_eid_t* GetUrmaLocalEid() {
     return g_has_local_eid ? &g_local_eid : nullptr;
 }
+uint32_t GetUrmaLocalUasid() { return g_local_uasid; }
 bool IsUrmaBondingDevice() { return g_is_bonding_device; }
 int FindUrmaPriorityForTpType(const urma_device_attr_t& attr,
                               urma_tp_type_t tp_type) {

@@ -72,6 +72,12 @@ urma_context_t* GetUrmaContext();
 // Returns nullptr if URMA is not initialized.
 const urma_eid_t* GetUrmaLocalEid();
 
+// Get the process-level uasid assigned by urma_init (or urma_get_uasid
+// fallback). This is the uasid that must be advertised to peers during
+// handshake — NOT g_context->uasid which is always 0 on bonding devices.
+// Returns 0 if URMA is not initialized or uasid was not assigned.
+uint32_t GetUrmaLocalUasid();
+
 // Return true when the selected URMA device is a bonding provider device.
 bool IsUrmaBondingDevice();
 

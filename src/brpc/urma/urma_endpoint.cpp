@@ -176,7 +176,6 @@ void UrmaEndpoint::Reset() {
     _new_rq_wrs.store(0, butil::memory_order_relaxed);
     _sq_imm_window_size = 0;
     _sq_current = 0;
-    _sq_sent = 0;
     _rq_received = 0;
     _pending_received_bytes.store(0, butil::memory_order_relaxed);
     _sbuf.clear();
@@ -252,7 +251,7 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
     out->recv_buffer_cnt = _rq_size - 1;
     if (_resource && _resource->jetty) {
         out->jetty_id = _resource->jetty->jetty_id.id;
-        out->uasid = _resource->jetty->jetty_id.uasid;
+        out->uasid = GetUrmaLocalUasid();
         const urma_eid_t* local_eid = GetUrmaLocalEid();
         const uint8_t* advertised_eid =
             local_eid != nullptr
@@ -265,7 +264,7 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
     urma_target_seg_t* pool = GetPoolSegFor(nullptr);
     if (pool) {
         std::memcpy(out->seg_eid, pool->seg.ubva.eid.raw, 16);
-        out->seg_uasid = pool->seg.ubva.uasid;
+        out->seg_uasid = GetUrmaLocalUasid();
         out->seg_va = pool->seg.ubva.va;
         out->seg_len = pool->seg.len;
         out->seg_token_id = pool->seg.token_id;
@@ -705,6 +704,7 @@ public:
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
+            sglist[*sge_index].user_tseg = nullptr;
             cutn(to, this_len);
             len += this_len;
             (*sge_index)++;
@@ -729,6 +729,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOMEM;
         return -1;
     }
+    std::memset(sglist, 0, sizeof(urma_sge_t) * max_sge);
 
     size_t current = 0;
     ssize_t total_len = 0;
@@ -1020,6 +1021,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                         static_cast<uint16_t>(old + 1),
                         butil::memory_order_relaxed);
                 }
+                // The remote RQE was not consumed — return the credit.
+                _remote_rq_window_size.fetch_add(
+                    1, butil::memory_order_relaxed);
             }
             butil::subtle::MemoryBarrier();
             if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
@@ -1033,7 +1037,12 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                          << " on " << _socket->description();
             // Replenish the recv buffer that was consumed by this failed
             // completion, so subsequent receives can proceed.
-            PostRecv(1, zerocopy);
+            if (PostRecv(1, zerocopy) < 0) {
+                LOG(ERROR) << "URMA RX error: PostRecv failed after RX error";
+                errno = EIO;
+                return -1;
+            }
+            SendAck(1);
             return 0;  // Non-fatal: continue processing CQEs.
         }
     }
@@ -1056,6 +1065,17 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             return 0;
         }
         uint16_t wnd = 1;  // We signal every WR (complete_enable=1).
+        // Use user_ctx (SQ slot index + 1) to locate the completed buffer.
+        // URMA does not guarantee in-order completions, so _sq_sent-based
+        // clearing would free the wrong slot on out-of-order completions.
+        const uint16_t slot = static_cast<uint16_t>(cr.user_ctx - 1);
+        if (slot >= (_sq_size - RESERVED_WR_NUM)) {
+            LOG(WARNING) << "URMA send completion has invalid user_ctx="
+                         << cr.user_ctx << " on " << _socket->description();
+            errno = EPROTO;
+            return -1;
+        }
+        _sbuf[slot].clear();
         uint16_t old =
             _sq_window_size.load(butil::memory_order_relaxed);
         while (true) {
@@ -1074,10 +1094,6 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                     butil::memory_order_relaxed)) {
                 break;
             }
-        }
-        for (uint16_t i = 0; i < wnd; ++i) {
-            _sbuf[_sq_sent].clear();
-            _sq_sent = (_sq_sent + 1) % (_sq_size - RESERVED_WR_NUM);
         }
         butil::subtle::MemoryBarrier();
         if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
