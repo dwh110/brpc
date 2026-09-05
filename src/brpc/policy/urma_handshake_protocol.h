@@ -15,14 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_SOCKET_MODE_H
-#define BRPC_SOCKET_MODE_H
+#ifndef BRPC_POLICY_URMA_HANDSHAKE_PROTOCOL_H
+#define BRPC_POLICY_URMA_HANDSHAKE_PROTOCOL_H
+
+#include "butil/iobuf.h"
+#include "brpc/input_message_base.h"
+#include "brpc/parse_result.h"
+#include "brpc/socket.h"
+
 namespace brpc {
-enum SocketMode {
-    SOCKET_MODE_TCP = 0,
-    SOCKET_MODE_RDMA = 1,
-    SOCKET_MODE_UBRING = 2,
-    SOCKET_MODE_URMA = 3
-};
-} // namespace brpc
-#endif //BRPC_SOCKET_MODE_H
+namespace policy {
+
+ParseResult ParseUrmaHandshake(butil::IOBuf* source, Socket* socket,
+                               bool read_eof, const void* arg);
+
+void ProcessUrmaHandshake(InputMessageBase* msg);
+
+}  // namespace policy
+}  // namespace brpc
+
+#endif  // BRPC_POLICY_URMA_HANDSHAKE_PROTOCOL_H

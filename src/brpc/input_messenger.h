@@ -94,11 +94,12 @@ private:
 // Process messages from connections.
 // `Message' corresponds to a client's request or a server's response.
 class InputMessenger : public SocketUser {
-friend class Socket;
-friend class TcpTransport;
-friend class RdmaTransport;
-friend class rdma::RdmaEndpoint;
-friend class ubring::UBShmEndpoint;
+    friend class Socket;
+    friend class TcpTransport;
+    friend class RdmaTransport;
+    friend class UrmaTransport;
+    friend class rdma::RdmaEndpoint;
+    friend class ubring::UBShmEndpoint;
 public:
     explicit InputMessenger(size_t capacity = 128);
     ~InputMessenger();

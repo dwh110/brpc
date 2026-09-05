@@ -15,14 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_SOCKET_MODE_H
-#define BRPC_SOCKET_MODE_H
+#ifndef BRPC_URMA_URMA_HANDSHAKE_CONSTANTS_H
+#define BRPC_URMA_URMA_HANDSHAKE_CONSTANTS_H
+
 namespace brpc {
-enum SocketMode {
-    SOCKET_MODE_TCP = 0,
-    SOCKET_MODE_RDMA = 1,
-    SOCKET_MODE_UBRING = 2,
-    SOCKET_MODE_URMA = 3
-};
-} // namespace brpc
-#endif //BRPC_SOCKET_MODE_H
+namespace urma {
+
+constexpr const char* HELLO_MAGIC = "URMA";
+constexpr const char* HELLO_MAGIC_V3 = "URM3";
+constexpr size_t HELLO_MAGIC_LEN = 4;
+
+constexpr uint16_t HELLO_V2_VERSION = 2;
+constexpr uint16_t IMPL_V2_VERSION = 1;
+
+constexpr size_t HELLO_V2_MSG_LEN_MIN = 38;
+constexpr size_t HELLO_V2_MSG_LEN_MAX = 4096;
+
+constexpr size_t HELLO_V3_PB_SIZE_LEN = 4;
+constexpr size_t HELLO_V3_MAX_PB_SIZE = 8192;
+
+constexpr size_t HELLO_ACK_LEN = 4;
+constexpr uint32_t HELLO_ACK_URMA_OK = 0x1;
+
+}  // namespace urma
+}  // namespace brpc
+
+#endif  // BRPC_URMA_URMA_HANDSHAKE_CONSTANTS_H

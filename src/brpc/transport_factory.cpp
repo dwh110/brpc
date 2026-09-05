@@ -19,6 +19,7 @@
 #include "brpc/tcp_transport.h"
 #include "brpc/rdma_transport.h"
 #include "brpc/ubshm_transport.h"
+#include "brpc/urma_transport.h"
 
 namespace brpc {
 int TransportFactory::ContextInitOrDie(SocketMode mode, bool serverOrNot, const void* _options) {
@@ -33,6 +34,11 @@ int TransportFactory::ContextInitOrDie(SocketMode mode, bool serverOrNot, const 
 #if BRPC_WITH_UBRING
     else if (mode == SOCKET_MODE_UBRING) {
         return UBShmTransport::ContextInitOrDie(serverOrNot, _options);
+    }
+#endif
+#if BRPC_WITH_URMA
+    else if (mode == SOCKET_MODE_URMA) {
+        return UrmaTransport::ContextInitOrDie(serverOrNot, _options);
     }
 #endif
     else {
@@ -53,6 +59,11 @@ std::unique_ptr<Transport> TransportFactory::CreateTransport(SocketMode mode) {
 #if BRPC_WITH_UBRING
     else if (mode == SOCKET_MODE_UBRING) {
         return std::unique_ptr<UBShmTransport>(new UBShmTransport());
+    }
+#endif
+#if BRPC_WITH_URMA
+    else if (mode == SOCKET_MODE_URMA) {
+        return std::unique_ptr<UrmaTransport>(new UrmaTransport());
     }
 #endif
     else {

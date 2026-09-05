@@ -52,6 +52,8 @@ build --define absl=1
 
 build:rdma --define BRPC_WITH_RDMA=true
 
+build:urma --define BRPC_WITH_URMA=true
+
 # For UT.
 build:test --define BRPC_BUILD_FOR_UNITTEST=true
 # Hide libunwind's `_Unwind_*` symbols so they don't preempt libgcc_s at

@@ -118,6 +118,7 @@ function(brpc_example_configure_target target_name)
         ${OPENSSL_INCLUDE_DIR}
         ${GPERFTOOLS_INCLUDE_DIR}
         ${RDMA_INCLUDE_PATH}
+        ${URMA_INCLUDE_PATH}
     )
 
     if(_include_dirs)
@@ -145,6 +146,10 @@ function(brpc_example_configure_target target_name)
 
     if(BRPC_EXAMPLE_WITH_RDMA)
         target_compile_definitions(${target_name} PRIVATE BRPC_WITH_RDMA=1)
+    endif()
+
+    if(BRPC_EXAMPLE_WITH_URMA)
+        target_compile_definitions(${target_name} PRIVATE BRPC_WITH_URMA=1)
     endif()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")

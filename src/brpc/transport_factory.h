@@ -22,7 +22,7 @@
 #include "brpc/transport.h"
 
 namespace brpc {
-// TransportFactory to create transport instance with socket_mode {TCP, RDMA}
+// TransportFactory to create transport instance with socket_mode {TCP, RDMA, UBRING, URMA}
 class TransportFactory {
 public:
     static int ContextInitOrDie(SocketMode mode, bool serverOrNot, const void* _options);

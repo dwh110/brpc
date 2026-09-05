@@ -28,6 +28,7 @@ option(WITH_BTHREAD_TRACER "With bthread tracer supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
 option(WITH_UBRING "With UB" OFF)
+option(WITH_URMA "With URMA" OFF)
 option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
 option(WITH_DEBUG_LOCK "With debugging lock" OFF)
 option(WITH_ASAN "With AddressSanitizer" OFF)
@@ -119,6 +120,12 @@ if(WITH_UBRING)
         set(WITH_UBRING_VAL "1")
 endif()
 
+set(WITH_URMA_VAL "0")
+if(WITH_URMA)
+    set(WITH_URMA_VAL "1")
+    option(DOWNLOAD_URMA_HEADERS "Download UMDK headers when not found" ON)
+endif()
+
 set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "0")
 if(WITH_DEBUG_BTHREAD_SCHE_SAFETY)
     set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "1")
@@ -154,6 +161,7 @@ list(APPEND BRPC_COMMON_DEFINITIONS
     BRPC_WITH_GLOG=${WITH_GLOG_VAL}
     BRPC_WITH_RDMA=${WITH_RDMA_VAL}
     BRPC_WITH_UBRING=${WITH_UBRING_VAL}
+    BRPC_WITH_URMA=${WITH_URMA_VAL}
     BRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL}
     BRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}
     BTHREAD_USE_FAST_PTHREAD_MUTEX
@@ -309,6 +317,34 @@ if(WITH_RDMA)
     list(APPEND BRPC_COMMON_INCLUDE_DIRS ${RDMA_INCLUDE_PATH})
 endif()
 
+if(WITH_URMA)
+    message("brpc compile with urma")
+    find_path(URMA_INCLUDE_PATH NAMES ub/umdk/urma/urma_api.h)
+    find_library(URMA_LIB NAMES urma)
+    if(URMA_INCLUDE_PATH)
+        list(APPEND BRPC_COMMON_INCLUDE_DIRS ${URMA_INCLUDE_PATH})
+    elseif(DOWNLOAD_URMA_HEADERS)
+        message(STATUS "URMA headers not found; downloading from upstream UMDK")
+        include(FetchContent)
+        FetchContent_Declare(
+            umdk_headers
+            GIT_REPOSITORY https://atomgit.com/openeuler/umdk.git
+            GIT_TAG main
+            SOURCE_SUBDIR src/urma/lib/urma/core/include
+        )
+        FetchContent_Populate(umdk_headers)
+        list(APPEND BRPC_COMMON_INCLUDE_DIRS ${umdk_headers_SOURCE_DIR}/src/urma/lib/urma/core/include)
+        list(APPEND BRPC_COMMON_INCLUDE_DIRS ${umdk_headers_SOURCE_DIR}/src/urma/lib/urma/bond/include)
+    else()
+        message(STATUS "URMA headers not found and DOWNLOAD_URMA_HEADERS=OFF; using mock")
+    endif()
+    if(URMA_LIB)
+        message(STATUS "Found liburma: ${URMA_LIB}")
+    else()
+        message(STATUS "liburma not found; URMA code will use mock/stub linkage")
+    endif()
+endif()
+
 find_library(PROTOC_LIB NAMES protoc)
 if(NOT PROTOC_LIB)
     message(FATAL_ERROR "Fail to find protoc lib")
@@ -359,6 +395,10 @@ endif()
 
 if(WITH_RDMA)
     list(APPEND DYNAMIC_LIB ${RDMA_LIB})
+endif()
+
+if(WITH_URMA AND URMA_LIB)
+    list(APPEND DYNAMIC_LIB ${URMA_LIB})
 endif()
 
 if(WITH_UBRING)

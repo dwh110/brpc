@@ -70,6 +70,7 @@
 // Protocols
 #include "brpc/protocol.h"
 #include "brpc/policy/rdma_handshake_protocol.h"
+#include "brpc/policy/urma_handshake_protocol.h"
 #include "brpc/policy/baidu_rpc_protocol.h"
 #include "brpc/policy/http_rpc_protocol.h"
 #include "brpc/policy/http2_rpc_protocol.h"
@@ -444,6 +445,15 @@ static void GlobalInitializeOrDieImpl() {
         NULL, NULL, NULL,
         CONNECTION_TYPE_ALL, "rdma_handshake" };
     if (RegisterProtocol(PROTOCOL_RDMA_HANDSHAKE, rdma_handshake_protocol) != 0) {
+        exit(1);
+    }
+
+    Protocol urma_handshake_protocol = {
+        ParseUrmaHandshake, NULL, NULL,
+        ProcessUrmaHandshake, NULL,
+        NULL, NULL, NULL,
+        CONNECTION_TYPE_ALL, "urma_handshake" };
+    if (RegisterProtocol(PROTOCOL_URMA_HANDSHAKE, urma_handshake_protocol) != 0) {
         exit(1);
     }
 

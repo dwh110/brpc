@@ -15,14 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_SOCKET_MODE_H
-#define BRPC_SOCKET_MODE_H
+#include "brpc/policy/urma_handshake_protocol.h"
+
+#include "butil/logging.h"
+#include "brpc/destroyable.h"
+#include "brpc/urma/urma_handshake_server.h"
+
 namespace brpc {
-enum SocketMode {
-    SOCKET_MODE_TCP = 0,
-    SOCKET_MODE_RDMA = 1,
-    SOCKET_MODE_UBRING = 2,
-    SOCKET_MODE_URMA = 3
-};
-} // namespace brpc
-#endif //BRPC_SOCKET_MODE_H
+namespace policy {
+
+ParseResult ParseUrmaHandshake(butil::IOBuf* source, Socket* socket,
+                               bool /*read_eof*/, const void* /*arg*/) {
+    return urma::ExecuteServerHandshake(source, socket);
+}
+
+void ProcessUrmaHandshake(InputMessageBase* msg) {
+    DestroyingPtr<InputMessageBase> destroying_msg(msg);
+    CHECK(false) << "ProcessUrmaHandshake should never be called";
+}
+
+}  // namespace policy
+}  // namespace brpc

@@ -341,10 +341,11 @@ friend class policy::H2GlobalStreamCreator;
 friend class VersionedRefWithId<Socket>;
 friend class IOEvent<Socket>;
 friend void DereferenceSocket(Socket*);
-friend class Transport;
-friend class TcpTransport;
-friend class RdmaTransport;
-friend class TransportFactory;
+    friend class Transport;
+    friend class TcpTransport;
+    friend class RdmaTransport;
+    friend class UrmaTransport;
+    friend class TransportFactory;
     class SharedPart;
     struct WriteRequest;
 
