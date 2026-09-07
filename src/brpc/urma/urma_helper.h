@@ -108,6 +108,23 @@ int GetUrmaMaxSge();
 // Return max_jfr_sge supported by the device (for JFR / receive path).
 int GetUrmaMaxJfrSge();
 
+// Return the effective RQ depth to use. On bonding devices the JFR depth is
+// capped to avoid URMA_CR_REM_ACCESS_ABORT_ERR (status=8) under concurrent
+// load — the bonding provider fails when JFR depth >= 16 with multiple
+// threads. Non-bonding devices return FLAGS_urma_rq_size unchanged.
+uint16_t GetUrmaEffectiveRqSize();
+
+// Return the maximum send window size on bonding devices. The bonding
+// provider returns status=8 when too many sends are posted concurrently.
+// Returns 0 on non-bonding devices (no cap).
+uint16_t GetUrmaBondingMaxSendWindow();
+
+// Return the maximum payload bytes per SGE on the current device.
+// The bonding provider silently drops SEND WRs whose SGE length exceeds
+// 4096 bytes, causing the jetty to flush (status=11) on all subsequent
+// WRs.  Non-bonding devices return 0 (no per-SGE limit).
+uint32_t GetUrmaMaxSgeLen();
+
 }  // namespace urma
 }  // namespace brpc
 

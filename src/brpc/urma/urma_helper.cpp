@@ -90,6 +90,20 @@ DEFINE_int32(urma_bonding_mode, 0,
              "1=active-backup, 2=balance.");
 DEFINE_int32(urma_bonding_level, 0,
              "Bonding level for bonding devices: 0=IODIE, 1=port.");
+DEFINE_int32(urma_bonding_max_rq_size, 0,
+             "Max JFR depth on bonding devices. The bonding provider returns "
+             "URMA_CR_REM_ACCESS_ABORT_ERR (status=8) under concurrent load "
+             "when too many WRs are in-flight. This cap is applied only on "
+             "bonding devices; non-bonding devices use --urma_rq_size unchanged. "
+             "Set to 0 to disable the cap. Default is 0 (disabled) because "
+             "the SGE cap (1) on bonding devices is the primary mitigation.");
+
+DEFINE_int32(urma_bonding_max_send_window, 0,
+             "Max send window size on bonding devices. The bonding provider "
+             "returns URMA_CR_REM_ACCESS_ABORT_ERR (status=8) when too many "
+             "sends are posted concurrently. Capping the send window limits "
+             "the number of in-flight sends, avoiding this provider bug. "
+             "Applied only on bonding devices; 0 means no cap.");
 DEFINE_int32(urma_prepared_jetty_cnt, 8,
              "Requested number of pre-allocated Jetty+CQ sets for fast "
              "connect; capped automatically according to RLIMIT_NOFILE");
@@ -689,6 +703,15 @@ static bool GlobalUrmaInitializeImpl() {
         device_max_sge = 255;
     }
     g_max_sge = static_cast<int>(device_max_sge);
+    // The bonding provider returns URMA_CR_REM_ACCESS_ABORT_ERR (status=8)
+    // when a SEND WR carries more than 1 SGE under concurrent load.
+    // Even 2 SGEs with moderate payload (~4KB) triggers this provider bug.
+    // Cap the JFS max_sge on bonding devices to 1 to avoid it entirely.
+    if (g_is_bonding_device && g_max_sge > 1) {
+        LOG(INFO) << "Bonding device: capping JFS max_sge from "
+                  << g_max_sge << " to 1 to avoid status=8 errors";
+        g_max_sge = 1;
+    }
     if (FLAGS_urma_max_sge > 0) {
         if (FLAGS_urma_max_sge > g_max_sge) {
             LOG(WARNING) << "Cap urma_max_sge from " << FLAGS_urma_max_sge
@@ -836,6 +859,39 @@ uint8_t GetUrmaJettyPriority() { return g_jetty_priority; }
 int GetUrmaMaxSge() { return g_max_sge; }
 int GetUrmaMaxJfrSge() { return g_max_jfr_sge; }
 size_t GetUrmaRecvBlockSize() { return g_recv_block_size; }
+
+uint16_t GetUrmaEffectiveRqSize() {
+    uint16_t rq = static_cast<uint16_t>(
+        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_rq_size))));
+    if (g_is_bonding_device && FLAGS_urma_bonding_max_rq_size > 0) {
+        const uint16_t cap = static_cast<uint16_t>(FLAGS_urma_bonding_max_rq_size);
+        if (rq > cap) {
+            LOG(INFO) << "Bonding device: capping JFR depth from "
+                      << rq << " to " << cap
+                      << " (--urma_bonding_max_rq_size) to avoid status=8";
+            rq = cap;
+        }
+    }
+    return rq;
+}
+
+uint16_t GetUrmaBondingMaxSendWindow() {
+    if (!g_is_bonding_device || FLAGS_urma_bonding_max_send_window <= 0) {
+        return 0;
+    }
+    return static_cast<uint16_t>(FLAGS_urma_bonding_max_send_window);
+}
+
+uint32_t GetUrmaMaxSgeLen() {
+    // The bonding provider silently drops SEND WRs whose SGE payload
+    // exceeds 4096 bytes, then flushes the jetty (status=11) on all
+    // subsequent WRs.  Cap each SGE to 4096 bytes on bonding devices.
+    // Non-bonding devices have no per-SGE limit (return 0).
+    if (!g_is_bonding_device) {
+        return 0;
+    }
+    return 4096;
+}
 
 // ============================================================================
 // Polling mode (per bthread tag).

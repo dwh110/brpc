@@ -150,8 +150,7 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
       _resource(nullptr) {
     _sq_size = static_cast<uint16_t>(
         std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
-    _rq_size = static_cast<uint16_t>(
-        std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_rq_size))));
+    _rq_size = GetUrmaEffectiveRqSize();
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
 }
@@ -678,7 +677,7 @@ public:
     // Returns bytes added, or -1 (errno set).
     ssize_t cut_into_sglist(urma_sge_t* sglist, size_t* sge_index,
                             butil::IOBuf* to, size_t max_sge,
-                            size_t max_len) {
+                            size_t max_len, size_t max_sge_len) {
         size_t len = 0;
         while (*sge_index < max_sge && len < max_len && _ref_num() != 0) {
             butil::IOBuf::BlockRef const& r = _ref_at(0);
@@ -701,6 +700,13 @@ public:
             if (len + this_len > max_len) {
                 this_len = max_len - len;
             }
+            // Bonding provider drops SEND WRs whose SGE payload exceeds
+            // 4096 bytes (max_sge_len).  Cap this_len so each SGE stays
+            // within the limit; the remaining bytes stay in the IOBuf for
+            // the next SGE/WR iteration.
+            if (max_sge_len > 0 && this_len > max_sge_len) {
+                this_len = max_sge_len;
+            }
             sglist[*sge_index].addr = reinterpret_cast<uint64_t>(start);
             sglist[*sge_index].len = static_cast<uint32_t>(this_len);
             sglist[*sge_index].tseg = tseg;
@@ -718,10 +724,16 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
+    // Serialize send-path access. The bonding provider's
+    // urma_post_jetty_send_wr cannot be called concurrently from
+    // multiple bthreads without triggering status=8 errors. The mutex
+    // also protects _sq_current which is not atomic.
+    BAIDU_SCOPED_LOCK(_send_mutex);
     int max_sge = GetUrmaMaxSge();
     if (max_sge < 1) {
         max_sge = 1;
     }
+    const uint32_t max_sge_len = GetUrmaMaxSgeLen();
 
     urma_sge_t* sglist = static_cast<urma_sge_t*>(
         alloca(sizeof(urma_sge_t) * max_sge));
@@ -757,7 +769,8 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                 continue;
             }
             ssize_t n = data->cut_into_sglist(sglist, &sge_index, to,
-                                              max_sge, max_len - this_len);
+                                              max_sge, max_len - this_len,
+                                              max_sge_len);
             if (n < 0) {
                 return -1;
             }
@@ -821,6 +834,18 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         }
         _sq_current = (_sq_current + 1) % (_sq_size - RESERVED_WR_NUM);
         total_len += static_cast<ssize_t>(this_len);
+        VLOG(99) << "URMA post WR: sq_slot=" << sq_slot
+                  << " sge_count=" << sge_index
+                  << " payload=" << this_len
+                  << " total_sent=" << total_len
+                  << " sq_wnd=" << _sq_window_size.load(butil::memory_order_relaxed)
+                  << " remote_rq_wnd=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
+                  << " max_sge=" << max_sge
+                  << " max_len=" << max_len
+                  << " max_sge_len=" << max_sge_len
+                  << " ndata=" << ndata
+                  << " current=" << current
+                  << " on " << _socket->description();
     }
     return total_len;
 }
@@ -973,16 +998,21 @@ int UrmaEndpoint::SendAck(int num) {
 ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     bool zerocopy = FLAGS_urma_recv_zerocopy;
     if (cr.status != URMA_CR_SUCCESS) {
-        // Mirrors umq_ub_dequeue_plus_with_poll_tx: distinguish TX vs RX
-        // errors and only treat FLUSH-type errors as fatal. Transient errors
-        // (REM_ACCESS_ABORT, RNR_RETRY, ACK_TIMEOUT, etc.) must not kill the
-        // connection — the SQ/RQ windows are still replenished and the loop
-        // continues processing subsequent CQEs.
+        // Distinguish fatal vs non-fatal completion errors.
+        // FLUSH/UNHANDLED: jetty torn down — fatal.
+        // REM_ACCESS_ABORT_ERR (status=8) on bonding devices: TP dead — fatal.
+        // Other errors (RNR_RETRY, ACK_TIMEOUT, LOC_ACCESS): non-fatal,
+        // the SQ/RQ windows are replenished and the loop continues.
         if (cr.status == URMA_CR_WR_FLUSH_ERR ||
             cr.status == URMA_CR_WR_UNHANDLED) {
             // Jetty is being torn down — this IS fatal.
             LOG(ERROR) << "URMA fatal completion error (jetty flush): status="
-                       << cr.status << " on " << _socket->description();
+                       << cr.status << " s_r=" << cr.flag.bs.s_r
+                       << " user_ctx=" << cr.user_ctx
+                       << " sq_wnd=" << _sq_window_size.load(butil::memory_order_relaxed)
+                       << " remote_rq_wnd=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
+                       << " state=" << GetStateStr()
+                       << " on " << _socket->description();
             errno = EIO;
             return -1;
         }
@@ -994,13 +1024,20 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                          << " on " << _socket->description();
             return 0;
         }
-        // Transient error: REM_ACCESS_ABORT_ERR, RNR_RETRY_CNT_EXC_ERR,
-        // ACK_TIMEOUT_ERR, LOC_ACCESS_ERR, etc. Recover resources and
-        // continue, mirroring umq_ub which counts failed_cnt and continues.
+        // Distinguish REM_ACCESS_ABORT_ERR (status=8) on bonding devices from
+        // other transient errors. The bonding provider TP enters a dead state
+        // after returning status=8: no further completions are generated for
+        // the jetty, so continuing is futile. The connection must be rebuilt.
+        const bool fatal_tp_error =
+            (cr.status == URMA_CR_REM_ACCESS_ABORT_ERR);
         if (cr.flag.bs.s_r == 0) {
             // --- TX (send) completion error ---
             LOG(WARNING) << "URMA TX completion error: status=" << cr.status
                          << " user_ctx=" << cr.user_ctx
+                         << " sq_wnd=" << _sq_window_size.load(butil::memory_order_relaxed)
+                         << " remote_rq_wnd=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
+                         << " sq_capacity=" << _local_window_capacity
+                         << " fatal=" << fatal_tp_error
                          << " on " << _socket->description();
             if (cr.user_ctx == 0) {
                 // Pure-ack WR error: replenish imm budget only.
@@ -1014,27 +1051,53 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                 if (slot < (_sq_size - RESERVED_WR_NUM)) {
                     _sbuf[slot].clear();
                 }
-                uint16_t old = _sq_window_size.load(
-                    butil::memory_order_relaxed);
-                if (old < _local_window_capacity) {
-                    _sq_window_size.store(
-                        static_cast<uint16_t>(old + 1),
-                        butil::memory_order_relaxed);
+                // Use the same CAS loop as the success path to avoid racing
+                // with the send path's fetch_sub on _sq_window_size.
+                uint16_t old =
+                    _sq_window_size.load(butil::memory_order_relaxed);
+                while (true) {
+                    if (old >= _local_window_capacity) {
+                        LOG(WARNING)
+                            << "URMA TX error: sq_window overflow: old="
+                            << old << " capacity=" << _local_window_capacity
+                            << " on " << _socket->description();
+                        break;
+                    }
+                    if (_sq_window_size.compare_exchange_weak(
+                            old, static_cast<uint16_t>(old + 1),
+                            butil::memory_order_relaxed)) {
+                        break;
+                    }
                 }
                 // The remote RQE was not consumed — return the credit.
                 _remote_rq_window_size.fetch_add(
                     1, butil::memory_order_relaxed);
             }
             butil::subtle::MemoryBarrier();
-            if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
-                _local_window_capacity / 8) {
-                _socket->WakeAsEpollOut();
+            _socket->WakeAsEpollOut();
+            if (fatal_tp_error) {
+                // Bonding provider TP is dead after status=8 — no more
+                // completions will arrive. Mark the connection failed so
+                // brpc retries on a new connection.
+                LOG(ERROR) << "URMA TX fatal TP error (status=8): bonding "
+                           << "provider TP dead, failing connection "
+                           << _socket->description();
+                errno = EIO;
+                return -1;
             }
             return 0;  // Non-fatal: continue processing CQEs.
         } else {
             // --- RX (recv) completion error ---
             LOG(WARNING) << "URMA RX completion error: status=" << cr.status
                          << " on " << _socket->description();
+            if (fatal_tp_error) {
+                // Same as TX: bonding provider TP is dead after status=8.
+                LOG(ERROR) << "URMA RX fatal TP error (status=8): bonding "
+                           << "provider TP dead, failing connection "
+                           << _socket->description();
+                errno = EIO;
+                return -1;
+            }
             // Replenish the recv buffer that was consumed by this failed
             // completion, so subsequent receives can proceed.
             if (PostRecv(1, zerocopy) < 0) {
@@ -1096,10 +1159,10 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             }
         }
         butil::subtle::MemoryBarrier();
-        if (_remote_rq_window_size.load(butil::memory_order_relaxed) >=
-            _local_window_capacity / 8) {
-            _socket->WakeAsEpollOut();
-        }
+        // Wake the send path unconditionally: the SQ slot is reclaimed
+        // and _remote_rq_window_size may have been replenished by an
+        // incoming SEND_WITH_IMM since the last check.
+        _socket->WakeAsEpollOut();
         return 0;
     }
     // Recv completion.
@@ -1131,9 +1194,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                 break;
             }
         }
-        if (_sq_window_size.load(butil::memory_order_relaxed) > 0) {
-            _socket->WakeAsEpollOut();
-        }
+        // Always wake: credits have been returned and the send path
+        // may be blocked waiting for remote_rq_window_size.
+        _socket->WakeAsEpollOut();
     } else if (cr.completion_len == 0) {
         LOG(WARNING) << "Zero-length URMA receive without immediate credit";
         errno = EPROTO;
@@ -1141,7 +1204,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     }
     if (cr.completion_len > GetUrmaRecvBlockSize()) {
         LOG(WARNING) << "URMA completion exceeds receive buffer: "
-                     << cr.completion_len;
+                     << cr.completion_len
+                     << " vs block_size=" << GetUrmaRecvBlockSize()
+                     << " on " << _socket->description();
         errno = EPROTO;
         return -1;
     }
@@ -1232,6 +1297,10 @@ void UrmaEndpoint::PollCq(Socket* m) {
         }
 
         ssize_t bytes = 0;
+        int total_cqes = 0;
+        int tx_ok = 0;
+        int tx_err = 0;
+        int rx_ok = 0;
         auto drain_cq = [&]() -> int {
             while (true) {
                 const int n =
@@ -1245,6 +1314,7 @@ void UrmaEndpoint::PollCq(Socket* m) {
                 if (cnt == 0) {
                     return 0;
                 }
+                total_cqes += cnt;
                 for (int i = 0; i < cnt; ++i) {
                     if (s->Failed()) {
                         return ECANCELED;
@@ -1253,12 +1323,29 @@ void UrmaEndpoint::PollCq(Socket* m) {
                     if (nr < 0) {
                         return errno ? errno : EIO;
                     }
+                    if (crs[i].status == URMA_CR_SUCCESS) {
+                        if (crs[i].flag.bs.s_r == 0) {
+                            ++tx_ok;
+                        } else {
+                            ++rx_ok;
+                        }
+                    } else {
+                        ++tx_err;
+                    }
                     bytes += nr;
                 }
             }
         };
 
         int completion_error = drain_cq();
+        if (tx_err > 0) {
+            LOG(WARNING) << "URMA CQ drain: total=" << total_cqes
+                      << " tx_ok=" << tx_ok << " tx_err=" << tx_err
+                      << " rx_ok=" << rx_ok << " bytes=" << bytes
+                      << " sq_wnd=" << ep->_sq_window_size.load(butil::memory_order_relaxed)
+                      << " remote_rq_wnd=" << ep->_remote_rq_window_size.load(butil::memory_order_relaxed)
+                      << " on " << ep->_socket->description();
+        }
         if (event_mode) {
             // The bonding provider records which physical JFCs produced CRs
             // while bondp_poll_jfc drains the virtual JFC.
@@ -1307,8 +1394,19 @@ void UrmaEndpoint::PollCq(Socket* m) {
 void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
     _remote_recv_block_size = remote.buffer_size;
     const uint32_t peer_rq_size = remote.recv_buffer_cnt + 1;
-    const uint32_t local_capacity =
+    uint32_t local_capacity =
         std::min<uint32_t>(_sq_size, peer_rq_size);
+    // Cap the send window on bonding devices to avoid status=8 errors.
+    // The bonding provider fails when too many sends are in-flight
+    // concurrently with larger messages.
+    const uint16_t bonding_max_wnd = GetUrmaBondingMaxSendWindow();
+    if (bonding_max_wnd > 0 && local_capacity > bonding_max_wnd) {
+        LOG(INFO) << "Bonding device: capping send window from "
+                  << local_capacity << " to " << bonding_max_wnd
+                  << " (--urma_bonding_max_send_window) on "
+                  << _socket->description();
+        local_capacity = bonding_max_wnd;
+    }
     _local_window_capacity = static_cast<uint16_t>(
         local_capacity > RESERVED_WR_NUM
             ? local_capacity - RESERVED_WR_NUM
@@ -1907,7 +2005,8 @@ int UrmaEndpoint::GlobalInitialize() {
             break;
         }
         urma_jfc_cfg_t jfc_cfg{};
-        jfc_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size + FLAGS_urma_rq_size);
+        const uint16_t effective_rq = GetUrmaEffectiveRqSize();
+        jfc_cfg.depth = static_cast<uint32_t>(FLAGS_urma_sq_size + effective_rq);
         jfc_cfg.jfce = r->jfce;
         r->jfc = urma_create_jfc(ctx, &jfc_cfg);
         if (!r->jfc) {
@@ -1915,7 +2014,7 @@ int UrmaEndpoint::GlobalInitialize() {
             break;
         }
         urma_jfr_cfg_t jfr_cfg{};
-        jfr_cfg.depth = static_cast<uint32_t>(FLAGS_urma_rq_size);
+        jfr_cfg.depth = static_cast<uint32_t>(effective_rq);
         jfr_cfg.trans_mode = URMA_TM_RM;
         jfr_cfg.max_sge =
             static_cast<uint8_t>(GetUrmaMaxJfrSge());
