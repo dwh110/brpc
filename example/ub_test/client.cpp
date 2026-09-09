@@ -788,14 +788,7 @@ static void RunPerformanceTest(std::vector<PerformanceTest*>& success_tests) {
 
     // Export percentile samples for cross-instance aggregation
     if (!FLAGS_export_percentile_file.empty()) {
-        const std::string& filepath = FLAGS_export_percentile_file;
-        if (g_latency_recorder->save_percentile_samples(filepath) == 0) {
-            std::cout << "[Export] Percentile samples saved to: "
-                      << filepath << std::endl;
-        } else {
-            std::cerr << "[Export] Failed to save percentile samples to: "
-                      << filepath << std::endl;
-        }
+        LOG(WARNING) << "--export_percentile_file is not supported in this build";
     }
 
 }
