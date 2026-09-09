@@ -225,6 +225,7 @@ cc_binary(
     name = "ub_performance_press_client",
     srcs = [
         "ub_performance_press/client.cpp",
+        "ub_performance_press/data_generator.h",
     ],
     includes = [
         "ub_performance_press",
