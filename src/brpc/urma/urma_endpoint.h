@@ -307,12 +307,6 @@ private:
     // SQ producer index (next slot to post).
     uint16_t _sq_current{0};
 
-    // Mutex serializing concurrent CutFromIOBufList calls. The bonding
-    // provider's urma_post_jetty_send_wr is not safe under concurrent
-    // invocation from multiple bthreads; concurrent calls cause
-    // URMA_CR_REM_ACCESS_ABORT_ERR (status=8). The mutex also protects
-    // _sq_current which is not atomic.
-    butil::Mutex _send_mutex;
     // RQ consumer index.
     uint16_t _rq_received{0};
 

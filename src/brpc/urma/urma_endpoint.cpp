@@ -724,11 +724,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
-    // Serialize send-path access. The bonding provider's
-    // urma_post_jetty_send_wr cannot be called concurrently from
-    // multiple bthreads without triggering status=8 errors. The mutex
-    // also protects _sq_current which is not atomic.
-    BAIDU_SCOPED_LOCK(_send_mutex);
+    // brpc's KeepWrite model guarantees single-writer access to this
+    // function per Socket, so no lock is needed for _sq_current or
+    // urma_post_jetty_send_wr. Window variables are atomic with CAS.
     int max_sge = GetUrmaMaxSge();
     if (max_sge < 1) {
         max_sge = 1;
