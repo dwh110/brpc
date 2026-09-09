@@ -80,6 +80,13 @@ brpc_proto_library(
     proto_deps = [],
 )
 
+brpc_proto_library(
+    name = "cc_ub_test_proto",
+    srcs = ["ub_test/test.proto"],
+    include = "ub_test",
+    proto_deps = [],
+)
+
 cc_binary(
     name = "echo_c++_server",
     srcs = [
@@ -233,6 +240,36 @@ cc_binary(
     copts = COPTS,
     deps = [
         ":cc_ub_performance_press_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_test_server",
+    srcs = [
+        "ub_test/server.cpp",
+    ],
+    includes = [
+        "ub_test",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_test_proto",
+        "//:brpc",
+    ],
+)
+
+cc_binary(
+    name = "ub_test_client",
+    srcs = [
+        "ub_test/client.cpp",
+    ],
+    includes = [
+        "ub_test",
+    ],
+    copts = COPTS,
+    deps = [
+        ":cc_ub_test_proto",
         "//:brpc",
     ],
 )
