@@ -703,13 +703,14 @@ static bool GlobalUrmaInitializeImpl() {
         device_max_sge = 255;
     }
     g_max_sge = static_cast<int>(device_max_sge);
-    // The bonding provider returns URMA_CR_REM_ACCESS_ABORT_ERR (status=8)
-    // when a SEND WR carries more than 1 SGE under concurrent load.
-    // Even 2 SGEs with moderate payload (~4KB) triggers this provider bug.
-    // Cap the JFS max_sge on bonding devices to 1 to avoid it entirely.
-    if (g_is_bonding_device && g_max_sge > 1) {
-        LOG(INFO) << "Bonding device: capping JFS max_sge from "
-                  << g_max_sge << " to 1 to avoid status=8 errors";
+    // Both bonding and raw UDMA providers return errors (status=8 on
+    // bonding, completion errors / silent WR drops on raw udma) when a
+    // SEND WR carries more than 1 SGE.  Even 2 SGEs with moderate payload
+    // (~4KB) triggers this.  Cap JFS max_sge to 1 on all URMA devices.
+    if (g_max_sge > 1) {
+        LOG(INFO) << "Capping JFS max_sge from "
+                  << g_max_sge << " to 1 to avoid multi-SGE errors"
+                  << " (device=" << device_name << ")";
         g_max_sge = 1;
     }
     if (FLAGS_urma_max_sge > 0) {
@@ -883,13 +884,9 @@ uint16_t GetUrmaBondingMaxSendWindow() {
 }
 
 uint32_t GetUrmaMaxSgeLen() {
-    // The bonding provider silently drops SEND WRs whose SGE payload
-    // exceeds 4096 bytes, then flushes the jetty (status=11) on all
-    // subsequent WRs.  Cap each SGE to 4096 bytes on bonding devices.
-    // Non-bonding devices have no per-SGE limit (return 0).
-    if (!g_is_bonding_device) {
-        return 0;
-    }
+    // Both bonding and raw UDMA providers silently drop SEND WRs whose
+    // SGE payload exceeds 4096 bytes, then flush the jetty (status=11)
+    // on all subsequent WRs.  Cap each SGE to 4096 bytes on all devices.
     return 4096;
 }
 
