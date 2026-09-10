@@ -118,6 +118,12 @@ DEFINE_bool(urma_poller_yield, false,
             "Yield (bthread_yield) in the busy poll loop to let other "
             "bthreads run");
 
+DEFINE_bool(urma_trace_latency, false,
+            "Log per-RPC URMA latency breakdown to LOG(INFO). "
+            "Tracks send/recv WR counts, EAGAIN waits, post/recv/ack "
+            "times for each CutFromIOBufList and completion batch. "
+            "Use with queue_depth=1 for clean per-request traces.");
+
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
 // true, GlobalUrmaInitializeOrDie() returns without touching liburma and the

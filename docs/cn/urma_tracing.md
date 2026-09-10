@@ -731,3 +731,137 @@ epoll(JFCE fd) 或 polling bthread
 | `enable_rpcz` | `false` | 开启 rpcz |
 | `rpcz_keep_span_seconds` | `3600` | Span 保留时间（秒） |
 | `rpcz_save_span_min_latency_us` | `0` | 仅保存延时超过此值的 Span |
+| `urma_trace_latency` | `false` | 开启代码级全流程时延打点（见下文） |
+
+---
+
+## 9. 代码级时延打点（--urma_trace_latency）
+
+当 `tools/urma_pipeline_trace.sh`（bpftrace）因权限不可用时，可使用代码级打点方案：
+通过 `--urma_trace_latency=true` gflag 在 URMA 关键路径插入零开销（关闭时无额外指令）
+的 timestamp 记录，输出到 `LOG(INFO)`，每条 RPC 请求输出一行汇总。
+
+### 9.1 打点位置
+
+共 10 个打点，覆盖发送端和接收端全流程：
+
+**发送端（client 发送 request / server 发送 response）：**
+
+| 点 | 位置 | 事件 | 说明 |
+|---|---|---|---|
+| T1 | `CutFromIOBufList` 入口 | 发送开始 | 重置 trace 状态，记录开始时间 |
+| T2 | `urma_post_jetty_send_wr` 调用 | 单个 WR post | 累计 post 次数和 post 耗时 |
+| T3 | `CutFromIOBufList` 返回 | 发送完成 | 输出 send 汇总行 |
+| T4 | window 检查 EAGAIN | 窗口阻塞 | 记录 EAGAIN 次数 |
+
+**接收端（server 接收 request / client 接收 response）：**
+
+| 点 | 位置 | 事件 | 说明 |
+|---|---|---|---|
+| T5 | `urma_poll_jfc` | CQ 轮询 | 记录 poll 次数 |
+| T6 | TX completion | 发送完成确认 | 记录 SQ 窗口回补次数 |
+| T7 | RX completion | 接收数据 | 记录首包时间、WR 数、字节数 |
+| T8 | `PostRecv` | 重投接收 WR | 记录 PostRecv 次数 |
+| T9 | `SendAck` | 发送信用 ACK | 记录 SendAck 次数 |
+| T10 | `DispatchReceivedBytes` | 分发到上层 | 输出 recv 汇总行 |
+
+### 9.2 输出格式
+
+**send 汇总行（T3，每次 `CutFromIOBufList` 返回时输出）：**
+
+```
+[URMA-TRACE] send: wrs=125 bytes=505951 eagain=1 post_time=383us total=393us remote_rq_wnd=0
+```
+
+| 字段 | 含义 |
+|------|------|
+| `wrs` | 本次 `CutFromIOBufList` post 的 WR 总数 |
+| `bytes` | 本次发送的字节数 |
+| `eagain` | 因窗口耗尽而 EAGAIN 的次数 |
+| `post_time` | `urma_post_jetty_send_wr` 累计耗时 |
+| `total` | 本次 `CutFromIOBufList` 总耗时 |
+| `remote_rq_wnd` | 返回时对端 RQ 剩余窗口（0=窗口耗尽） |
+
+**recv 汇总行（T10，每次 `DispatchReceivedBytes` 时输出）：**
+
+```
+[URMA-TRACE] recv: rx_wrs=2058 bytes=8388672 tx_completions=32 polls=452 postrecv=2058 sendack=2058 recv_time=49034us
+```
+
+| 字段 | 含义 |
+|------|------|
+| `rx_wrs` | 接收到的 RX completion 总数 |
+| `bytes` | 接收总字节数 |
+| `tx_completions` | TX completion 数（SQ 窗口回补） |
+| `polls` | `urma_poll_jfc` 调用次数 |
+| `postrecv` | `PostRecv` 调用次数 |
+| `sendack` | `SendAck` 调用次数 |
+| `recv_time` | 从首个 RX completion 到分发总耗时 |
+
+### 9.3 使用方法
+
+```bash
+# 1. 编译（带打点代码，默认关闭零开销）
+bazel build -c opt //example:ub_test_server //example:ub_test_client \
+    --define BRPC_WITH_URMA=true --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0
+
+# 2. 启动 server（开启打点）
+numactl -C 96-111 -m 1 ./ub_test_server \
+    --port=10086 --use_urma=true --urma_uasid=1 \
+    --rsp_size=8388608 --num_threads=16 \
+    --urma_trace_latency=true 2>/tmp/server_trace.log
+
+# 3. 启动 client（开启打点，queue_depth=1 获得干净逐请求打点）
+numactl -C 96-111 -m 1 ./ub_test_client \
+    --servers=141.61.17.202:10086 --use_urma=true --urma_uasid=2 \
+    --req_size=8388608 --queue_depth=1 --test_seconds=5 --expected_qps=0 \
+    --urma_trace_latency=true 2>/tmp/client_trace.log
+
+# 4. 收集 trace 日志
+grep '\[URMA-TRACE\]' /tmp/server_trace.log
+grep '\[URMA-TRACE\]' /tmp/client_trace.log
+```
+
+### 9.4 8MB 瓶颈分析示例
+
+使用 `--req_size=8388608 --queue_depth=1 --expected_qps=0` 对 8MB 场景打点，
+关键发现：
+
+**接收侧（server 收 8MB request）：**
+```
+recv: rx_wrs=2058 bytes=8388672 tx_completions=32 polls=452 postrecv=2058 sendack=2058 recv_time=49034us
+```
+- 8MB 数据被拆成 2058 个 WR（每 WR 4096B，受 `max_sge_len=4096` 限制）
+- 452 次 poll 才排空所有 CQE，说明硬件中断→poll 的粒度远小于 WR 粒度
+- `recv_time=49ms`：接收侧本身耗时约 49ms
+
+**发送侧（server 发 8MB response）：**
+```
+send: wrs=125 bytes=505951 eagain=1 post_time=383us total=393us remote_rq_wnd=0
+send: wrs=63  bytes=257056 eagain=1 post_time=26us  total=30us  remote_rq_wnd=0
+send: wrs=189 bytes=772096 eagain=1 post_time=150us total=162us remote_rq_wnd=0
+send: wrs=441 bytes=1799264 eagain=1 post_time=160us total=216us remote_rq_wnd=0
+...（共 ~10 次 CutFromIOBufList 调用）
+```
+- 8MB response 不是一次 post 完成，而是被拆成 ~10 次 `CutFromIOBufList`
+- **每次都命中 `eagain=1` 且 `remote_rq_wnd=0`** — 对端接收窗口耗尽
+- 发送端必须等待接收端 `PostRecv` + `SendAck` 回补信用后才能继续
+
+**瓶颈定位结论：**
+
+```
+8MB 单请求延迟 ~48ms 拆解：
+
+  接收侧 poll 粒度     ~49ms（2058 WRs / 452 polls）
+  发送侧窗口等待       ~10 轮 EAGAIN（remote_rq_wnd=0）
+  ↳ 每轮等待 PostRecv+SendAck 往返
+
+  根因：credit-based flow control + max_sge_len=4096
+  → 8MB 需 2048 WRs，远超 SQ/RQ 窗口深度（128）
+  → 发送端反复阻塞等待对端回补信用
+```
+
+**优化方向：**
+1. 增大 `--urma_sq_size` / `--urma_rq_size`（如 4096），减少窗口等待轮次
+2. 增大 `max_sge_len`（需硬件/驱动支持），减少 WR 数量
+3. 批量 `SendAck`（当前每 WR 一条 ACK），减少信用回补往返延迟

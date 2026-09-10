@@ -307,6 +307,27 @@ private:
     // SQ producer index (next slot to post).
     uint16_t _sq_current{0};
 
+    // ---- Latency tracing state (active when --urma_trace_latency=true) ----
+    struct TraceState {
+        // Send path (reset at CutFromIOBufList entry, flushed at return)
+        int64_t send_start_us{0};       // T1: function entry
+        int64_t send_first_post_us{0};  // T2: first urma_post_jetty_send_wr
+        int64_t send_post_time_us{0};   // cumulative time in urma_post_jetty_send_wr
+        int send_wr_count{0};           // total WRs posted in this call
+        int send_eagain_count{0};       // window-blocked breaks
+        size_t send_total_bytes{0};     // total bytes sent
+
+        // Recv path (accumulated across PollCq calls, flushed at DispatchReceivedBytes)
+        int64_t recv_first_rx_us{0};    // T7: first RX completion timestamp
+        int recv_wr_count{0};           // total RX completions
+        size_t recv_total_bytes{0};     // total bytes received
+        int recv_postrecv_count{0};     // PostRecv calls
+        int recv_sendack_count{0};      // SendAck calls
+        int recv_poll_count{0};         // urma_poll_jfc calls
+        int recv_tx_complete{0};        // TX completions (SQ window returns)
+    };
+    TraceState _trace;
+
     // RQ consumer index.
     uint16_t _rq_received{0};
 

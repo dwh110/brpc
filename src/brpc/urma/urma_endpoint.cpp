@@ -67,6 +67,7 @@ DECLARE_bool(urma_recv_zerocopy);
 DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
 DECLARE_bool(urma_poller_yield);
+DECLARE_bool(urma_trace_latency);
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -724,6 +725,16 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
+    // T1: trace send start
+    const bool trace_on = FLAGS_urma_trace_latency;
+    if (trace_on) {
+        _trace.send_start_us = butil::monotonic_time_us();
+        _trace.send_first_post_us = 0;
+        _trace.send_post_time_us = 0;
+        _trace.send_wr_count = 0;
+        _trace.send_eagain_count = 0;
+        _trace.send_total_bytes = 0;
+    }
     // brpc's KeepWrite model guarantees single-writer access to this
     // function per Socket, so no lock is needed for _sq_current or
     // urma_post_jetty_send_wr. Window variables are atomic with CAS.
@@ -747,6 +758,10 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         uint16_t remote_wnd = _remote_rq_window_size.load(butil::memory_order_relaxed);
         uint16_t sq_wnd = _sq_window_size.load(butil::memory_order_relaxed);
         if (remote_wnd == 0 || sq_wnd == 0) {
+            // T4: window blocked
+            if (trace_on) {
+                _trace.send_eagain_count++;
+            }
             if (total_len > 0) {
                 break;
             }
@@ -807,7 +822,18 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // connection.
         _remote_rq_window_size.fetch_sub(1, butil::memory_order_relaxed);
         _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+        // T2: trace per-WR post time
+        const int64_t post_t0 = trace_on ? butil::monotonic_time_us() : 0;
         int rc = urma_post_jetty_send_wr(_resource->jetty, &wr, &bad_wr);
+        if (trace_on) {
+            const int64_t post_dt = butil::monotonic_time_us() - post_t0;
+            _trace.send_post_time_us += post_dt;
+            if (_trace.send_first_post_us == 0) {
+                _trace.send_first_post_us = post_t0;
+            }
+            _trace.send_wr_count++;
+            _trace.send_total_bytes += this_len;
+        }
         if (rc != URMA_SUCCESS) {
             const int provider_errno = errno;
             _remote_rq_window_size.fetch_add(1, butil::memory_order_relaxed);
@@ -843,6 +869,19 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
                   << " max_sge_len=" << max_sge_len
                   << " ndata=" << ndata
                   << " current=" << current
+                  << " on " << _socket->description();
+    }
+    // T3: trace send complete summary
+    if (trace_on && total_len > 0) {
+        const int64_t now_us = butil::monotonic_time_us();
+        const int64_t total_us = now_us - _trace.send_start_us;
+        LOG(INFO) << "[URMA-TRACE] send: wrs=" << _trace.send_wr_count
+                  << " bytes=" << _trace.send_total_bytes
+                  << " eagain=" << _trace.send_eagain_count
+                  << " post_time=" << _trace.send_post_time_us << "us"
+                  << " total=" << total_us << "us"
+                  << " sq_wnd=" << _sq_window_size.load(butil::memory_order_relaxed)
+                  << " remote_rq_wnd=" << _remote_rq_window_size.load(butil::memory_order_relaxed)
                   << " on " << _socket->description();
     }
     return total_len;
@@ -1109,6 +1148,10 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     }
     if (cr.flag.bs.s_r == 0) {
         // Send completion: reclaim SQ window and wake the writer.
+        // T6: trace TX completion
+        if (FLAGS_urma_trace_latency) {
+            _trace.recv_tx_complete++;
+        }
         if (cr.user_ctx == 0) {
             // Pure-ack WR: just replenish the imm budget.
             if (_sq_imm_window_size >= RESERVED_WR_NUM) {
@@ -1216,11 +1259,27 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     } else {
         _socket->_read_buf.append(_rbuf_data[_rq_received], cr.completion_len);
     }
+    // T7: trace RX completion
+    if (FLAGS_urma_trace_latency) {
+        if (_trace.recv_first_rx_us == 0) {
+            _trace.recv_first_rx_us = butil::monotonic_time_us();
+        }
+        _trace.recv_wr_count++;
+        _trace.recv_total_bytes += cr.completion_len;
+    }
+    // T8: trace PostRecv
     if (PostRecv(1, zerocopy) < 0) {
         return -1;
     }
+    if (FLAGS_urma_trace_latency) {
+        _trace.recv_postrecv_count++;
+    }
+    // T9: trace SendAck
     if (cr.completion_len > 0) {
         SendAck(1);
+    }
+    if (FLAGS_urma_trace_latency && cr.completion_len > 0) {
+        _trace.recv_sendack_count++;
     }
     return static_cast<ssize_t>(cr.completion_len);
 }
@@ -1259,6 +1318,28 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
 
     const int64_t received_us = butil::cpuwide_time_us();
     const int64_t base_realtime = butil::gettimeofday_us() - received_us;
+    // T10: trace recv complete summary
+    if (FLAGS_urma_trace_latency && _trace.recv_total_bytes > 0) {
+        const int64_t now_us = butil::monotonic_time_us();
+        const int64_t recv_total_us = now_us - _trace.recv_first_rx_us;
+        LOG(INFO) << "[URMA-TRACE] recv: rx_wrs=" << _trace.recv_wr_count
+                  << " bytes=" << _trace.recv_total_bytes
+                  << " tx_completions=" << _trace.recv_tx_complete
+                  << " polls=" << _trace.recv_poll_count
+                  << " postrecv=" << _trace.recv_postrecv_count
+                  << " sendack=" << _trace.recv_sendack_count
+                  << " recv_time=" << recv_total_us << "us"
+                  << " pending=" << pending
+                  << " on " << _socket->description();
+        // Reset recv trace for next batch
+        _trace.recv_first_rx_us = 0;
+        _trace.recv_wr_count = 0;
+        _trace.recv_total_bytes = 0;
+        _trace.recv_postrecv_count = 0;
+        _trace.recv_sendack_count = 0;
+        _trace.recv_poll_count = 0;
+        _trace.recv_tx_complete = 0;
+    }
     InputMessageClosure last_msg;
     messenger->ProcessNewMessage(s.get(), static_cast<ssize_t>(pending),
                                  false, received_us, base_realtime, last_msg);
@@ -1304,6 +1385,10 @@ void UrmaEndpoint::PollCq(Socket* m) {
                 const int n =
                     std::max(1, std::min<int>(FLAGS_urma_cqe_poll_once, 32));
                 urma_cr_t crs[32];
+                // T5: trace poll count
+                if (FLAGS_urma_trace_latency) {
+                    ep->_trace.recv_poll_count++;
+                }
                 const int cnt =
                     urma_poll_jfc(ep->_resource->jfc, n, crs);
                 if (cnt < 0) {
