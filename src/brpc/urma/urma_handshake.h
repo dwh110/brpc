@@ -48,6 +48,31 @@ struct ParsedHello {
     uint64_t seg_va = 0;            // segment virtual address
     uint64_t seg_len = 0;          // segment length in bytes
     uint32_t seg_token_id = 0;      // segment token id
+
+    // ---- One-sided operation parameters (v3 extension) ----
+    // All default to 0 / empty: a v2 peer or a v3 peer that doesn't support
+    // one-sided operations will leave these unset, and the local endpoint
+    // falls back to SEND_ONLY (io_mode=0).
+    uint32_t io_mode = 0;               // 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID
+
+    // Peer's send_buf (peer writes FROM here).
+    uint64_t send_buf_va = 0;
+    uint32_t send_buf_size = 0;
+    uint32_t send_buf_token_id = 0;
+    uint8_t send_buf_seg_eid[16] = {0};
+    uint32_t send_buf_seg_uasid = 0;
+
+    // Peer's recv_buf (peer writes INTO here; we WRITE_IMM to this).
+    uint64_t recv_buf_va = 0;
+    uint32_t recv_buf_size = 0;
+    uint32_t recv_buf_token_id = 0;
+    uint8_t recv_buf_seg_eid[16] = {0};
+    uint32_t recv_buf_seg_uasid = 0;
+
+    // True if the peer actually sent one-sided parameters (v3 with io_mode
+    // field present and non-zero). Used to decide whether to enable the
+    // one-sided path.
+    bool has_one_sided = false;
 };
 
 // Validate all values that influence resource import and queue/window sizing.

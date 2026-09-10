@@ -124,6 +124,27 @@ DEFINE_bool(urma_trace_latency, false,
             "times for each CutFromIOBufList and completion batch. "
             "Use with queue_depth=1 for clean per-request traces.");
 
+DEFINE_int32(urma_io_mode, 0,
+             "IO mode for URMA transport: "
+             "0=SEND_ONLY (two-sided SEND/RECV, default), "
+             "1=WRITE_ONLY (all sizes use WRITE_IN_BAND one-sided), "
+             "2=HYBRID (small IO <= urma_inline_threshold uses WRITE_IN_BAND, "
+             "large IO uses PRE_WRITE + READ). Only effective with v3 "
+             "handshake peers; v2 peers fall back to SEND_ONLY.");
+DEFINE_int32(urma_inline_threshold, 2048,
+             "Maximum payload size in bytes for WRITE_IN_BAND (small IO path). "
+             "Messages at or below this threshold are written directly into "
+             "the peer's recv_buf via WRITE_IMM. Only used when "
+             "--urma_io_mode=2.");
+DEFINE_int32(urma_send_buf_size, 128,
+             "Size in KB of the per-connection send_buf for one-sided "
+             "operations. Must be a multiple of 1KB. Used as the source "
+             "buffer for WRITE_IMM and for control messages in PRE_WRITE.");
+DEFINE_int32(urma_recv_buf_size, 128,
+             "Size in KB of the per-connection recv_buf for one-sided "
+             "operations. Must be a multiple of 1KB. Used as the "
+             "destination buffer for incoming WRITE_IMM data.");
+
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
 // true, GlobalUrmaInitializeOrDie() returns without touching liburma and the

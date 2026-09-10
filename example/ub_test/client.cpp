@@ -38,6 +38,7 @@
 #include "brpc/channel.h"
 #include "brpc/socket_mode.h"
 #include "brpc/retry_policy.h"
+#include "brpc/urma/urma_helper.h"
 #include "bthread/bthread.h"
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
@@ -99,6 +100,10 @@ DEFINE_string(export_percentile_file, "", "Export percentile samples to a binary
 DEFINE_int32(latency_window_seconds, 10, "Percentile window in seconds for latency recorder");
 DEFINE_bool(warmup, false, "Enable warmup connections before benchmark test to eliminate cold-start effects");
 DEFINE_int32(warmup_connections, 100, "Number of connections to warm up (0 means same as thread_num or link_num)");
+
+#if BRPC_WITH_URMA
+namespace brpc { namespace urma { DECLARE_int32(urma_io_mode); } }
+#endif
 
 // 解析有效连接数：link_num 优先，未设置（默认 -1）时回退到 thread_num
 inline int GetConnectionCount() {
@@ -803,6 +808,9 @@ void Test(int thread_num, int attachment_size) {
         << ", Attachment: " << attachment_size << "B"
         << ", string sizes: [" << (FLAGS_req_size.empty() ? "0" : FLAGS_req_size) << "]B"
         << ", URMA: " << (FLAGS_use_urma ? "yes" : "no")
+#if BRPC_WITH_URMA
+        << ", URMA_IO_MODE: " << ::brpc::urma::FLAGS_urma_io_mode
+#endif
         << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
         << ", Echo: " << (FLAGS_echo_attachment ? "yes" : "no")
         << ", Batch: " << (FLAGS_batch_size > 0 ? std::to_string(FLAGS_batch_size) : "unlimited")

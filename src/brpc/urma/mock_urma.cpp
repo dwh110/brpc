@@ -543,6 +543,102 @@ urma_status_t urma_post_jetty_send_wr(urma_jetty_t *jetty, urma_jfs_wr_t *wr,
             return URMA_EINVAL;
         }
 
+        // ---- One-sided operations (WRITE_IMM / READ) ----
+        if (current->opcode == URMA_OPC_WRITE_IMM ||
+            current->opcode == URMA_OPC_WRITE) {
+            // Send completion for the local side.
+            urma_cr_t send_cr{};
+            send_cr.status = URMA_CR_SUCCESS;
+            send_cr.user_ctx = current->user_ctx;
+            send_cr.flag.bs.s_r = 0;
+            if (current->flag.bs.complete_enable) {
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
+                               local_state, send_cr);
+            }
+
+            // WRITE_IMM: copy data from src to dst, consume a recv WR,
+            // and push a WRITE_WITH_IMM recv completion to the remote JFC.
+            uint32_t copied = 0;
+            for (uint32_t i = 0; i < current->rw.src.num_sge; ++i) {
+                const urma_sge_t& sge = current->rw.src.sge[i];
+                for (uint32_t j = 0; j < current->rw.dst.num_sge; ++j) {
+                    const urma_sge_t& dsg = current->rw.dst.sge[j];
+                    uint32_t n = std::min(sge.len - 0, dsg.len - 0);
+                    std::memcpy(reinterpret_cast<void*>(dsg.addr),
+                                reinterpret_cast<const void*>(sge.addr + copied),
+                                n);
+                    copied += n;
+                }
+            }
+
+            // Consume a recv WR from the remote JFR and push a recv CR.
+            PendingRecv recv{};
+            urma_jfc_t* remote_jfc = nullptr;
+            JfcState* remote_state = nullptr;
+            {
+                std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
+                auto remote_it = jetty_id_map.find(current->tjetty->id.id);
+                if (remote_it == jetty_id_map.end()) {
+                    continue;
+                }
+                urma_jfr_t* remote_jfr =
+                    remote_it->second->jetty_cfg.shared.jfr;
+                auto recv_it = jfr_recv_map.find(remote_jfr);
+                auto jfc_it = jfr_jfc_map.find(remote_jfr);
+                if (recv_it == jfr_recv_map.end() || recv_it->second.empty() ||
+                    jfc_it == jfr_jfc_map.end()) {
+                    continue;
+                }
+                recv = recv_it->second.front();
+                recv_it->second.pop_front();
+                remote_jfc = jfc_it->second;
+                auto state_it = jfc_state_map.find(remote_jfc);
+                if (state_it != jfc_state_map.end()) {
+                    remote_state = state_it->second;
+                }
+            }
+            if (remote_state) {
+                urma_cr_t recv_cr{};
+                recv_cr.status = URMA_CR_SUCCESS;
+                recv_cr.user_ctx = recv.user_ctx;
+                recv_cr.flag.bs.s_r = 1;
+                recv_cr.completion_len = copied;
+                recv_cr.opcode = (current->opcode == URMA_OPC_WRITE_IMM)
+                    ? URMA_CR_OPC_WRITE_WITH_IMM
+                    : URMA_CR_OPC_SEND;  // WRITE without IMM: no recv CR normally
+                recv_cr.imm_data = current->rw.notify_data;
+                if (current->opcode == URMA_OPC_WRITE_IMM) {
+                    PushCompletion(remote_jfc, remote_state, recv_cr);
+                }
+            }
+            continue;
+        }
+
+        if (current->opcode == URMA_OPC_READ) {
+            // READ: copy data from remote src to local dst.
+            // Only a send completion is generated (no recv CR).
+            for (uint32_t i = 0; i < current->rw.src.num_sge; ++i) {
+                const urma_sge_t& ssg = current->rw.src.sge[i];
+                if (i < current->rw.dst.num_sge) {
+                    const urma_sge_t& dsg = current->rw.dst.sge[i];
+                    uint32_t n = std::min(ssg.len, dsg.len);
+                    std::memcpy(reinterpret_cast<void*>(dsg.addr),
+                                reinterpret_cast<const void*>(ssg.addr), n);
+                }
+            }
+            // Send completion for the local side.
+            urma_cr_t send_cr{};
+            send_cr.status = URMA_CR_SUCCESS;
+            send_cr.user_ctx = current->user_ctx;
+            send_cr.flag.bs.s_r = 0;
+            if (current->flag.bs.complete_enable) {
+                PushCompletion(jetty->jetty_cfg.jfs_cfg.jfc,
+                               local_state, send_cr);
+            }
+            continue;
+        }
+
+        // ---- Two-sided operations (SEND / SEND_IMM) — existing path ----
         urma_cr_t send_cr{};
         send_cr.status = URMA_CR_SUCCESS;
         send_cr.user_ctx = current->user_ctx;

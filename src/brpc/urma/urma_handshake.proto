@@ -44,4 +44,27 @@ message UrmaHello {
     required uint64 seg_va = 9;          // segment virtual address
     required uint64 seg_len = 10;        // segment length in bytes
     required uint32 seg_token_id = 11;   // segment token id
+
+    // ---- One-sided operation parameters (v3 extension) ----
+    // All fields below are optional for backward compatibility. A v2 peer
+    // never sends them; a v3 peer that omits them defaults to io_mode=0
+    // (SEND_ONLY). When both peers advertise io_mode != 0, the negotiated
+    // mode is min(local, remote).
+
+    // Sender's send_buf: pre-registered memory for WRITE_IMM source.
+    optional uint64 send_buf_va = 12;        // virtual address of send_buf
+    optional uint32 send_buf_size = 13;      // send_buf size in bytes
+    optional uint32 send_buf_token_id = 14;  // send_buf segment token id
+    optional bytes send_buf_seg_eid = 15;    // 16-byte EID owning send_buf seg
+    optional uint32 send_buf_seg_uasid = 16; // uasid owning send_buf seg
+
+    // Receiver's recv_buf: pre-registered memory for WRITE_IMM destination.
+    optional uint64 recv_buf_va = 17;        // virtual address of recv_buf
+    optional uint32 recv_buf_size = 18;      // recv_buf size in bytes
+    optional uint32 recv_buf_token_id = 19;  // recv_buf segment token id
+    optional bytes recv_buf_seg_eid = 20;    // 16-byte EID owning recv_buf seg
+    optional uint32 recv_buf_seg_uasid = 21; // uasid owning recv_buf seg
+
+    // One-sided IO mode: 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID.
+    optional uint32 io_mode = 22;
 }

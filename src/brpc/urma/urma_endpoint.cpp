@@ -20,6 +20,7 @@
 #if BRPC_WITH_URMA
 
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -68,6 +70,10 @@ DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
 DECLARE_bool(urma_poller_yield);
 DECLARE_bool(urma_trace_latency);
+DECLARE_int32(urma_io_mode);
+DECLARE_int32(urma_inline_threshold);
+DECLARE_int32(urma_send_buf_size);
+DECLARE_int32(urma_recv_buf_size);
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -126,6 +132,9 @@ UrmaResource::~UrmaResource() {
     if (remote_seg) {
         urma_unimport_seg(remote_seg);
     }
+    if (remote_recv_buf_seg) {
+        urma_unimport_seg(remote_recv_buf_seg);
+    }
     if (jetty) {
         urma_delete_jetty(jetty);
     }
@@ -152,6 +161,8 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
     _sq_size = static_cast<uint16_t>(
         std::max(16, std::min(4096, static_cast<int>(FLAGS_urma_sq_size))));
     _rq_size = GetUrmaEffectiveRqSize();
+    _io_mode = static_cast<uint8_t>(
+        std::max(0, std::min(2, static_cast<int>(FLAGS_urma_io_mode))));
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
 }
@@ -166,6 +177,7 @@ UrmaEndpoint::~UrmaEndpoint() {
 
 void UrmaEndpoint::Reset() {
     DeallocateResources();
+    DeallocateOneSidedBuffers();
     _state = UNINIT;
     _handshake_version = 0;
     _remote_recv_block_size = 0;
@@ -182,6 +194,24 @@ void UrmaEndpoint::Reset() {
     _rbuf.clear();
     _rbuf_data.clear();
     _read_butex->store(0, butil::memory_order_relaxed);
+    _io_mode = static_cast<uint8_t>(
+        std::max(0, std::min(2, static_cast<int>(FLAGS_urma_io_mode))));
+    _remote_recv_buf_va = 0;
+    _remote_recv_buf_size = 0;
+    _remote_send_buf_va = 0;
+    _remote_send_buf_size = 0;
+    _one_sided_seq.store(1, butil::memory_order_relaxed);
+    _rx_consume_seq.store(0, butil::memory_order_relaxed);
+    for (uint32_t i = 0; i < URMA_RX_RING_SIZE; ++i) {
+        _rx_slots[i].Reset();
+    }
+    {
+        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+        for (auto& pair : _pending_sends) {
+            delete pair.second;
+        }
+        _pending_sends.clear();
+    }
 }
 
 // ============================================================================
@@ -286,6 +316,27 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
                   << " seg_len=" << out->seg_len
                   << " on " << _socket->description();
     }
+    // One-sided: fill send_buf / recv_buf info if we have allocated them.
+    if (_io_mode != 0 && _send_buf_tseg) {
+        out->io_mode = _io_mode;
+        out->has_one_sided = true;
+        const char* base = static_cast<const char*>(_one_sided_buf);
+        // recv_buf is at the base of the registered segment.
+        out->recv_buf_va = reinterpret_cast<uint64_t>(base);
+        out->recv_buf_size = _recv_buf_capacity;
+        out->recv_buf_token_id = _send_buf_tseg->seg.token_id;
+        std::memcpy(out->recv_buf_seg_eid,
+                    _send_buf_tseg->seg.ubva.eid.raw, 16);
+        out->recv_buf_seg_uasid = _send_buf_tseg->seg.ubva.uasid;
+        // send_buf is at base + recv_buf_size.
+        out->send_buf_va = reinterpret_cast<uint64_t>(
+            base + _recv_buf_capacity);
+        out->send_buf_size = _send_buf_capacity;
+        out->send_buf_token_id = _send_buf_tseg->seg.token_id;
+        std::memcpy(out->send_buf_seg_eid,
+                    _send_buf_tseg->seg.ubva.eid.raw, 16);
+        out->send_buf_seg_uasid = _send_buf_tseg->seg.ubva.uasid;
+    }
 }
 
 void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
@@ -322,6 +373,21 @@ void UrmaEndpoint::FillLocalHelloV3(UrmaHello* out) const {
     out->set_seg_va(p.seg_va);
     out->set_seg_len(p.seg_len);
     out->set_seg_token_id(p.seg_token_id);
+    // One-sided parameters: only advertise if io_mode != 0 and we have
+    // allocated the send/recv buffers.
+    if (p.has_one_sided && _send_buf_tseg) {
+        out->set_send_buf_va(p.send_buf_va);
+        out->set_send_buf_size(p.send_buf_size);
+        out->set_send_buf_token_id(p.send_buf_token_id);
+        out->set_send_buf_seg_eid(p.send_buf_seg_eid, 16);
+        out->set_send_buf_seg_uasid(p.send_buf_seg_uasid);
+        out->set_recv_buf_va(p.recv_buf_va);
+        out->set_recv_buf_size(p.recv_buf_size);
+        out->set_recv_buf_token_id(p.recv_buf_token_id);
+        out->set_recv_buf_seg_eid(p.recv_buf_seg_eid, 16);
+        out->set_recv_buf_seg_uasid(p.recv_buf_seg_uasid);
+        out->set_io_mode(p.io_mode);
+    }
 }
 
 int UrmaEndpoint::WriteHelloV3(const UrmaHello& msg) {
@@ -389,6 +455,29 @@ int UrmaEndpoint::ReadAndParseHelloV3(ParsedHello* out, bool* negotiated) {
     out->seg_va = msg.seg_va();
     out->seg_len = msg.seg_len();
     out->seg_token_id = msg.seg_token_id();
+    // One-sided parameters (v3 extension): all optional.
+    if (msg.has_io_mode()) {
+        out->io_mode = msg.io_mode();
+        out->has_one_sided = (out->io_mode != 0);
+        if (out->has_one_sided) {
+            if (msg.send_buf_seg_eid().size() == 16) {
+                out->send_buf_va = msg.send_buf_va();
+                out->send_buf_size = msg.send_buf_size();
+                out->send_buf_token_id = msg.send_buf_token_id();
+                std::memcpy(out->send_buf_seg_eid,
+                            msg.send_buf_seg_eid().data(), 16);
+                out->send_buf_seg_uasid = msg.send_buf_seg_uasid();
+            }
+            if (msg.recv_buf_seg_eid().size() == 16) {
+                out->recv_buf_va = msg.recv_buf_va();
+                out->recv_buf_size = msg.recv_buf_size();
+                out->recv_buf_token_id = msg.recv_buf_token_id();
+                std::memcpy(out->recv_buf_seg_eid,
+                            msg.recv_buf_seg_eid().data(), 16);
+                out->recv_buf_seg_uasid = msg.recv_buf_seg_uasid();
+            }
+        }
+    }
     if (!ValidHello(*out)) {
         return 0;
     }
@@ -516,6 +605,15 @@ int UrmaEndpoint::AllocateResources() {
         }
         PollerAddCqSid();
     }
+    // Allocate one-sided buffers if io_mode is enabled.
+    if (_io_mode != 0) {
+        if (AllocateOneSidedBuffers() != 0) {
+            LOG(WARNING) << "Failed to allocate one-sided buffers; "
+                         << "falling back to SEND_ONLY on "
+                         << _socket->description();
+            _io_mode = 0;
+        }
+    }
     return 0;
 }
 
@@ -547,6 +645,141 @@ void UrmaEndpoint::DeallocateResources() {
     // one-shot: they accelerate connection setup but are destroyed on close.
     delete _resource;
     _resource = nullptr;
+}
+
+// ============================================================================
+// One-sided buffer allocation and deallocation.
+// ============================================================================
+
+int UrmaEndpoint::AllocateOneSidedBuffers() {
+    if (_one_sided_buf) {
+        return 0;  // already allocated
+    }
+    _recv_buf_capacity = static_cast<uint32_t>(
+        std::max(1, FLAGS_urma_recv_buf_size)) * 1024;
+    _send_buf_capacity = static_cast<uint32_t>(
+        std::max(1, FLAGS_urma_send_buf_size)) * 1024;
+    // Round to allocation unit.
+    _recv_buf_capacity = (_recv_buf_capacity + URMA_ONE_SIDED_ALLOC_UNIT - 1) /
+                         URMA_ONE_SIDED_ALLOC_UNIT * URMA_ONE_SIDED_ALLOC_UNIT;
+    _send_buf_capacity = (_send_buf_capacity + URMA_ONE_SIDED_ALLOC_UNIT - 1) /
+                         URMA_ONE_SIDED_ALLOC_UNIT * URMA_ONE_SIDED_ALLOC_UNIT;
+
+    const size_t total = _recv_buf_capacity + _send_buf_capacity;
+    _one_sided_buf = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (_one_sided_buf == MAP_FAILED) {
+        PLOG(ERROR) << "Fail to mmap one-sided buffers";
+        _one_sided_buf = nullptr;
+        return -1;
+    }
+
+    // Register the entire region as a single URMA segment.
+    urma_context_t* ctx = GetUrmaContext();
+    if (!ctx) {
+        errno = ENODEV;
+        return -1;
+    }
+    urma_reg_seg_flag_t flag{};
+    flag.bs.token_policy = URMA_TOKEN_NONE;
+    flag.bs.cacheable = URMA_NON_CACHEABLE;
+    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    urma_seg_cfg_t cfg{};
+    cfg.va = reinterpret_cast<uint64_t>(_one_sided_buf);
+    cfg.len = total;
+    cfg.token_id = nullptr;
+    cfg.token_value = {};
+    cfg.flag = flag;
+    cfg.user_ctx = reinterpret_cast<uint64_t>(_one_sided_buf);
+    cfg.iova = 0;
+    _send_buf_tseg = urma_register_seg(ctx, &cfg);
+    if (!_send_buf_tseg) {
+        PLOG(ERROR) << "Fail to register one-sided segment";
+        munmap(_one_sided_buf, total);
+        _one_sided_buf = nullptr;
+        return -1;
+    }
+
+    // Initialize the send_buf allocator.
+    _send_buf_alloc = new UrmaRingBuf();
+    _send_buf_alloc->Init(_send_buf_capacity);
+
+    LOG(INFO) << "Allocated one-sided buffers: recv_buf=" << _recv_buf_capacity
+              << " send_buf=" << _send_buf_capacity
+              << " total=" << total
+              << " io_mode=" << static_cast<int>(_io_mode)
+              << " on " << _socket->description();
+    return 0;
+}
+
+void UrmaEndpoint::DeallocateOneSidedBuffers() {
+    if (_send_buf_alloc) {
+        delete _send_buf_alloc;
+        _send_buf_alloc = nullptr;
+    }
+    if (_send_buf_tseg) {
+        urma_unregister_seg(_send_buf_tseg);
+        _send_buf_tseg = nullptr;
+    }
+    if (_one_sided_buf) {
+        munmap(_one_sided_buf, _recv_buf_capacity + _send_buf_capacity);
+        _one_sided_buf = nullptr;
+    }
+    _send_buf_capacity = 0;
+    _recv_buf_capacity = 0;
+    // Clean up any leftover pending send contexts.
+    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+    for (auto& pair : _pending_sends) {
+        delete pair.second;
+    }
+    _pending_sends.clear();
+}
+
+// Post empty recv WRs: num_sge=1, len=0. These are consumed by incoming
+// WRITE_IMM operations (URMA protocol requires a recv WR to be posted
+// even for WRITE_IMM, and the completion arrives as WRITE_WITH_IMM).
+int UrmaEndpoint::PostEmptyRecvWr(uint32_t count) {
+    if (!_resource || !_resource->jfr) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        urma_jfr_wr_t wr{};
+        std::memset(&wr, 0, sizeof(wr));
+        urma_sge_t sge{};
+        // Point at the recv_buf (valid registered memory, but len=0).
+        if (_one_sided_buf) {
+            sge.addr = reinterpret_cast<uint64_t>(_one_sided_buf);
+            sge.len = 0;
+            sge.tseg = _send_buf_tseg;
+        } else {
+            // Fallback: use pool seg.
+            sge.addr = reinterpret_cast<uint64_t>(GetPoolSegFor(nullptr));
+            sge.len = 0;
+            sge.tseg = GetPoolSegFor(nullptr);
+        }
+        sge.user_tseg = nullptr;
+        wr.src.sge = &sge;
+        wr.src.num_sge = 1;
+        wr.user_ctx = 0;
+        urma_jfr_wr_t* bad = nullptr;
+        if (urma_post_jfr_wr(_resource->jfr, &wr, &bad) != URMA_SUCCESS) {
+            PLOG(WARNING) << "PostEmptyRecvWr failed";
+            return -1;
+        }
+    }
+    return 0;
+}
+
+UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t request_id) {
+    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+    auto it = _pending_sends.find(request_id);
+    if (it == _pending_sends.end()) {
+        return nullptr;
+    }
+    UrmaSendContext* ctx = it->second;
+    _pending_sends.erase(it);
+    return ctx;
 }
 
 // ============================================================================
@@ -725,6 +958,31 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         errno = ENOTCONN;
         return -1;
     }
+    // Dispatch based on IO mode.
+    if (_io_mode == 0) {
+        return CutFromIOBufList_Send(from, ndata);
+    }
+    // Calculate total payload size to decide small vs large path.
+    size_t total = 0;
+    for (size_t i = 0; i < ndata; ++i) {
+        total += from[i]->size();
+    }
+    if (_io_mode == 1) {
+        // WRITE_ONLY: all sizes use WriteInline.
+        return WriteInline(from, ndata);
+    }
+    // HYBRID: small IO uses WriteInline, large IO uses WriteZeroCopy.
+    if (total <= static_cast<size_t>(FLAGS_urma_inline_threshold)) {
+        return WriteInline(from, ndata);
+    }
+    return WriteZeroCopy(from, ndata);
+}
+
+ssize_t UrmaEndpoint::CutFromIOBufList_Send(butil::IOBuf** from, size_t ndata) {
+    if (!_resource || !_resource->jetty || !_resource->remote_jetty) {
+        errno = ENOTCONN;
+        return -1;
+    }
     // T1: trace send start
     const bool trace_on = FLAGS_urma_trace_latency;
     if (trace_on) {
@@ -888,8 +1146,355 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
 }
 
 bool UrmaEndpoint::IsWritable() const {
-    return _remote_rq_window_size.load(butil::memory_order_relaxed) > 0 &&
-           _sq_window_size.load(butil::memory_order_relaxed) > 0;
+    if (_io_mode == 0) {
+        return _remote_rq_window_size.load(butil::memory_order_relaxed) > 0 &&
+               _sq_window_size.load(butil::memory_order_relaxed) > 0;
+    }
+    // One-sided: writable if send_buf has at least one allocation unit free.
+    return _send_buf_alloc &&
+           _send_buf_alloc->Available() >= URMA_ONE_SIDED_ALLOC_UNIT;
+}
+
+// ============================================================================
+// One-sided send paths.
+// ============================================================================
+
+// Small IO path: WRITE_IN_BAND.
+// Copy IOBuf data into send_buf, then WRITE_IMM into peer's recv_buf.
+ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
+    if (!_resource || !_resource->jetty || !_resource->remote_jetty ||
+        !_send_buf_alloc || !_send_buf_tseg || !_one_sided_buf) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    // Calculate total payload size.
+    size_t total_payload = 0;
+    for (size_t i = 0; i < ndata; ++i) {
+        total_payload += from[i]->size();
+    }
+    if (total_payload == 0) {
+        return 0;
+    }
+
+    // Allocate send_buf space: UrmaMessageHead + payload.
+    const uint32_t alloc_size = static_cast<uint32_t>(
+        sizeof(UrmaMessageHead) + total_payload);
+    uint32_t offset = 0;
+    if (!_send_buf_alloc->Allocate(alloc_size, &offset)) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    // The send_buf starts at _one_sided_buf + _recv_buf_capacity.
+    char* send_buf = static_cast<char*>(_one_sided_buf) + _recv_buf_capacity;
+    char* dst = send_buf + offset;
+
+    // Fill UrmaMessageHead.
+    UrmaMessageHead* head = reinterpret_cast<UrmaMessageHead*>(dst);
+    head->magic = URMA_CTRL_MAGIC;
+    head->message_size = alloc_size;
+    head->data_count = static_cast<uint32_t>(total_payload);
+    head->flags = 0;
+    const uint64_t request_id = _one_sided_seq.fetch_add(1,
+                                butil::memory_order_relaxed);
+    head->request_id = request_id;
+
+    // Copy IOBuf data after the head.
+    size_t copied = 0;
+    for (size_t i = 0; i < ndata; ++i) {
+        if (from[i]->empty()) {
+            continue;
+        }
+        from[i]->copy_to(dst + sizeof(UrmaMessageHead) + copied,
+                         from[i]->size());
+        copied += from[i]->size();
+    }
+
+    // Build WRITE_IMM WR: src=local send_buf, dst=peer recv_buf (mirrored offset).
+    urma_sge_t src_sge{};
+    src_sge.addr = reinterpret_cast<uint64_t>(dst);
+    src_sge.len = alloc_size;
+    src_sge.tseg = _send_buf_tseg;
+    src_sge.user_tseg = nullptr;
+
+    urma_sge_t dst_sge{};
+    dst_sge.addr = _remote_recv_buf_va + offset;
+    dst_sge.len = alloc_size;
+    dst_sge.tseg = _resource->remote_recv_buf_seg;
+    dst_sge.user_tseg = nullptr;
+
+    urma_jfs_wr_t wr{};
+    std::memset(&wr, 0, sizeof(wr));
+    wr.opcode = URMA_OPC_WRITE_IMM;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = _resource->remote_jetty;
+    wr.rw.src.sge = &src_sge;
+    wr.rw.src.num_sge = 1;
+    wr.rw.dst.sge = &dst_sge;
+    wr.rw.dst.num_sge = 1;
+
+    // Encode imm_data: opcode + buffer_offset.
+    UrmaWriteImmData imm{};
+    imm.io.opcode = URMA_IO_WRITE_IN_BAND;
+    imm.io.buffer_offset = static_cast<uint16_t>(offset / URMA_ONE_SIDED_ALLOC_UNIT);
+    wr.rw.notify_data = imm.data;
+
+    // Encode user_ctx for completion identification.
+    wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, request_id);
+
+    // Register the send context.
+    auto* ctx = new UrmaSendContext();
+    ctx->request_id = request_id;
+    ctx->send_buf_offset = offset;
+    ctx->send_buf_size = alloc_size;
+    ctx->opcode = URMA_IO_WRITE_IN_BAND;
+    {
+        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+        _pending_sends[request_id] = ctx;
+    }
+
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        const int provider_errno = errno;
+        LOG(WARNING) << "WriteInline: urma_post_jetty_send_wr failed: "
+                     << status << " provider_errno=" << provider_errno
+                     << " on " << _socket->description();
+        _send_buf_alloc->Release(offset, alloc_size);
+        FindAndRemoveSendContext(request_id);
+        delete ctx;
+        errno = status;
+        return -1;
+    }
+
+    // Consume the IOBuf data (it's been copied to send_buf).
+    for (size_t i = 0; i < ndata; ++i) {
+        from[i]->clear();
+    }
+    return static_cast<ssize_t>(total_payload);
+}
+
+// Large IO path: PRE_WRITE + READ.
+// Build a control message listing IOBuf block addresses, send via WRITE_IMM.
+// The receiver will READ the data from our pool buffers.
+ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
+    if (!_resource || !_resource->jetty || !_resource->remote_jetty ||
+        !_send_buf_alloc || !_send_buf_tseg || !_one_sided_buf) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    // Collect IOBuf blocks: {addr, size, tseg} for each block.
+    struct BlockInfo {
+        uint64_t addr;
+        uint32_t size;
+        urma_target_seg_t* tseg;
+    };
+    std::vector<BlockInfo> blocks;
+    size_t total_payload = 0;
+    const uint32_t max_sge_len = GetUrmaMaxSgeLen();
+    for (size_t i = 0; i < ndata; ++i) {
+        butil::IOBuf* buf = from[i];
+        const size_t num_blocks = buf->backing_block_num();
+        for (size_t j = 0; j < num_blocks; ++j) {
+            butil::StringPiece sp = buf->backing_block(j);
+            if (sp.empty()) {
+                continue;
+            }
+            const void* start = sp.data();
+            urma_target_seg_t* tseg =
+                GetPoolSegFor(const_cast<void*>(start));
+            if (!tseg) {
+                // User-registered memory: look up the seg handle.
+                uint64_t meta = buf->get_first_data_meta();
+                if (meta != 0) {
+                    tseg = reinterpret_cast<urma_target_seg_t*>(
+                        static_cast<uintptr_t>(meta));
+                }
+            }
+            if (!tseg) {
+                errno = ERDMAMEM;
+                return -1;
+            }
+            // Split blocks larger than max_sge_len.
+            uint32_t remaining = static_cast<uint32_t>(sp.size());
+            uint64_t addr = reinterpret_cast<uint64_t>(start);
+            while (remaining > 0) {
+                uint32_t chunk = remaining;
+                if (max_sge_len > 0 && chunk > max_sge_len) {
+                    chunk = max_sge_len;
+                }
+                blocks.push_back({addr, chunk, tseg});
+                total_payload += chunk;
+                addr += chunk;
+                remaining -= chunk;
+            }
+        }
+    }
+    if (blocks.empty()) {
+        return 0;
+    }
+
+    // Build control message: UrmaMessageHead + PageBufferInMessage[blocks.size()].
+    const uint32_t ctrl_msg_size = static_cast<uint32_t>(
+        sizeof(UrmaMessageHead) +
+        blocks.size() * sizeof(PageBufferInMessage));
+    uint32_t offset = 0;
+    if (!_send_buf_alloc->Allocate(ctrl_msg_size, &offset)) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    char* send_buf = static_cast<char*>(_one_sided_buf) + _recv_buf_capacity;
+    char* dst = send_buf + offset;
+
+    UrmaMessageHead* head = reinterpret_cast<UrmaMessageHead*>(dst);
+    head->magic = URMA_CTRL_MAGIC;
+    head->message_size = ctrl_msg_size;
+    head->data_count = static_cast<uint32_t>(blocks.size());
+    head->flags = 0;
+    const uint64_t request_id = _one_sided_seq.fetch_add(1,
+                                butil::memory_order_relaxed);
+    head->request_id = request_id;
+
+    auto* entries = reinterpret_cast<PageBufferInMessage*>(
+        dst + sizeof(UrmaMessageHead));
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        entries[i].addr = blocks[i].addr;
+        entries[i].size = blocks[i].size;
+        entries[i].seg_token_id = 0;  // pool seg already imported by peer
+    }
+
+    // Build WRITE_IMM WR for the control message.
+    urma_sge_t src_sge{};
+    src_sge.addr = reinterpret_cast<uint64_t>(dst);
+    src_sge.len = ctrl_msg_size;
+    src_sge.tseg = _send_buf_tseg;
+    src_sge.user_tseg = nullptr;
+
+    urma_sge_t dst_sge{};
+    dst_sge.addr = _remote_recv_buf_va + offset;
+    dst_sge.len = ctrl_msg_size;
+    dst_sge.tseg = _resource->remote_recv_buf_seg;
+    dst_sge.user_tseg = nullptr;
+
+    urma_jfs_wr_t wr{};
+    std::memset(&wr, 0, sizeof(wr));
+    wr.opcode = URMA_OPC_WRITE_IMM;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = _resource->remote_jetty;
+    wr.rw.src.sge = &src_sge;
+    wr.rw.src.num_sge = 1;
+    wr.rw.dst.sge = &dst_sge;
+    wr.rw.dst.num_sge = 1;
+
+    UrmaWriteImmData imm{};
+    imm.io.opcode = URMA_IO_PRE_WRITE;
+    imm.io.buffer_offset = static_cast<uint16_t>(offset / URMA_ONE_SIDED_ALLOC_UNIT);
+    wr.rw.notify_data = imm.data;
+    wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, request_id);
+
+    // Register the send context and save IOBuf block references.
+    auto* ctx = new UrmaSendContext();
+    ctx->request_id = request_id;
+    ctx->send_buf_offset = offset;
+    ctx->send_buf_size = ctrl_msg_size;
+    ctx->opcode = URMA_IO_PRE_WRITE;
+    for (size_t i = 0; i < ndata; ++i) {
+        ctx->saved_blocks.append(*from[i]);
+    }
+    {
+        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+        _pending_sends[request_id] = ctx;
+    }
+
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        const int provider_errno = errno;
+        LOG(WARNING) << "WriteZeroCopy: urma_post_jetty_send_wr failed: "
+                     << status << " provider_errno=" << provider_errno
+                     << " on " << _socket->description();
+        _send_buf_alloc->Release(offset, ctrl_msg_size);
+        FindAndRemoveSendContext(request_id);
+        delete ctx;
+        errno = status;
+        return -1;
+    }
+
+    // Consume the IOBuf data (blocks are kept alive by saved_blocks).
+    for (size_t i = 0; i < ndata; ++i) {
+        from[i]->clear();
+    }
+    return static_cast<ssize_t>(total_payload);
+}
+
+// Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to the
+// peer's send_buf at the mirrored offset.
+int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
+                                       uint64_t request_id,
+                                       uint32_t message_size) {
+    if (!_resource || !_resource->jetty || !_resource->remote_jetty ||
+        !_send_buf_tseg || !_one_sided_buf) {
+        errno = ENOTCONN;
+        return -1;
+    }
+    // Write a small control message into our recv_buf (which mirrors the
+    // peer's send_buf offset). The peer reads the UrmaMessageHead from
+    // its send_buf at the same offset.
+    char* recv_buf = static_cast<char*>(_one_sided_buf);
+    const uint32_t offset = buffer_offset * URMA_ONE_SIDED_ALLOC_UNIT;
+    char* dst = recv_buf + offset;
+
+    // Write the UrmaMessageHead into our recv_buf. The peer will see this
+    // in its send_buf (mirrored region).
+    UrmaMessageHead* head = reinterpret_cast<UrmaMessageHead*>(dst);
+    head->magic = URMA_CTRL_MAGIC;
+    head->message_size = message_size;
+    head->data_count = 0;
+    head->flags = 0;
+    head->request_id = request_id;
+
+    // Build WRITE_IMM WR: src=local recv_buf, dst=peer send_buf (mirrored offset).
+    urma_sge_t src_sge{};
+    src_sge.addr = reinterpret_cast<uint64_t>(dst);
+    src_sge.len = static_cast<uint32_t>(sizeof(UrmaMessageHead));
+    src_sge.tseg = _send_buf_tseg;
+    src_sge.user_tseg = nullptr;
+
+    urma_sge_t dst_sge{};
+    dst_sge.addr = _remote_send_buf_va + offset;
+    dst_sge.len = static_cast<uint32_t>(sizeof(UrmaMessageHead));
+    dst_sge.tseg = _resource->remote_recv_buf_seg;  // same segment
+    dst_sge.user_tseg = nullptr;
+
+    urma_jfs_wr_t wr{};
+    std::memset(&wr, 0, sizeof(wr));
+    wr.opcode = URMA_OPC_WRITE_IMM;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = _resource->remote_jetty;
+    wr.rw.src.sge = &src_sge;
+    wr.rw.src.num_sge = 1;
+    wr.rw.dst.sge = &dst_sge;
+    wr.rw.dst.num_sge = 1;
+
+    UrmaWriteImmData imm{};
+    imm.io.opcode = opcode;
+    imm.io.buffer_offset = buffer_offset;
+    wr.rw.notify_data = imm.data;
+    wr.user_ctx = EncodeUserCtx(CTRL_DATA_RESPONSE, request_id);
+
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        PLOG(WARNING) << "ResponseCtrlMessage: post failed: " << status
+                      << " on " << _socket->description();
+        errno = status;
+        return -1;
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -1152,6 +1757,23 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         if (FLAGS_urma_trace_latency) {
             _trace.recv_tx_complete++;
         }
+        // One-sided send completion: check user_ctx encoding.
+        if (cr.user_ctx != 0) {
+            const OneSideSenderType type = DecodeUserCtxType(cr.user_ctx);
+            if (type == READ_DATA_REQUEST) {
+                return HandleReadCompletion(cr);
+            }
+            if (type == CTRL_DATA_REQUEST || type == CTRL_DATA_RESPONSE) {
+                // Send completion for our WRITE_IMM (data or control response).
+                // The send_buf slot is released when we receive the ACK
+                // (WRITE_IN_BAND_ACK or POST_WRITE), not here. For
+                // CTRL_DATA_RESPONSE, there's nothing to do — the response
+                // is fire-and-forget.
+                return 0;
+            }
+            // Fall through to existing SEND path for user_ctx != 0
+            // that is not one-sided encoded.
+        }
         if (cr.user_ctx == 0) {
             // Pure-ack WR: just replenish the imm budget.
             if (_sq_imm_window_size >= RESERVED_WR_NUM) {
@@ -1207,6 +1829,30 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         return 0;
     }
     // Recv completion.
+    // One-sided: WRITE_IMM completions arrive as URMA_CR_OPC_WRITE_WITH_IMM.
+    if (cr.opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
+        // Decode the immediate data to determine the one-sided opcode.
+        const UrmaWriteImmData imm{cr.imm_data};
+        const uint32_t offset = imm.io.buffer_offset *
+                                URMA_ONE_SIDED_ALLOC_UNIT;
+        if (imm.io.opcode == URMA_IO_WRITE_IN_BAND ||
+            imm.io.opcode == URMA_IO_PRE_WRITE) {
+            return HandleWriteImmCompletion(cr);
+        }
+        if (imm.io.opcode == URMA_IO_WRITE_IN_BAND_ACK) {
+            HandleWriteInBandAck(cr);
+            return 0;
+        }
+        if (imm.io.opcode == URMA_IO_POST_WRITE) {
+            HandlePostWrite(cr);
+            return 0;
+        }
+        LOG(WARNING) << "Unknown one-sided opcode: "
+                     << static_cast<int>(imm.io.opcode)
+                     << " on " << _socket->description();
+        errno = EPROTO;
+        return -1;
+    }
     if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
         if (cr.imm_data > _local_window_capacity) {
             LOG(WARNING) << "Invalid URMA receive credit: " << cr.imm_data;
@@ -1282,6 +1928,233 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         _trace.recv_sendack_count++;
     }
     return static_cast<ssize_t>(cr.completion_len);
+}
+
+// ============================================================================
+// One-sided completion handlers.
+// ============================================================================
+
+// Handle a WRITE_IMM receive completion (WRITE_IN_BAND or PRE_WRITE).
+// The imm_data encodes the opcode and buffer_offset. The data was written
+// into our recv_buf at the specified offset.
+ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
+    const UrmaWriteImmData imm{cr.imm_data};
+    const uint32_t offset = imm.io.buffer_offset * URMA_ONE_SIDED_ALLOC_UNIT;
+    char* recv_buf = static_cast<char*>(_one_sided_buf);
+    const UrmaMessageHead* head =
+        reinterpret_cast<const UrmaMessageHead*>(recv_buf + offset);
+
+    if (head->magic != URMA_CTRL_MAGIC) {
+        LOG(ERROR) << "HandleWriteImmCompletion: bad magic=0x" << std::hex
+                   << head->magic << std::dec
+                   << " offset=" << offset
+                   << " on " << _socket->description();
+        errno = EPROTO;
+        return -1;
+    }
+
+    if (imm.io.opcode == URMA_IO_WRITE_IN_BAND) {
+        // Small IO: data is inline in recv_buf after the head.
+        const uint32_t data_count = head->data_count;
+        const char* data = recv_buf + offset + sizeof(UrmaMessageHead);
+        _socket->_read_buf.append(data, data_count);
+
+        // Send WRITE_IN_BAND_ACK back to the peer's send_buf.
+        ResponseCtrlMessage(URMA_IO_WRITE_IN_BAND_ACK,
+                            imm.io.buffer_offset,
+                            head->request_id,
+                            head->message_size);
+
+        // Repost the empty recv WR that was consumed by this WRITE_IMM.
+        if (_io_mode != 0) {
+            PostEmptyRecvWr(1);
+        }
+        return static_cast<ssize_t>(data_count);
+    }
+
+    if (imm.io.opcode == URMA_IO_PRE_WRITE) {
+        // Large IO: control message with PageBufferInMessage entries.
+        // The receiver should issue READ WRs to pull data from the sender.
+        const uint32_t block_count = head->data_count;
+        const auto* entries = reinterpret_cast<const PageBufferInMessage*>(
+            recv_buf + offset + sizeof(UrmaMessageHead));
+
+        // Allocate an RX slot.
+        const uint64_t seq = _rx_consume_seq.fetch_add(
+            1, butil::memory_order_relaxed);
+        const uint32_t idx = static_cast<uint32_t>(
+            seq % URMA_RX_RING_SIZE);
+        UrmaRxSlot& slot = _rx_slots[idx];
+        slot.Reset();
+        slot.state.store(UrmaRxSlot::READING, butil::memory_order_relaxed);
+        slot.write_imm = imm.data;
+        slot.request_id = head->request_id;
+
+        // Build READ WR chain: src=remote block, dst=local pool buffer.
+        uint32_t total_bytes = 0;
+        const size_t recv_block_size = GetUrmaRecvBlockSize();
+        // We need to post READ WRs. Each READ pulls one block from the
+        // sender's pool into a local pool buffer.
+        urma_jfs_wr_t* wr_head = nullptr;
+        urma_jfs_wr_t* wr_tail = nullptr;
+        // Use alloca for WR and SGE arrays (freed on return).
+        urma_jfs_wr_t* wrs = static_cast<urma_jfs_wr_t*>(
+            alloca(sizeof(urma_jfs_wr_t) * block_count));
+        urma_sge_t* src_sges = static_cast<urma_sge_t*>(
+            alloca(sizeof(urma_sge_t) * block_count));
+        urma_sge_t* dst_sges = static_cast<urma_sge_t*>(
+            alloca(sizeof(urma_sge_t) * block_count));
+
+        for (uint32_t i = 0; i < block_count; ++i) {
+            // Allocate a local pool buffer as READ destination.
+            butil::IOBuf iobuf;
+            butil::IOBufAsZeroCopyOutputStream zcis(
+                &iobuf, entries[i].size + IOBUF_BLOCK_HEADER_LEN);
+            void* data = nullptr;
+            int size = 0;
+            if (!zcis.Next(&data, &size) || !data ||
+                size < static_cast<int>(entries[i].size)) {
+                LOG(ERROR) << "HandlePreWrite: failed to alloc READ target";
+                errno = ENOMEM;
+                return -1;
+            }
+            slot.local_bufs.push_back(data);
+            slot.read_targets.push_back({data, entries[i].size});
+            total_bytes += entries[i].size;
+
+            // Build READ WR: src=remote block (sender's pool), dst=local buffer.
+            src_sges[i].addr = entries[i].addr;
+            src_sges[i].len = entries[i].size;
+            src_sges[i].tseg = _resource->remote_seg;  // sender's pool seg
+            src_sges[i].user_tseg = nullptr;
+
+            dst_sges[i].addr = reinterpret_cast<uint64_t>(data);
+            dst_sges[i].len = entries[i].size;
+            dst_sges[i].tseg = GetPoolSegFor(data);
+            dst_sges[i].user_tseg = nullptr;
+
+            std::memset(&wrs[i], 0, sizeof(urma_jfs_wr_t));
+            wrs[i].opcode = URMA_OPC_READ;
+            wrs[i].flag.bs.complete_enable =
+                (i == block_count - 1) ? 1 : 0;  // signal on last only
+            wrs[i].tjetty = _resource->remote_jetty;
+            wrs[i].rw.src.sge = &src_sges[i];
+            wrs[i].rw.src.num_sge = 1;
+            wrs[i].rw.dst.sge = &dst_sges[i];
+            wrs[i].rw.dst.num_sge = 1;
+            wrs[i].user_ctx = EncodeUserCtx(READ_DATA_REQUEST, seq);
+            wrs[i].next = (i + 1 < block_count) ? &wrs[i + 1] : nullptr;
+        }
+        slot.total_bytes = total_bytes;
+
+        urma_jfs_wr_t* bad = nullptr;
+        const urma_status_t status =
+            urma_post_jetty_send_wr(_resource->jetty, wrs, &bad);
+        if (status != URMA_SUCCESS) {
+            LOG(WARNING) << "HandlePreWrite: READ post failed: " << status
+                         << " on " << _socket->description();
+            slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
+            errno = status;
+            return -1;
+        }
+
+        // Repost the empty recv WR.
+        if (_io_mode != 0) {
+            PostEmptyRecvWr(1);
+        }
+        return 0;  // Data will be delivered when READs complete.
+    }
+
+    LOG(WARNING) << "HandleWriteImmCompletion: unexpected opcode="
+                 << static_cast<int>(imm.io.opcode)
+                 << " on " << _socket->description();
+    errno = EPROTO;
+    return -1;
+}
+
+// Handle a READ completion (large IO path). All READ WRs for this seq
+// have been posted; the last one has complete_enable=1 so we get one
+// completion. Copy data from local pool buffers into _socket->_read_buf.
+ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
+    const uint64_t seq = DecodeUserCtxSeq(cr.user_ctx);
+    const uint32_t idx = static_cast<uint32_t>(seq % URMA_RX_RING_SIZE);
+    UrmaRxSlot& slot = _rx_slots[idx];
+
+    if (slot.state.load(butil::memory_order_relaxed) != UrmaRxSlot::READING) {
+        LOG(WARNING) << "HandleReadCompletion: slot not READING, seq=" << seq
+                     << " on " << _socket->description();
+        return 0;
+    }
+
+    // Copy data from local pool buffers into _socket->_read_buf.
+    ssize_t total_bytes = 0;
+    for (const auto& target : slot.read_targets) {
+        _socket->_read_buf.append(target.first, target.second);
+        total_bytes += static_cast<ssize_t>(target.second);
+    }
+
+    slot.state.store(UrmaRxSlot::DATA_READY, butil::memory_order_relaxed);
+
+    // Send POST_WRITE ack to the peer so it can release send_buf and
+    // saved IOBuf block references.
+    const UrmaWriteImmData imm{slot.write_imm};
+    ResponseCtrlMessage(URMA_IO_POST_WRITE,
+                        imm.io.buffer_offset,
+                        slot.request_id,
+                        0);
+
+    // Clean up the slot.
+    slot.Reset();
+
+    return total_bytes;
+}
+
+// Handle WRITE_IN_BAND_ACK: the peer has consumed our inline data.
+// Release the send_buf slot and the pending send context.
+void UrmaEndpoint::HandleWriteInBandAck(const urma_cr_t& cr) {
+    const UrmaWriteImmData imm{cr.imm_data};
+    const uint32_t offset = imm.io.buffer_offset * URMA_ONE_SIDED_ALLOC_UNIT;
+
+    // Find the send context by request_id from the UrmaMessageHead in
+    // our send_buf. But we don't know the request_id from the ACK alone.
+    // Instead, we search pending_sends by offset.
+    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+    for (auto it = _pending_sends.begin(); it != _pending_sends.end(); ++it) {
+        if (it->second->send_buf_offset == offset &&
+            it->second->opcode == URMA_IO_WRITE_IN_BAND) {
+            _send_buf_alloc->Release(offset, it->second->send_buf_size);
+            delete it->second;
+            _pending_sends.erase(it);
+            _socket->WakeAsEpollOut();
+            return;
+        }
+    }
+    LOG(WARNING) << "HandleWriteInBandAck: no pending send for offset="
+                 << offset << " on " << _socket->description();
+}
+
+// Handle POST_WRITE: the peer has finished READing our data.
+// Release the send_buf slot and the saved IOBuf block references.
+void UrmaEndpoint::HandlePostWrite(const urma_cr_t& cr) {
+    const UrmaWriteImmData imm{cr.imm_data};
+    const uint32_t offset = imm.io.buffer_offset * URMA_ONE_SIDED_ALLOC_UNIT;
+
+    // Read the UrmaMessageHead from our send_buf to get the request_id
+    // and message_size.
+    char* send_buf = static_cast<char*>(_one_sided_buf) + _recv_buf_capacity;
+    const UrmaMessageHead* head =
+        reinterpret_cast<const UrmaMessageHead*>(send_buf + offset);
+    if (head->magic != URMA_CTRL_MAGIC) {
+        LOG(ERROR) << "HandlePostWrite: bad magic on " << _socket->description();
+        return;
+    }
+
+    UrmaSendContext* ctx = FindAndRemoveSendContext(head->request_id);
+    if (ctx) {
+        _send_buf_alloc->Release(ctx->send_buf_offset, ctx->send_buf_size);
+        delete ctx;  // releases saved_blocks
+    }
+    _socket->WakeAsEpollOut();
 }
 
 void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
@@ -1500,10 +2373,51 @@ void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
     _remote_rq_window_size.store(_local_window_capacity,
                                  butil::memory_order_relaxed);
     _sq_window_size.store(_local_window_capacity, butil::memory_order_relaxed);
-}
 
-// ============================================================================
-// OnNewDataFromTcp: edge-triggered dispatcher.
+    // Negotiate one-sided IO mode: min(local, remote). v2 peers or peers
+    // without one-sided support will have io_mode=0, so we fall back to
+    // SEND_ONLY.
+    const uint8_t negotiated_mode = static_cast<uint8_t>(
+        std::min(static_cast<uint32_t>(_io_mode), remote.io_mode));
+    if (negotiated_mode != 0 && remote.has_one_sided &&
+        remote.recv_buf_size > 0 && remote.send_buf_size > 0) {
+        _io_mode = negotiated_mode;
+        _remote_recv_buf_va = remote.recv_buf_va;
+        _remote_recv_buf_size = remote.recv_buf_size;
+        _remote_send_buf_va = remote.send_buf_va;
+        _remote_send_buf_size = remote.send_buf_size;
+        LOG(INFO) << "Negotiated one-sided io_mode=" << static_cast<int>(_io_mode)
+                  << " remote_recv_buf_va=0x" << std::hex
+                  << _remote_recv_buf_va << std::dec
+                  << " size=" << _remote_recv_buf_size
+                  << " on " << _socket->description();
+        // Import the peer's recv_buf segment so we can WRITE_IMM into it.
+        urma_context_t* ctx = GetUrmaContext();
+        if (ctx) {
+            urma_seg_t peer_recv_seg{};
+            std::memcpy(peer_recv_seg.ubva.eid.raw,
+                        remote.recv_buf_seg_eid, 16);
+            peer_recv_seg.ubva.uasid = remote.recv_buf_seg_uasid;
+            peer_recv_seg.ubva.va = remote.recv_buf_va;
+            peer_recv_seg.len = remote.recv_buf_size;
+            peer_recv_seg.token_id = remote.recv_buf_token_id;
+            urma_token_t seg_token{};
+            urma_import_seg_flag_t seg_flag{};
+            seg_flag.bs.cacheable = URMA_NON_CACHEABLE;
+            seg_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+            seg_flag.bs.mapping = URMA_SEG_NOMAP;
+            _resource->remote_recv_buf_seg =
+                urma_import_seg(ctx, &peer_recv_seg, &seg_token, 0, seg_flag);
+            if (!_resource->remote_recv_buf_seg) {
+                PLOG(WARNING) << "Failed to import peer recv_buf seg; "
+                              << "falling back to SEND_ONLY";
+                _io_mode = 0;
+            }
+        }
+    } else {
+        _io_mode = 0;
+    }
+}
 // ============================================================================
 
 static void TryReadOnTcpDuringUrmaEst(Socket* socket);
@@ -1688,6 +2602,10 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     }
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
+    // Post empty recv WRs for one-sided WRITE_IMM operations.
+    if (ep->_io_mode != 0) {
+        ep->PostEmptyRecvWr(ep->_rq_size);
+    }
     ep->DispatchReceivedBytes(s, 0);
     return nullptr;
 }
@@ -1773,7 +2691,11 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
-        ep->DispatchReceivedBytes(s, 0);   // todo 设
+        // Post empty recv WRs for one-sided WRITE_IMM operations.
+        if (ep->_io_mode != 0) {
+            ep->PostEmptyRecvWr(ep->_rq_size);
+        }
+        ep->DispatchReceivedBytes(s, 0);
     } else {
         ep->FallbackToTcp(tp, true);
     }

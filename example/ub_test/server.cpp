@@ -23,6 +23,7 @@
 #include "butil/time.h"
 #include "brpc/server.h"
 #include "brpc/socket_mode.h"
+#include "brpc/urma/urma_helper.h"
 #include "bvar/variable.h"
 #include "bvar/latency_recorder.h"
 #include "test.pb.h"
@@ -169,6 +170,9 @@ public:
 namespace bthread {
     DECLARE_int32(bthread_concurrency);
 }
+#if BRPC_WITH_URMA
+namespace brpc { namespace urma { DECLARE_int32(urma_io_mode); } }
+#endif
 
 constexpr int FD_NUM = 20000;
 
@@ -192,6 +196,11 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "server rsp/name len is " << g_name.size() << "B" << std::endl;
     }
+    std::cout << "URMA: " << (FLAGS_use_urma ? "yes" : "no")
+#if BRPC_WITH_URMA
+              << ", URMA_IO_MODE: " << ::brpc::urma::FLAGS_urma_io_mode
+#endif
+              << std::endl;
  
     g_total_cnt.store(0, butil::memory_order_relaxed);
     g_total_bytes.store(0, butil::memory_order_relaxed);

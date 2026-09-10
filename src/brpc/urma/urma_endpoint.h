@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <ostream>
+#include <unordered_map>
 #include <vector>
 
 #include "butil/atomicops.h"
@@ -38,6 +39,7 @@
 #include "urma_types.h"
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
+#include "brpc/urma/urma_one_sided.h"
 
 namespace brpc {
 
@@ -90,6 +92,9 @@ struct UrmaResource {
     // Imported peer objects (created per-connection, not pooled).
     urma_target_jetty_t* remote_jetty{nullptr};
     urma_target_seg_t* remote_seg{nullptr};
+    // Imported peer recv_buf segment (one-sided only). We WRITE_IMM into
+    // this buffer.
+    urma_target_seg_t* remote_recv_buf_seg{nullptr};
 
     UrmaResource() = default;
     ~UrmaResource();
@@ -356,6 +361,64 @@ private:
     };
     static std::vector<PollerGroup> _poller_groups;
     bthread_tag_t _poller_tag{0};
+
+    // ---- One-sided operation state (active when _io_mode != 0) ----
+    // IO mode: 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID. Negotiated to
+    // min(local, remote) during handshake. v2 peers always get 0.
+    uint8_t _io_mode{0};
+
+    // Local send/recv buffers for one-sided operations. Single contiguous
+    // mmap region registered as one URMA segment: recv_buf at base,
+    // send_buf at base + recv_buf_size.
+    void* _one_sided_buf{nullptr};       // mmap base (owned)
+    uint32_t _send_buf_capacity{0};      // send_buf size in bytes
+    uint32_t _recv_buf_capacity{0};      // recv_buf size in bytes
+    urma_target_seg_t* _send_buf_tseg{nullptr};  // local registered seg
+    // Allocator for the send_buf (tracks which slots are in use).
+    UrmaRingBuf* _send_buf_alloc{nullptr};
+
+    // Peer recv_buf address (we WRITE_IMM to this address + offset).
+    uint64_t _remote_recv_buf_va{0};
+    uint32_t _remote_recv_buf_size{0};
+    // Peer send_buf address (we WRITE_IN_BAND_ACK / POST_WRITE to this).
+    uint64_t _remote_send_buf_va{0};
+    uint32_t _remote_send_buf_size{0};
+
+    // Request ID counter for one-sided messages.
+    butil::atomic<uint64_t> _one_sided_seq{1};
+
+    // Pending send contexts: keyed by request_id. Tracks in-flight
+    // one-sided messages so we can release send_buf on ACK/POST_WRITE.
+    std::mutex _pending_sends_mutex;
+    std::unordered_map<uint64_t, UrmaSendContext*> _pending_sends;
+
+    // RX slots for large IO (PRE_WRITE + READ) path.
+    UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
+    butil::atomic<uint64_t> _rx_consume_seq{0};
+
+    // ---- One-sided methods ----
+    int AllocateOneSidedBuffers();
+    void DeallocateOneSidedBuffers();
+    int PostEmptyRecvWr(uint32_t count);
+
+    // Send path dispatch: called by CutFromIOBufList.
+    ssize_t CutFromIOBufList_Send(butil::IOBuf** from, size_t ndata);
+    ssize_t WriteInline(butil::IOBuf** from, size_t ndata);
+    ssize_t WriteZeroCopy(butil::IOBuf** from, size_t ndata);
+
+    // Completion handlers for one-sided operations.
+    ssize_t HandleWriteImmCompletion(const urma_cr_t& cr);
+    ssize_t HandleReadCompletion(const urma_cr_t& cr);
+    void HandleWriteInBandAck(const urma_cr_t& cr);
+    void HandlePostWrite(const urma_cr_t& cr);
+
+    // Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to
+    // the peer's send_buf at the mirrored offset.
+    int ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
+                            uint64_t request_id, uint32_t message_size);
+
+    // Helper: find and remove a pending send context by request_id.
+    UrmaSendContext* FindAndRemoveSendContext(uint64_t request_id);
 
     DISALLOW_COPY_AND_ASSIGN(UrmaEndpoint);
 };
