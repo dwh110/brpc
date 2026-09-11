@@ -85,6 +85,11 @@ DEFINE_uint32(urma_uasid, 0,
               "stays 0 after urma_init), specify a non-zero value manually.");
 DEFINE_int32(urma_max_sge, 0,
              "Max SGEs per WR. 0 means the device maximum.");
+DEFINE_int32(urma_max_sge_len, 4096,
+             "Max payload bytes per SGE. SEND path is capped to 4096 on all "
+             "devices due to bonding/UDMA hardware bugs. For one-sided READ "
+             "(io_mode=2 large IO), larger values (e.g. 8192) halve the WR "
+             "count and may improve throughput. 0 means use device default.");
 DEFINE_int32(urma_bonding_mode, 0,
              "Bonding mode for bonding devices: 0=standalone, "
              "1=active-backup, 2=balance.");
@@ -913,7 +918,16 @@ uint16_t GetUrmaBondingMaxSendWindow() {
 uint32_t GetUrmaMaxSgeLen() {
     // Both bonding and raw UDMA providers silently drop SEND WRs whose
     // SGE payload exceeds 4096 bytes, then flush the jetty (status=11)
-    // on all subsequent WRs.  Cap each SGE to 4096 bytes on all devices.
+    // on all subsequent WRs.  Cap each SGE to 4096 bytes on all devices
+    // for the SEND path.  For one-sided READ (io_mode=2 large IO), the
+    // cap may be relaxed via --urma_max_sge_len to reduce WR count.
+    return static_cast<uint32_t>(FLAGS_urma_max_sge_len);
+}
+
+uint32_t GetUrmaSendMaxSgeLen() {
+    // SEND path hard limit: bonding/UDMA hardware silently drops SEND WRs
+    // whose SGE payload exceeds 4096 bytes.  This value is NOT affected
+    // by --urma_max_sge_len.
     return 4096;
 }
 

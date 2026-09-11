@@ -1000,7 +1000,7 @@ ssize_t UrmaEndpoint::CutFromIOBufList_Send(butil::IOBuf** from, size_t ndata) {
     if (max_sge < 1) {
         max_sge = 1;
     }
-    const uint32_t max_sge_len = GetUrmaMaxSgeLen();
+    const uint32_t max_sge_len = GetUrmaSendMaxSgeLen();
 
     urma_sge_t* sglist = static_cast<urma_sge_t*>(
         alloca(sizeof(urma_sge_t) * max_sge));

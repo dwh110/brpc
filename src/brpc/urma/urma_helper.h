@@ -125,6 +125,9 @@ uint16_t GetUrmaBondingMaxSendWindow();
 // WRs.  Non-bonding devices return 0 (no per-SGE limit).
 uint32_t GetUrmaMaxSgeLen();
 
+// Hard cap for SEND path (bonding/UDMA hardware limit).
+uint32_t GetUrmaSendMaxSgeLen();
+
 }  // namespace urma
 }  // namespace brpc
 
