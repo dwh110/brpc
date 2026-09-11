@@ -953,6 +953,15 @@ int main(int argc, char* argv[]) {
     // 占位初始化, 实际数量在每次 Test() 阶段3前重建为 queue_depth
     bthread_sem_init(&g_inflight_sem, 0);
 
+    // Initialize URMA before any IOBuf operations (e.g. _attachment.append
+    // in PerformanceTest constructor).  GlobalUrmaInitializeOrDie replaces
+    // the IOBuf block allocator with PoolAllocate.  If IOBuf blocks are
+    // allocated from the original malloc before this call, they get cached
+    // in thread-local storage and later fail GetPoolSegFor with ERDMAMEM.
+    if (FLAGS_use_urma) {
+        brpc::urma::GlobalUrmaInitializeOrDie();
+    }
+
 #ifdef WITH_RDMA
     if (FLAGS_use_rdma) {
         brpc::rdma::GlobalRdmaInitializeOrDie();

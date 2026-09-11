@@ -187,6 +187,12 @@ int main(int argc, char* argv[]) {
 
     bthread::FLAGS_bthread_concurrency = FLAGS_server_bthread_concurrency;
 
+    // Initialize URMA before any IOBuf operations to ensure all IOBuf blocks
+    // are allocated from the URMA pool, not the original malloc.
+    if (FLAGS_use_urma) {
+        brpc::urma::GlobalUrmaInitializeOrDie();
+    }
+
     brpc::Server server;
     test::PerfTestServiceImpl perf_test_service_impl;
 
