@@ -63,6 +63,23 @@ TEST(UrmaHandshakeTest, v2_serialize_deserialize_roundtrip) {
     m.seg_va = 0x1122334455667788ULL;
     m.seg_len = 1ULL << 20;
     m.seg_token_id = 0x42424242;
+    // One-sided fields.
+    m.io_mode = 2;
+    m.has_one_sided = 1;
+    m.recv_buf_va = 0xaabbccdd11223344ULL;
+    m.recv_buf_size = 131072;
+    m.recv_buf_token_id = 0x55555555;
+    for (int i = 0; i < 16; ++i) {
+        m.recv_buf_seg_eid[i] = static_cast<uint8_t>(i + 10);
+    }
+    m.recv_buf_seg_uasid = 0x66666666;
+    m.send_buf_va = 0xeeff001122334455ULL;
+    m.send_buf_size = 131072;
+    m.send_buf_token_id = 0x77777777;
+    for (int i = 0; i < 16; ++i) {
+        m.send_buf_seg_eid[i] = static_cast<uint8_t>(i + 20);
+    }
+    m.send_buf_seg_uasid = 0x88888888;
 
     uint8_t buf[urma::v2_wire::HELLO_BODY_LEN];
     m.Serialize(buf);
@@ -83,6 +100,18 @@ TEST(UrmaHandshakeTest, v2_serialize_deserialize_roundtrip) {
     EXPECT_EQ(m.seg_va, m2.seg_va);
     EXPECT_EQ(m.seg_len, m2.seg_len);
     EXPECT_EQ(m.seg_token_id, m2.seg_token_id);
+    EXPECT_EQ(m.io_mode, m2.io_mode);
+    EXPECT_EQ(m.has_one_sided, m2.has_one_sided);
+    EXPECT_EQ(m.recv_buf_va, m2.recv_buf_va);
+    EXPECT_EQ(m.recv_buf_size, m2.recv_buf_size);
+    EXPECT_EQ(m.recv_buf_token_id, m2.recv_buf_token_id);
+    EXPECT_EQ(0, memcmp(m.recv_buf_seg_eid, m2.recv_buf_seg_eid, 16));
+    EXPECT_EQ(m.recv_buf_seg_uasid, m2.recv_buf_seg_uasid);
+    EXPECT_EQ(m.send_buf_va, m2.send_buf_va);
+    EXPECT_EQ(m.send_buf_size, m2.send_buf_size);
+    EXPECT_EQ(m.send_buf_token_id, m2.send_buf_token_id);
+    EXPECT_EQ(0, memcmp(m.send_buf_seg_eid, m2.send_buf_seg_eid, 16));
+    EXPECT_EQ(m.send_buf_seg_uasid, m2.send_buf_seg_uasid);
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +121,7 @@ TEST(UrmaHandshakeTest, v2_packet_magic_is_urma) {
     EXPECT_EQ(4u, urma::v2_wire::MAGIC_STR_LEN);
     char magic[4] = {'U', 'R', 'M', 'A'};
     EXPECT_EQ(0, memcmp(magic, "URMA", 4));
-    EXPECT_EQ(4u + 82u, urma::v2_wire::HELLO_PACKET_LEN);
+    EXPECT_EQ(4u + 158u, urma::v2_wire::HELLO_PACKET_LEN);
 }
 
 // ---------------------------------------------------------------------------

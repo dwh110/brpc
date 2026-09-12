@@ -80,18 +80,18 @@ struct ParsedHello {
 bool ValidHello(const ParsedHello& hello);
 
 // v2 binary wire layout. The full on-wire packet is:
-//   [ "URMA" 4B ][ HelloMessage body 82B ]   => 86 bytes total.
-// (msg_len = 86 includes the magic prefix and the body, matching RDMA's
+//   [ "URMA" 4B ][ HelloMessage body 158B ]   => 162 bytes total.
+// (msg_len = 162 includes the magic prefix and the body, matching RDMA's
 // convention where msg_len covers the whole packet.)
 namespace v2_wire {
 
 constexpr size_t MAGIC_STR_LEN = 4;
-constexpr size_t HELLO_BODY_LEN = 82;
-constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 86
+constexpr size_t HELLO_BODY_LEN = 158;
+constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 162
 constexpr size_t HELLO_MSG_LEN_MIN = HELLO_PACKET_LEN;
 constexpr size_t HELLO_MSG_LEN_MAX = 4096;
 constexpr uint16_t HELLO_V2_VERSION = 2;
-constexpr uint16_t IMPL_V2_VERSION = 1;
+constexpr uint16_t IMPL_V2_VERSION = 2;  // bumped to 2 for one-sided extension
 
 // The serializable struct. Aligned so it can be reinterpreted as raw bytes.
 struct HelloMessage {
@@ -110,6 +110,20 @@ struct HelloMessage {
     uint64_t seg_va;
     uint64_t seg_len;
     uint32_t seg_token_id;
+    // ---- One-sided extension (impl_ver >= 2) ----
+    uint8_t io_mode;               // 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID
+    uint8_t has_one_sided;         // 1 if peer supports one-sided ops
+    uint8_t pad2[2];              // alignment
+    uint64_t recv_buf_va;          // peer recv_buf virtual address
+    uint32_t recv_buf_size;        // peer recv_buf size in bytes
+    uint32_t recv_buf_token_id;    // peer recv_buf segment token id
+    uint8_t recv_buf_seg_eid[16];  // peer recv_buf segment EID
+    uint32_t recv_buf_seg_uasid;   // peer recv_buf segment uasid
+    uint64_t send_buf_va;          // peer send_buf virtual address
+    uint32_t send_buf_size;        // peer send_buf size in bytes
+    uint32_t send_buf_token_id;    // peer send_buf segment token id
+    uint8_t send_buf_seg_eid[16];  // peer send_buf segment EID
+    uint32_t send_buf_seg_uasid;   // peer send_buf segment uasid
 
     void Serialize(void* buf) const;   // host -> network order, write to buf
     void Deserialize(const void* buf);  // network -> host order, read from buf

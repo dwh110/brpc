@@ -44,7 +44,7 @@ DEFINE_int32(urma_client_handshake_version, 2,
 
 // ============================================================================
 // v2 binary HelloMessage.
-// On-wire layout (network byte order, tightly packed body of 82 bytes):
+// On-wire layout (network byte order, tightly packed body of 158 bytes):
 //
 //   offset  field            size
 //      0    msg_len          2B    (full packet length incl. magic)
@@ -62,9 +62,23 @@ DEFINE_int32(urma_client_handshake_version, 2,
 //     62    seg_va           8B
 //     70    seg_len          8B
 //     78    seg_token_id     4B
-//   total = 82 bytes body.
+//   -- one-sided extension (impl_ver >= 2) --
+//     82    io_mode          1B
+//     83    has_one_sided    1B
+//     84    pad2             2B
+//     86    recv_buf_va      8B
+//     94    recv_buf_size    4B
+//     98    recv_buf_token_id 4B
+//    102    recv_buf_seg_eid 16B  (raw)
+//    118    recv_buf_seg_uasid 4B
+//    122    send_buf_va      8B
+//    130    send_buf_size    4B
+//    134    send_buf_token_id 4B
+//    138    send_buf_seg_eid 16B  (raw)
+//    154    send_buf_seg_uasid 4B
+//   total = 158 bytes body.
 //
-// Full packet = magic "URMA" (4B) + body (82B) = 86 bytes.
+// Full packet = magic "URMA" (4B) + body (158B) = 162 bytes.
 // ============================================================================
 
 namespace v2_wire {
@@ -105,6 +119,23 @@ void HelloMessage::Serialize(void* buf) const {
     write64(seg_va);
     write64(seg_len);
     write32(seg_token_id);
+    // One-sided extension (impl_ver >= 2).
+    *p++ = io_mode;
+    *p++ = has_one_sided;
+    std::memset(p, 0, sizeof(pad2));
+    p += sizeof(pad2);
+    write64(recv_buf_va);
+    write32(recv_buf_size);
+    write32(recv_buf_token_id);
+    std::memcpy(p, recv_buf_seg_eid, sizeof(recv_buf_seg_eid));
+    p += sizeof(recv_buf_seg_eid);
+    write32(recv_buf_seg_uasid);
+    write64(send_buf_va);
+    write32(send_buf_size);
+    write32(send_buf_token_id);
+    std::memcpy(p, send_buf_seg_eid, sizeof(send_buf_seg_eid));
+    p += sizeof(send_buf_seg_eid);
+    write32(send_buf_seg_uasid);
 }
 
 void HelloMessage::Deserialize(const void* buf) {
@@ -145,6 +176,22 @@ void HelloMessage::Deserialize(const void* buf) {
     seg_va = read64();
     seg_len = read64();
     seg_token_id = read32();
+    // One-sided extension (impl_ver >= 2).
+    io_mode = *p++;
+    has_one_sided = *p++;
+    p += sizeof(pad2);
+    recv_buf_va = read64();
+    recv_buf_size = read32();
+    recv_buf_token_id = read32();
+    std::memcpy(recv_buf_seg_eid, p, sizeof(recv_buf_seg_eid));
+    p += sizeof(recv_buf_seg_eid);
+    recv_buf_seg_uasid = read32();
+    send_buf_va = read64();
+    send_buf_size = read32();
+    send_buf_token_id = read32();
+    std::memcpy(send_buf_seg_eid, p, sizeof(send_buf_seg_eid));
+    p += sizeof(send_buf_seg_eid);
+    send_buf_seg_uasid = read32();
 }
 
 }  // namespace v2_wire
@@ -210,6 +257,19 @@ int ReadBodyAndNegotiate(UrmaEndpoint* ep, ParsedHello* out, bool* negotiated) {
     p.seg_va = m.seg_va;
     p.seg_len = m.seg_len;
     p.seg_token_id = m.seg_token_id;
+    // One-sided fields (impl_ver >= 2).
+    p.io_mode = m.io_mode;
+    p.has_one_sided = (m.has_one_sided != 0);
+    p.recv_buf_va = m.recv_buf_va;
+    p.recv_buf_size = m.recv_buf_size;
+    p.recv_buf_token_id = m.recv_buf_token_id;
+    std::memcpy(p.recv_buf_seg_eid, m.recv_buf_seg_eid, 16);
+    p.recv_buf_seg_uasid = m.recv_buf_seg_uasid;
+    p.send_buf_va = m.send_buf_va;
+    p.send_buf_size = m.send_buf_size;
+    p.send_buf_token_id = m.send_buf_token_id;
+    std::memcpy(p.send_buf_seg_eid, m.send_buf_seg_eid, 16);
+    p.send_buf_seg_uasid = m.send_buf_seg_uasid;
     if (!ValidHello(p)) {
         return 0;
     }

@@ -357,6 +357,19 @@ void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
     out->seg_va = p.seg_va;
     out->seg_len = p.seg_len;
     out->seg_token_id = p.seg_token_id;
+    // One-sided fields.
+    out->io_mode = static_cast<uint8_t>(p.io_mode);
+    out->has_one_sided = p.has_one_sided ? 1 : 0;
+    out->recv_buf_va = p.recv_buf_va;
+    out->recv_buf_size = p.recv_buf_size;
+    out->recv_buf_token_id = p.recv_buf_token_id;
+    std::memcpy(out->recv_buf_seg_eid, p.recv_buf_seg_eid, 16);
+    out->recv_buf_seg_uasid = p.recv_buf_seg_uasid;
+    out->send_buf_va = p.send_buf_va;
+    out->send_buf_size = p.send_buf_size;
+    out->send_buf_token_id = p.send_buf_token_id;
+    std::memcpy(out->send_buf_seg_eid, p.send_buf_seg_eid, 16);
+    out->send_buf_seg_uasid = p.send_buf_seg_uasid;
 }
 
 void UrmaEndpoint::FillLocalHelloV3(UrmaHello* out) const {
