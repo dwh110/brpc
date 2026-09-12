@@ -228,11 +228,13 @@ struct UrmaRxSlot {
     uint64_t request_id{0};  // sender's request ID
     uint32_t total_bytes{0}; // total bytes to receive across all READs
     uint32_t received_bytes{0};
+    uint16_t sq_slots_used{0}; // SQ slots consumed by READ WRs (for reclaim)
     // READ target buffers: {local_addr, size} pairs. Data is copied from
     // these into _socket->_read_buf after all READs complete.
     std::vector<std::pair<void*, size_t>> read_targets;
-    // Local pool buffers allocated as READ destinations (need cleanup).
-    std::vector<void*> local_bufs;
+    // IOBuf objects that own the local pool buffers used as READ destinations.
+    // These must stay alive until all READs complete and data is copied.
+    std::vector<butil::IOBuf> recv_bufs;
 
     UrmaRxSlot() = default;
     void Reset() {
@@ -241,8 +243,9 @@ struct UrmaRxSlot {
         request_id = 0;
         total_bytes = 0;
         received_bytes = 0;
+        sq_slots_used = 0;
         read_targets.clear();
-        local_bufs.clear();
+        recv_bufs.clear();
     }
 };
 

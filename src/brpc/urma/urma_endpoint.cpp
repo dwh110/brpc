@@ -1150,9 +1150,10 @@ bool UrmaEndpoint::IsWritable() const {
         return _remote_rq_window_size.load(butil::memory_order_relaxed) > 0 &&
                _sq_window_size.load(butil::memory_order_relaxed) > 0;
     }
-    // One-sided: writable if send_buf has at least one allocation unit free.
+    // One-sided: writable if send_buf has space AND SQ has slots available.
     return _send_buf_alloc &&
-           _send_buf_alloc->Available() >= URMA_ONE_SIDED_ALLOC_UNIT;
+           _send_buf_alloc->Available() >= URMA_ONE_SIDED_ALLOC_UNIT &&
+           _sq_window_size.load(butil::memory_order_relaxed) > 0;
 }
 
 // ============================================================================
@@ -1253,11 +1254,14 @@ ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
         _pending_sends[request_id] = ctx;
     }
 
+    // Consume one SQ slot for the WRITE_IMM WR.
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
     const urma_status_t status =
         urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
         LOG(WARNING) << "WriteInline: urma_post_jetty_send_wr failed: "
                      << status << " provider_errno=" << provider_errno
                      << " on " << _socket->description();
@@ -1408,11 +1412,14 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
         _pending_sends[request_id] = ctx;
     }
 
+    // Consume one SQ slot for the WRITE_IMM control message WR.
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
     const urma_status_t status =
         urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
         LOG(WARNING) << "WriteZeroCopy: urma_post_jetty_send_wr failed: "
                      << status << " provider_errno=" << provider_errno
                      << " on " << _socket->description();
@@ -1485,10 +1492,13 @@ int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
     wr.rw.notify_data = imm.data;
     wr.user_ctx = EncodeUserCtx(CTRL_DATA_RESPONSE, request_id);
 
+    // Consume one SQ slot for the WRITE_IMM WR.
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
     const urma_status_t status =
         urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     if (status != URMA_SUCCESS) {
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
         PLOG(WARNING) << "ResponseCtrlMessage: post failed: " << status
                       << " on " << _socket->description();
         errno = status;
@@ -1761,14 +1771,51 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         if (cr.user_ctx != 0) {
             const OneSideSenderType type = DecodeUserCtxType(cr.user_ctx);
             if (type == READ_DATA_REQUEST) {
+                // READ WR completion: reclaim all SQ slots consumed by the
+                // READ chain. The number of slots is stored in the rx slot.
+                const uint64_t seq = DecodeUserCtxSeq(cr.user_ctx);
+                const uint32_t idx = static_cast<uint32_t>(
+                    seq % URMA_RX_RING_SIZE);
+                const uint16_t slots = _rx_slots[idx].sq_slots_used;
+                uint16_t old =
+                    _sq_window_size.load(butil::memory_order_relaxed);
+                while (true) {
+                    uint16_t newval = static_cast<uint16_t>(old + slots);
+                    if (newval > _local_window_capacity) {
+                        newval = _local_window_capacity;
+                    }
+                    if (old >= _local_window_capacity) {
+                        break;
+                    }
+                    if (_sq_window_size.compare_exchange_weak(
+                            old, newval,
+                            butil::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+                _socket->WakeAsEpollOut();
                 return HandleReadCompletion(cr);
             }
             if (type == CTRL_DATA_REQUEST || type == CTRL_DATA_RESPONSE) {
                 // Send completion for our WRITE_IMM (data or control response).
+                // Reclaim the SQ window — the WRITE_IMM consumed one SQ slot.
                 // The send_buf slot is released when we receive the ACK
                 // (WRITE_IN_BAND_ACK or POST_WRITE), not here. For
-                // CTRL_DATA_RESPONSE, there's nothing to do — the response
+                // CTRL_DATA_RESPONSE, there's nothing else to do — the response
                 // is fire-and-forget.
+                uint16_t old =
+                    _sq_window_size.load(butil::memory_order_relaxed);
+                while (true) {
+                    if (old >= _local_window_capacity) {
+                        break;
+                    }
+                    if (_sq_window_size.compare_exchange_weak(
+                            old, static_cast<uint16_t>(old + 1),
+                            butil::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+                _socket->WakeAsEpollOut();
                 return 0;
             }
             // Fall through to existing SEND path for user_ctx != 0
@@ -1997,17 +2044,21 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
         // sender's pool into a local pool buffer.
         urma_jfs_wr_t* wr_head = nullptr;
         urma_jfs_wr_t* wr_tail = nullptr;
-        // Use alloca for WR and SGE arrays (freed on return).
-        urma_jfs_wr_t* wrs = static_cast<urma_jfs_wr_t*>(
-            alloca(sizeof(urma_jfs_wr_t) * block_count));
-        urma_sge_t* src_sges = static_cast<urma_sge_t*>(
-            alloca(sizeof(urma_sge_t) * block_count));
-        urma_sge_t* dst_sges = static_cast<urma_sge_t*>(
-            alloca(sizeof(urma_sge_t) * block_count));
+        // Use heap allocation for WR and SGE arrays (must survive until
+        // urma_post_jetty_send_wr copies them internally).
+        std::unique_ptr<urma_jfs_wr_t[]> wrs(
+            new urma_jfs_wr_t[block_count]);
+        std::unique_ptr<urma_sge_t[]> src_sges(
+            new urma_sge_t[block_count]);
+        std::unique_ptr<urma_sge_t[]> dst_sges(
+            new urma_sge_t[block_count]);
 
         for (uint32_t i = 0; i < block_count; ++i) {
             // Allocate a local pool buffer as READ destination.
-            butil::IOBuf iobuf;
+            // The IOBuf must stay alive until HandleReadCompletion copies
+            // the data — store it in slot.recv_bufs.
+            slot.recv_bufs.emplace_back();
+            butil::IOBuf& iobuf = slot.recv_bufs.back();
             butil::IOBufAsZeroCopyOutputStream zcis(
                 &iobuf, entries[i].size + IOBUF_BLOCK_HEADER_LEN);
             void* data = nullptr;
@@ -2018,7 +2069,6 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
                 errno = ENOMEM;
                 return -1;
             }
-            slot.local_bufs.push_back(data);
             slot.read_targets.push_back({data, entries[i].size});
             total_bytes += entries[i].size;
 
@@ -2047,11 +2097,34 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
         }
         slot.total_bytes = total_bytes;
 
+        // Consume SQ slots for all READ WRs in the chain.
+        // Each READ WR occupies one SQ slot. Only the last WR generates a
+        // completion (complete_enable=1), so we reclaim all slots at once
+        // when HandleReadCompletion fires.
+        const uint16_t sq_needed = static_cast<uint16_t>(block_count);
+        uint16_t sq_old = _sq_window_size.load(butil::memory_order_relaxed);
+        if (sq_old < sq_needed) {
+            LOG(WARNING) << "HandlePreWrite: insufficient SQ window: have="
+                         << sq_old << " need=" << sq_needed
+                         << " block_count=" << block_count
+                         << " on " << _socket->description();
+            slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
+            errno = EAGAIN;
+            return -1;
+        }
+        _sq_window_size.fetch_sub(sq_needed, butil::memory_order_relaxed);
+        slot.sq_slots_used = sq_needed;
+
         urma_jfs_wr_t* bad = nullptr;
         const urma_status_t status =
-            urma_post_jetty_send_wr(_resource->jetty, wrs, &bad);
+            urma_post_jetty_send_wr(_resource->jetty, wrs.get(), &bad);
         if (status != URMA_SUCCESS) {
-            LOG(WARNING) << "HandlePreWrite: READ post failed: " << status
+            const int provider_errno = errno;
+            _sq_window_size.fetch_add(sq_needed, butil::memory_order_relaxed);
+            LOG(WARNING) << "HandlePreWrite: READ post failed: status=" << status
+                         << " provider_errno=" << provider_errno
+                         << " bad_wr_index=" << (bad ? (int)(bad - wrs.get()) : -1)
+                         << " block_count=" << block_count
                          << " on " << _socket->description();
             slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
             errno = status;
@@ -2118,19 +2191,27 @@ void UrmaEndpoint::HandleWriteInBandAck(const urma_cr_t& cr) {
     // Find the send context by request_id from the UrmaMessageHead in
     // our send_buf. But we don't know the request_id from the ACK alone.
     // Instead, we search pending_sends by offset.
-    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-    for (auto it = _pending_sends.begin(); it != _pending_sends.end(); ++it) {
-        if (it->second->send_buf_offset == offset &&
-            it->second->opcode == URMA_IO_WRITE_IN_BAND) {
-            _send_buf_alloc->Release(offset, it->second->send_buf_size);
-            delete it->second;
-            _pending_sends.erase(it);
-            _socket->WakeAsEpollOut();
-            return;
+    {
+        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+        for (auto it = _pending_sends.begin(); it != _pending_sends.end(); ++it) {
+            if (it->second->send_buf_offset == offset &&
+                it->second->opcode == URMA_IO_WRITE_IN_BAND) {
+                _send_buf_alloc->Release(offset, it->second->send_buf_size);
+                delete it->second;
+                _pending_sends.erase(it);
+                _socket->WakeAsEpollOut();
+                goto repost;
+            }
         }
     }
     LOG(WARNING) << "HandleWriteInBandAck: no pending send for offset="
                  << offset << " on " << _socket->description();
+
+repost:
+    // Repost the recv WR consumed by this WRITE_IMM ACK.
+    if (_io_mode != 0) {
+        PostEmptyRecvWr(1);
+    }
 }
 
 // Handle POST_WRITE: the peer has finished READing our data.
@@ -2155,6 +2236,11 @@ void UrmaEndpoint::HandlePostWrite(const urma_cr_t& cr) {
         delete ctx;  // releases saved_blocks
     }
     _socket->WakeAsEpollOut();
+
+    // Repost the recv WR consumed by this WRITE_IMM POST_WRITE.
+    if (_io_mode != 0) {
+        PostEmptyRecvWr(1);
+    }
 }
 
 void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
@@ -2602,10 +2688,8 @@ void* UrmaEndpoint::ProcessHandshakeAtClient(void* arg) {
     }
     tp->_urma_state = UrmaTransport::URMA_ON;
     ep->_state = ESTABLISHED;
-    // Post empty recv WRs for one-sided WRITE_IMM operations.
-    if (ep->_io_mode != 0) {
-        ep->PostEmptyRecvWr(ep->_rq_size);
-    }
+    // RQ is already filled by PostRecv above. Normal recv WRs also consume
+    // WRITE_IMM completions — no need for additional PostEmptyRecvWr.
     ep->DispatchReceivedBytes(s, 0);
     return nullptr;
 }
@@ -2691,10 +2775,8 @@ void* UrmaEndpoint::ProcessHandshakeAtServer(void* arg) {
         }
         tp->_urma_state = UrmaTransport::URMA_ON;
         ep->_state = ESTABLISHED;
-        // Post empty recv WRs for one-sided WRITE_IMM operations.
-        if (ep->_io_mode != 0) {
-            ep->PostEmptyRecvWr(ep->_rq_size);
-        }
+        // RQ is already filled by PostRecv above. Normal recv WRs also consume
+        // WRITE_IMM completions — no need for additional PostEmptyRecvWr.
         ep->DispatchReceivedBytes(s, 0);
     } else {
         ep->FallbackToTcp(tp, true);
