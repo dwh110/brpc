@@ -67,4 +67,14 @@ message UrmaHello {
 
     // One-sided IO mode: 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID.
     optional uint32 io_mode = 22;
+
+    // ---- RNDV protocol parameters (v3 extension) ----
+    // RNDV: sender copies data to a contiguous pre-registered buffer and
+    // the receiver issues a single READ WR for the entire message.
+    optional bool rndv_enabled = 23;
+    optional uint64 rndv_buf_va = 24;
+    optional uint32 rndv_buf_size = 25;
+    optional uint32 rndv_seg_token_id = 26;
+    optional bytes rndv_seg_eid = 27;
+    optional uint32 rndv_seg_uasid = 28;
 }

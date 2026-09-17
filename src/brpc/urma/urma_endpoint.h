@@ -53,6 +53,9 @@ struct ParsedHello;
 DECLARE_bool(urma_use_polling);
 DECLARE_int32(urma_poller_num);
 DECLARE_bool(urma_disable_bthread);
+DECLARE_bool(urma_rndv_enabled);
+DECLARE_int32(urma_rndv_buf_size);
+DECLARE_int32(urma_rndv_threshold);
 
 // Per-connection application-level connect object. Returned by
 // UrmaTransport::Connect(); its StartConnect spawns the client-side handshake
@@ -396,15 +399,41 @@ private:
     UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
     butil::atomic<uint64_t> _rx_consume_seq{0};
 
+    // Number of empty recv WRs consumed but not yet reposted (one-sided path).
+    // Accumulated and batch-reposted when deficit exceeds the low-water mark.
+    butil::atomic<uint16_t> _empty_rq_deficit{0};
+
+    // ---- RNDV protocol state (active when _rndv_enabled) ----
+    // Per-endpoint RNDV buffer: contiguous pre-registered region for large
+    // messages. Sender copies data here; receiver issues a single READ.
+    bool _rndv_enabled{false};
+    void* _rndv_buf{nullptr};              // mmap base (owned)
+    uint32_t _rndv_buf_capacity{0};        // total size in bytes
+    urma_target_seg_t* _rndv_buf_tseg{nullptr};  // URMA segment for _rndv_buf
+    UrmaRingBuf* _rndv_buf_alloc{nullptr}; // bitmap allocator
+    butil::atomic<uint16_t> _rndv_inflight{0};   // concurrent RNDV ops in flight
+    // RNDV RX buffer: pre-registered contiguous buffer for READ destinations.
+    // Shares the same mmap region as _rndv_buf (TX half + RX half).
+    uint32_t _rndv_rx_capacity{0};
+    UrmaRingBuf* _rndv_rx_alloc{nullptr};
+    // Peer's RNDV buffer info (imported during handshake).
+    uint64_t _remote_rndv_buf_va{0};
+    uint32_t _remote_rndv_buf_size{0};
+    urma_target_seg_t* _remote_rndv_seg{nullptr};
+
     // ---- One-sided methods ----
     int AllocateOneSidedBuffers();
     void DeallocateOneSidedBuffers();
+    int AllocateRndvBuffer();
+    void DeallocateRndvBuffer();
     int PostEmptyRecvWr(uint32_t count);
+    void RepostEmptyRecvWr();
 
     // Send path dispatch: called by CutFromIOBufList.
     ssize_t CutFromIOBufList_Send(butil::IOBuf** from, size_t ndata);
     ssize_t WriteInline(butil::IOBuf** from, size_t ndata);
     ssize_t WriteZeroCopy(butil::IOBuf** from, size_t ndata);
+    ssize_t WriteRndv(butil::IOBuf** from, size_t ndata);
 
     // Completion handlers for one-sided operations.
     ssize_t HandleWriteImmCompletion(const urma_cr_t& cr);

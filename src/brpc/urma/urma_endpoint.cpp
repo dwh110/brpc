@@ -337,6 +337,27 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
                     _send_buf_tseg->seg.ubva.eid.raw, 16);
         out->send_buf_seg_uasid = _send_buf_tseg->seg.ubva.uasid;
     }
+    // RNDV: advertise RNDV buffer if allocated.
+    if (_rndv_enabled && _rndv_buf && _rndv_buf_tseg) {
+        out->rndv_enabled = true;
+        out->rndv_buf_va = reinterpret_cast<uint64_t>(_rndv_buf);
+        out->rndv_buf_size = _rndv_buf_capacity;
+        out->rndv_seg_token_id = _rndv_buf_tseg->seg.token_id;
+        std::memcpy(out->rndv_seg_eid,
+                    _rndv_buf_tseg->seg.ubva.eid.raw, 16);
+        out->rndv_seg_uasid = _rndv_buf_tseg->seg.ubva.uasid;
+        LOG(INFO) << "MakeLocalParsedHello: advertising RNDV buf_va=0x"
+                  << std::hex << out->rndv_buf_va << std::dec
+                  << " size=" << out->rndv_buf_size
+                  << " token_id=" << out->rndv_seg_token_id
+                  << " on " << _socket->description();
+    } else {
+        LOG(INFO) << "MakeLocalParsedHello: RNDV NOT advertised"
+                  << " _rndv_enabled=" << _rndv_enabled
+                  << " _rndv_buf=" << (_rndv_buf != nullptr)
+                  << " _rndv_buf_tseg=" << (_rndv_buf_tseg != nullptr)
+                  << " on " << _socket->description();
+    }
 }
 
 void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
@@ -370,6 +391,13 @@ void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
     out->send_buf_token_id = p.send_buf_token_id;
     std::memcpy(out->send_buf_seg_eid, p.send_buf_seg_eid, 16);
     out->send_buf_seg_uasid = p.send_buf_seg_uasid;
+    // RNDV fields.
+    out->rndv_enabled = p.rndv_enabled ? 1 : 0;
+    out->rndv_buf_va = p.rndv_buf_va;
+    out->rndv_buf_size = p.rndv_buf_size;
+    out->rndv_seg_token_id = p.rndv_seg_token_id;
+    std::memcpy(out->rndv_seg_eid, p.rndv_seg_eid, 16);
+    out->rndv_seg_uasid = p.rndv_seg_uasid;
 }
 
 void UrmaEndpoint::FillLocalHelloV3(UrmaHello* out) const {
@@ -400,6 +428,15 @@ void UrmaEndpoint::FillLocalHelloV3(UrmaHello* out) const {
         out->set_recv_buf_seg_eid(p.recv_buf_seg_eid, 16);
         out->set_recv_buf_seg_uasid(p.recv_buf_seg_uasid);
         out->set_io_mode(p.io_mode);
+    }
+    // RNDV parameters.
+    if (p.rndv_enabled) {
+        out->set_rndv_enabled(true);
+        out->set_rndv_buf_va(p.rndv_buf_va);
+        out->set_rndv_buf_size(p.rndv_buf_size);
+        out->set_rndv_seg_token_id(p.rndv_seg_token_id);
+        out->set_rndv_seg_eid(p.rndv_seg_eid, 16);
+        out->set_rndv_seg_uasid(p.rndv_seg_uasid);
     }
 }
 
@@ -490,6 +527,22 @@ int UrmaEndpoint::ReadAndParseHelloV3(ParsedHello* out, bool* negotiated) {
                 out->recv_buf_seg_uasid = msg.recv_buf_seg_uasid();
             }
         }
+    }
+    // RNDV parameters (v3 extension).
+    LOG(INFO) << "ReadAndParseHelloV3: RNDV has_rndv_enabled=" << msg.has_rndv_enabled()
+              << " rndv_enabled=" << (msg.has_rndv_enabled() ? msg.rndv_enabled() : false)
+              << " has_rndv_buf_va=" << msg.has_rndv_buf_va()
+              << " on " << _socket->description();
+    if (msg.has_rndv_enabled() && msg.rndv_enabled()) {
+        out->rndv_enabled = true;
+        out->rndv_buf_va = msg.rndv_buf_va();
+        out->rndv_buf_size = msg.rndv_buf_size();
+        out->rndv_seg_token_id = msg.rndv_seg_token_id();
+        if (msg.rndv_seg_eid().size() == 16) {
+            std::memcpy(out->rndv_seg_eid,
+                        msg.rndv_seg_eid().data(), 16);
+        }
+        out->rndv_seg_uasid = msg.rndv_seg_uasid();
     }
     if (!ValidHello(*out)) {
         return 0;
@@ -722,10 +775,22 @@ int UrmaEndpoint::AllocateOneSidedBuffers() {
               << " total=" << total
               << " io_mode=" << static_cast<int>(_io_mode)
               << " on " << _socket->description();
+
+    // Allocate RNDV buffer for HYBRID mode when enabled.
+    if (_io_mode == 2 && FLAGS_urma_rndv_enabled) {
+        _rndv_enabled = true;
+        if (AllocateRndvBuffer() != 0) {
+            LOG(WARNING) << "Failed to allocate RNDV buffer; "
+                         << "large messages will use PRE_WRITE+READ on "
+                         << _socket->description();
+            _rndv_enabled = false;
+        }
+    }
     return 0;
 }
 
 void UrmaEndpoint::DeallocateOneSidedBuffers() {
+    DeallocateRndvBuffer();
     if (_send_buf_alloc) {
         delete _send_buf_alloc;
         _send_buf_alloc = nullptr;
@@ -746,6 +811,87 @@ void UrmaEndpoint::DeallocateOneSidedBuffers() {
         delete pair.second;
     }
     _pending_sends.clear();
+}
+
+int UrmaEndpoint::AllocateRndvBuffer() {
+    if (_rndv_buf) return 0;
+    // Total RNDV region: half for TX (sender copies here), half for RX
+    // (READ destinations). Both halves share one mmap + one URMA segment.
+    const uint32_t total_kb = static_cast<uint32_t>(
+        std::max(1, FLAGS_urma_rndv_buf_size)) * 1024;
+    const uint32_t total_aligned = (total_kb + URMA_ONE_SIDED_ALLOC_UNIT - 1) /
+                                   URMA_ONE_SIDED_ALLOC_UNIT *
+                                   URMA_ONE_SIDED_ALLOC_UNIT;
+    _rndv_buf_capacity = total_aligned / 2;
+    _rndv_rx_capacity = total_aligned / 2;
+
+    _rndv_buf = mmap(nullptr, total_aligned, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (_rndv_buf == MAP_FAILED) {
+        PLOG(ERROR) << "Fail to mmap RNDV buffer";
+        _rndv_buf = nullptr;
+        return -1;
+    }
+
+    urma_context_t* ctx = GetUrmaContext();
+    if (!ctx) {
+        errno = ENODEV;
+        return -1;
+    }
+    urma_reg_seg_flag_t rflag{};
+    rflag.bs.token_policy = URMA_TOKEN_NONE;
+    rflag.bs.cacheable = URMA_NON_CACHEABLE;
+    rflag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    urma_seg_cfg_t rcfg{};
+    rcfg.va = reinterpret_cast<uint64_t>(_rndv_buf);
+    rcfg.len = total_aligned;
+    rcfg.token_id = nullptr;
+    rcfg.token_value = {};
+    rcfg.flag = rflag;
+    rcfg.user_ctx = reinterpret_cast<uint64_t>(_rndv_buf);
+    rcfg.iova = 0;
+    _rndv_buf_tseg = urma_register_seg(ctx, &rcfg);
+    if (!_rndv_buf_tseg) {
+        PLOG(ERROR) << "Fail to register RNDV segment";
+        munmap(_rndv_buf, total_aligned);
+        _rndv_buf = nullptr;
+        return -1;
+    }
+
+    _rndv_buf_alloc = new UrmaRingBuf();
+    _rndv_buf_alloc->Init(_rndv_buf_capacity);
+    _rndv_rx_alloc = new UrmaRingBuf();
+    _rndv_rx_alloc->Init(_rndv_rx_capacity);
+    LOG(INFO) << "Allocated RNDV buffer: tx=" << _rndv_buf_capacity
+              << " rx=" << _rndv_rx_capacity
+              << " on " << _socket->description();
+    return 0;
+}
+
+void UrmaEndpoint::DeallocateRndvBuffer() {
+    if (_remote_rndv_seg) {
+        urma_unimport_seg(_remote_rndv_seg);
+        _remote_rndv_seg = nullptr;
+    }
+    if (_rndv_rx_alloc) {
+        delete _rndv_rx_alloc;
+        _rndv_rx_alloc = nullptr;
+    }
+    if (_rndv_buf_alloc) {
+        delete _rndv_buf_alloc;
+        _rndv_buf_alloc = nullptr;
+    }
+    if (_rndv_buf_tseg) {
+        urma_unregister_seg(_rndv_buf_tseg);
+        _rndv_buf_tseg = nullptr;
+    }
+    if (_rndv_buf) {
+        munmap(_rndv_buf, _rndv_buf_capacity + _rndv_rx_capacity);
+        _rndv_buf = nullptr;
+    }
+    _rndv_buf_capacity = 0;
+    _rndv_rx_capacity = 0;
+    _rndv_enabled = false;
 }
 
 // Post empty recv WRs: num_sge=1, len=0. These are consumed by incoming
@@ -782,6 +928,21 @@ int UrmaEndpoint::PostEmptyRecvWr(uint32_t count) {
         }
     }
     return 0;
+}
+
+void UrmaEndpoint::RepostEmptyRecvWr() {
+    const uint16_t deficit = _empty_rq_deficit.fetch_add(
+        1, butil::memory_order_relaxed) + 1;
+    // Low-water mark: batch repost when deficit reaches 1/4 of RQ depth.
+    const uint16_t low_water = _rq_size / 4;
+    if (deficit >= low_water) {
+        // CAS to claim the deficit for this batch.
+        uint16_t expected = deficit;
+        if (_empty_rq_deficit.compare_exchange_strong(
+                expected, 0, butil::memory_order_acq_rel)) {
+            PostEmptyRecvWr(deficit);
+        }
+    }
 }
 
 UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t request_id) {
@@ -879,6 +1040,16 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
         bonding_remote.jetty = _resource->jetty;
         _resource->remote_jetty =
             urma_import_jetty(ctx, &bonding_remote.base, &token);
+        // Fallback: if bonding extension import fails with EPERM (kernel
+        // driver rejects has_drv_ext when context uasid=0), retry with a
+        // plain import. One-way traffic is better than no traffic.
+        if (!_resource->remote_jetty && errno == EPERM) {
+            LOG(WARNING) << "Bonding extension import failed with EPERM, "
+                         << "retrying with plain import on "
+                         << _socket->description();
+            errno = 0;
+            _resource->remote_jetty = urma_import_jetty(ctx, &remote, &token);
+        }
 #else
         LOG(ERROR) << "Bonding remote jetty import requires provider header "
                       "urma_ubagg.h";
@@ -984,9 +1155,16 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // WRITE_ONLY: all sizes use WriteInline.
         return WriteInline(from, ndata);
     }
-    // HYBRID: small IO uses WriteInline, large IO uses WriteZeroCopy.
+    // HYBRID: small IO uses WriteInline, large IO uses WriteZeroCopy or RNDV.
     if (total <= static_cast<size_t>(FLAGS_urma_inline_threshold)) {
         return WriteInline(from, ndata);
+    }
+    // RNDV path for large messages when enabled.
+    if (_rndv_enabled &&
+        total > static_cast<size_t>(FLAGS_urma_rndv_threshold) * 1024) {
+        ssize_t ret = WriteRndv(from, ndata);
+        // Fall back to WriteZeroCopy on EAGAIN (RNDV buffer full or flow control).
+        if (ret >= 0 || errno != EAGAIN) return ret;
     }
     return WriteZeroCopy(from, ndata);
 }
@@ -1450,8 +1628,147 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     return static_cast<ssize_t>(total_payload);
 }
 
-// Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to the
-// peer's send_buf at the mirrored offset.
+// RNDV path: copy IOBuf data to a contiguous pre-registered buffer, send a
+// small control message via WRITE_IMM. The receiver issues a single READ WR
+// to pull the entire message. SQ consumption: 1 slot (sender) + 1 (receiver).
+ssize_t UrmaEndpoint::WriteRndv(butil::IOBuf** from, size_t ndata) {
+    if (!_resource || !_resource->jetty || !_resource->remote_jetty ||
+        !_rndv_buf || !_rndv_buf_alloc || !_rndv_buf_tseg ||
+        !_send_buf_alloc || !_send_buf_tseg || !_one_sided_buf) {
+        errno = ENOTCONN;
+        return -1;
+    }
+
+    // 1. Calculate total size.
+    size_t total = 0;
+    for (size_t i = 0; i < ndata; ++i) total += from[i]->size();
+    if (total == 0) return 0;
+
+    // 2. Flow control: limit concurrent RNDV ops based on buffer capacity.
+    // The buffer allocator is the primary gate — if it can satisfy the
+    // allocation, we proceed. The inflight counter prevents unbounded
+    // queueing when the allocator has fragmented free space.
+    const uint16_t max_inflight = static_cast<uint16_t>(
+        _rndv_buf_capacity / 1024 > 0 ? _rndv_buf_capacity / 1024 : 1);
+    uint16_t inflight = _rndv_inflight.load(butil::memory_order_relaxed);
+    if (inflight >= max_inflight) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    // 3. Allocate contiguous RNDV buffer.
+    uint32_t rndv_offset = 0;
+    if (!_rndv_buf_alloc->Allocate(static_cast<uint32_t>(total), &rndv_offset)) {
+        errno = EAGAIN;
+        return -1;
+    }
+
+    // 4. Copy IOBuf data to RNDV buffer.
+    char* rndv_ptr = static_cast<char*>(_rndv_buf) + rndv_offset;
+    size_t copied = 0;
+    for (size_t i = 0; i < ndata; ++i) {
+        copied += from[i]->copy_to(rndv_ptr + copied);
+    }
+
+    // 5. Build control message in send_buf.
+    const uint32_t ctrl_msg_size =
+        sizeof(UrmaMessageHead) + sizeof(RndvDescriptor);
+    uint32_t ctrl_offset = 0;
+    if (!_send_buf_alloc->Allocate(ctrl_msg_size, &ctrl_offset)) {
+        _rndv_buf_alloc->Release(rndv_offset, static_cast<uint32_t>(total));
+        errno = EAGAIN;
+        return -1;
+    }
+
+    char* send_buf = static_cast<char*>(_one_sided_buf) + _recv_buf_capacity;
+    char* dst = send_buf + ctrl_offset;
+    const uint64_t request_id = _one_sided_seq.fetch_add(
+        1, butil::memory_order_relaxed);
+
+    UrmaMessageHead* head = reinterpret_cast<UrmaMessageHead*>(dst);
+    head->magic = URMA_CTRL_MAGIC;
+    head->message_size = ctrl_msg_size;
+    head->data_count = 1;
+    head->flags = 0;
+    head->request_id = request_id;
+
+    auto* rndv_desc = reinterpret_cast<RndvDescriptor*>(
+        dst + sizeof(UrmaMessageHead));
+    rndv_desc->addr = reinterpret_cast<uint64_t>(rndv_ptr);
+    rndv_desc->total_size = static_cast<uint32_t>(total);
+    rndv_desc->reserved = 0;
+
+    // 6. WRITE_IMM the control message to peer's recv_buf.
+    urma_sge_t src_sge{};
+    src_sge.addr = reinterpret_cast<uint64_t>(dst);
+    src_sge.len = ctrl_msg_size;
+    src_sge.tseg = _send_buf_tseg;
+    src_sge.user_tseg = nullptr;
+
+    urma_sge_t dst_sge{};
+    dst_sge.addr = _remote_recv_buf_va + ctrl_offset;
+    dst_sge.len = ctrl_msg_size;
+    dst_sge.tseg = _resource->remote_recv_buf_seg;
+    dst_sge.user_tseg = nullptr;
+
+    urma_jfs_wr_t wr{};
+    std::memset(&wr, 0, sizeof(wr));
+    wr.opcode = URMA_OPC_WRITE_IMM;
+    wr.flag.bs.complete_enable = 1;
+    wr.tjetty = _resource->remote_jetty;
+    wr.rw.src.sge = &src_sge;
+    wr.rw.src.num_sge = 1;
+    wr.rw.dst.sge = &dst_sge;
+    wr.rw.dst.num_sge = 1;
+
+    UrmaWriteImmData imm{};
+    imm.io.opcode = URMA_IO_RNDV;
+    imm.io.buffer_offset = static_cast<uint16_t>(
+        ctrl_offset / URMA_ONE_SIDED_ALLOC_UNIT);
+    wr.rw.notify_data = imm.data;
+    wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, request_id);
+
+    // 7. Save send context.
+    auto* ctx = new UrmaSendContext();
+    ctx->request_id = request_id;
+    ctx->send_buf_offset = ctrl_offset;
+    ctx->send_buf_size = ctrl_msg_size;
+    ctx->opcode = URMA_IO_RNDV;
+    ctx->rndv_offset = rndv_offset;
+    ctx->rndv_size = static_cast<uint32_t>(total);
+    for (size_t i = 0; i < ndata; ++i) {
+        ctx->saved_blocks.append(*from[i]);
+    }
+    {
+        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+        _pending_sends[request_id] = ctx;
+    }
+    _rndv_inflight.fetch_add(1, butil::memory_order_relaxed);
+
+    // 8. Post WRITE_IMM.
+    _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+    urma_jfs_wr_t* bad = nullptr;
+    const urma_status_t status =
+        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    if (status != URMA_SUCCESS) {
+        const int provider_errno = errno;
+        _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
+        _rndv_inflight.fetch_sub(1, butil::memory_order_relaxed);
+        _send_buf_alloc->Release(ctrl_offset, ctrl_msg_size);
+        _rndv_buf_alloc->Release(rndv_offset, static_cast<uint32_t>(total));
+        FindAndRemoveSendContext(request_id);
+        delete ctx;
+        LOG(WARNING) << "WriteRndv: urma_post_jetty_send_wr failed: "
+                     << status << " provider_errno=" << provider_errno
+                     << " on " << _socket->description();
+        errno = status;
+        return -1;
+    }
+
+    // 9. Consume IOBuf data.
+    for (size_t i = 0; i < ndata; ++i) from[i]->clear();
+    return static_cast<ssize_t>(total);
+}
 int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
                                        uint64_t request_id,
                                        uint32_t message_size) {
@@ -1893,10 +2210,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     if (cr.opcode == URMA_CR_OPC_WRITE_WITH_IMM) {
         // Decode the immediate data to determine the one-sided opcode.
         const UrmaWriteImmData imm{cr.imm_data};
-        const uint32_t offset = imm.io.buffer_offset *
-                                URMA_ONE_SIDED_ALLOC_UNIT;
         if (imm.io.opcode == URMA_IO_WRITE_IN_BAND ||
-            imm.io.opcode == URMA_IO_PRE_WRITE) {
+            imm.io.opcode == URMA_IO_PRE_WRITE ||
+            imm.io.opcode == URMA_IO_RNDV) {
             return HandleWriteImmCompletion(cr);
         }
         if (imm.io.opcode == URMA_IO_WRITE_IN_BAND_ACK) {
@@ -2027,7 +2343,7 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
 
         // Repost the empty recv WR that was consumed by this WRITE_IMM.
         if (_io_mode != 0) {
-            PostEmptyRecvWr(1);
+            RepostEmptyRecvWr();
         }
         return static_cast<ssize_t>(data_count);
     }
@@ -2052,11 +2368,6 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
 
         // Build READ WR chain: src=remote block, dst=local pool buffer.
         uint32_t total_bytes = 0;
-        const size_t recv_block_size = GetUrmaRecvBlockSize();
-        // We need to post READ WRs. Each READ pulls one block from the
-        // sender's pool into a local pool buffer.
-        urma_jfs_wr_t* wr_head = nullptr;
-        urma_jfs_wr_t* wr_tail = nullptr;
         // Use heap allocation for WR and SGE arrays (must survive until
         // urma_post_jetty_send_wr copies them internally).
         std::unique_ptr<urma_jfs_wr_t[]> wrs(
@@ -2146,9 +2457,100 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
 
         // Repost the empty recv WR.
         if (_io_mode != 0) {
-            PostEmptyRecvWr(1);
+            RepostEmptyRecvWr();
         }
         return 0;  // Data will be delivered when READs complete.
+    }
+
+    if (imm.io.opcode == URMA_IO_RNDV) {
+        // RNDV: peer has copied data to a contiguous buffer. Issue 1 READ.
+        const auto* rndv_desc = reinterpret_cast<const RndvDescriptor*>(
+            recv_buf + offset + sizeof(UrmaMessageHead));
+        const uint64_t remote_addr = rndv_desc->addr;
+        const uint32_t total_size = rndv_desc->total_size;
+
+        // Allocate an RX slot.
+        const uint64_t seq = _rx_consume_seq.fetch_add(
+            1, butil::memory_order_relaxed);
+        const uint32_t idx = static_cast<uint32_t>(
+            seq % URMA_RX_RING_SIZE);
+        UrmaRxSlot& slot = _rx_slots[idx];
+        slot.Reset();
+        slot.state.store(UrmaRxSlot::READING, butil::memory_order_relaxed);
+        slot.write_imm = imm.data;
+        slot.request_id = head->request_id;
+        slot.total_bytes = total_size;
+
+        // Allocate contiguous READ destination from pre-registered RNDV RX
+        // buffer. The entire region is covered by _rndv_buf_tseg, so the
+        // URMA driver can verify local access.
+        uint32_t rx_offset = 0;
+        if (!_rndv_rx_alloc ||
+            !_rndv_rx_alloc->Allocate(total_size, &rx_offset)) {
+            LOG(ERROR) << "HandleRndv: failed to alloc RNDV RX buffer (size="
+                       << total_size << ") on " << _socket->description();
+            errno = ENOMEM;
+            return -1;
+        }
+        char* rx_data = static_cast<char*>(_rndv_buf) +
+                        _rndv_buf_capacity + rx_offset;
+        slot.read_targets.push_back({rx_data, total_size});
+        // Store RX offset for later release.
+        slot.rndv_rx_offset = rx_offset;
+        slot.rndv_rx_size = total_size;
+
+        // Build single READ WR: src=peer's RNDV buf, dst=local RNDV RX buf.
+        urma_sge_t src_sge{};
+        src_sge.addr = remote_addr;
+        src_sge.len = total_size;
+        src_sge.tseg = _remote_rndv_seg;  // peer's RNDV segment
+        src_sge.user_tseg = nullptr;
+
+        urma_sge_t dst_sge{};
+        dst_sge.addr = reinterpret_cast<uint64_t>(rx_data);
+        dst_sge.len = total_size;
+        dst_sge.tseg = _rndv_buf_tseg;  // local RNDV segment (covers TX+RX)
+        dst_sge.user_tseg = nullptr;
+
+        urma_jfs_wr_t wr{};
+        std::memset(&wr, 0, sizeof(wr));
+        wr.opcode = URMA_OPC_READ;
+        wr.flag.bs.complete_enable = 1;
+        wr.tjetty = _resource->remote_jetty;
+        wr.rw.src.sge = &src_sge;
+        wr.rw.src.num_sge = 1;
+        wr.rw.dst.sge = &dst_sge;
+        wr.rw.dst.num_sge = 1;
+        wr.user_ctx = EncodeUserCtx(READ_DATA_REQUEST, seq);
+
+        // Consume 1 SQ slot.
+        if (_sq_window_size.load(butil::memory_order_relaxed) < 1) {
+            LOG(WARNING) << "HandleRndv: SQ window empty on "
+                         << _socket->description();
+            slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
+            errno = EAGAIN;
+            return -1;
+        }
+        _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
+        slot.sq_slots_used = 1;
+
+        urma_jfs_wr_t* bad = nullptr;
+        const urma_status_t status =
+            urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+        if (status != URMA_SUCCESS) {
+            const int provider_errno = errno;
+            _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
+            LOG(WARNING) << "HandleRndv: READ post failed: status=" << status
+                         << " provider_errno=" << provider_errno
+                         << " total_size=" << total_size
+                         << " on " << _socket->description();
+            slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
+            errno = status;
+            return -1;
+        }
+
+        if (_io_mode != 0) RepostEmptyRecvWr();
+        return 0;  // Data will be delivered when READ completes.
     }
 
     LOG(WARNING) << "HandleWriteImmCompletion: unexpected opcode="
@@ -2189,6 +2591,11 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
                         slot.request_id,
                         0);
 
+    // Release RNDV RX buffer if this was a RNDV READ.
+    if (slot.rndv_rx_size > 0 && _rndv_rx_alloc) {
+        _rndv_rx_alloc->Release(slot.rndv_rx_offset, slot.rndv_rx_size);
+    }
+
     // Clean up the slot.
     slot.Reset();
 
@@ -2201,29 +2608,33 @@ void UrmaEndpoint::HandleWriteInBandAck(const urma_cr_t& cr) {
     const UrmaWriteImmData imm{cr.imm_data};
     const uint32_t offset = imm.io.buffer_offset * URMA_ONE_SIDED_ALLOC_UNIT;
 
-    // Find the send context by request_id from the UrmaMessageHead in
-    // our send_buf. But we don't know the request_id from the ACK alone.
-    // Instead, we search pending_sends by offset.
-    {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-        for (auto it = _pending_sends.begin(); it != _pending_sends.end(); ++it) {
-            if (it->second->send_buf_offset == offset &&
-                it->second->opcode == URMA_IO_WRITE_IN_BAND) {
-                _send_buf_alloc->Release(offset, it->second->send_buf_size);
-                delete it->second;
-                _pending_sends.erase(it);
-                _socket->WakeAsEpollOut();
-                goto repost;
-            }
+    // Read the UrmaMessageHead from our send_buf to get the request_id.
+    // The peer's ResponseCtrlMessage wrote this head (with request_id) into
+    // our send_buf at the mirrored offset via WRITE_IMM.
+    char* send_buf = static_cast<char*>(_one_sided_buf) + _recv_buf_capacity;
+    const UrmaMessageHead* head =
+        reinterpret_cast<const UrmaMessageHead*>(send_buf + offset);
+    if (head->magic != URMA_CTRL_MAGIC) {
+        LOG(ERROR) << "HandleWriteInBandAck: bad magic on "
+                   << _socket->description();
+    } else {
+        UrmaSendContext* ctx = FindAndRemoveSendContext(head->request_id);
+        if (ctx) {
+            _send_buf_alloc->Release(ctx->send_buf_offset,
+                                     ctx->send_buf_size);
+            delete ctx;
+        } else {
+            LOG(WARNING) << "HandleWriteInBandAck: no pending send for "
+                         << "request_id=" << head->request_id
+                         << " offset=" << offset
+                         << " on " << _socket->description();
         }
     }
-    LOG(WARNING) << "HandleWriteInBandAck: no pending send for offset="
-                 << offset << " on " << _socket->description();
+    _socket->WakeAsEpollOut();
 
-repost:
     // Repost the recv WR consumed by this WRITE_IMM ACK.
     if (_io_mode != 0) {
-        PostEmptyRecvWr(1);
+        RepostEmptyRecvWr();
     }
 }
 
@@ -2246,13 +2657,18 @@ void UrmaEndpoint::HandlePostWrite(const urma_cr_t& cr) {
     UrmaSendContext* ctx = FindAndRemoveSendContext(head->request_id);
     if (ctx) {
         _send_buf_alloc->Release(ctx->send_buf_offset, ctx->send_buf_size);
+        // Release RNDV buffer if this was a RNDV send.
+        if (ctx->opcode == URMA_IO_RNDV && _rndv_buf_alloc) {
+            _rndv_buf_alloc->Release(ctx->rndv_offset, ctx->rndv_size);
+            _rndv_inflight.fetch_sub(1, butil::memory_order_relaxed);
+        }
         delete ctx;  // releases saved_blocks
     }
     _socket->WakeAsEpollOut();
 
     // Repost the recv WR consumed by this WRITE_IMM POST_WRITE.
     if (_io_mode != 0) {
-        PostEmptyRecvWr(1);
+        RepostEmptyRecvWr();
     }
 }
 
@@ -2512,6 +2928,47 @@ void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
                               << "falling back to SEND_ONLY";
                 _io_mode = 0;
             }
+        }
+        // RNDV negotiation: both sides must have RNDV enabled.
+        LOG(INFO) << "RNDV negotiation: local_enabled=" << _rndv_enabled
+                  << " remote_enabled=" << remote.rndv_enabled
+                  << " remote_buf_size=" << remote.rndv_buf_size
+                  << " on " << _socket->description();
+        if (_rndv_enabled && remote.rndv_enabled &&
+            remote.rndv_buf_size > 0) {
+            _remote_rndv_buf_va = remote.rndv_buf_va;
+            _remote_rndv_buf_size = remote.rndv_buf_size;
+            // Import peer's RNDV segment so we can READ from it.
+            urma_context_t* ctx = GetUrmaContext();
+            if (ctx) {
+                urma_seg_t peer_rndv_seg{};
+                std::memcpy(peer_rndv_seg.ubva.eid.raw,
+                            remote.rndv_seg_eid, 16);
+                peer_rndv_seg.ubva.uasid = remote.rndv_seg_uasid;
+                peer_rndv_seg.ubva.va = remote.rndv_buf_va;
+                peer_rndv_seg.len = remote.rndv_buf_size;
+                peer_rndv_seg.token_id = remote.rndv_seg_token_id;
+                urma_token_t seg_token{};
+                urma_import_seg_flag_t rseg_flag{};
+                rseg_flag.bs.cacheable = URMA_NON_CACHEABLE;
+                rseg_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+                rseg_flag.bs.mapping = URMA_SEG_NOMAP;
+                _remote_rndv_seg = urma_import_seg(
+                    ctx, &peer_rndv_seg, &seg_token, 0, rseg_flag);
+                if (!_remote_rndv_seg) {
+                    PLOG(WARNING) << "Failed to import peer RNDV seg; "
+                                  << "RNDV disabled on "
+                                  << _socket->description();
+                    _rndv_enabled = false;
+                } else {
+                    LOG(INFO) << "RNDV enabled: remote_buf_va=0x"
+                              << std::hex << _remote_rndv_buf_va
+                              << std::dec << " size=" << _remote_rndv_buf_size
+                              << " on " << _socket->description();
+                }
+            }
+        } else {
+            _rndv_enabled = false;
         }
     } else {
         _io_mode = 0;
