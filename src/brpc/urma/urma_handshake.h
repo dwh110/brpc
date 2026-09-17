@@ -73,17 +73,6 @@ struct ParsedHello {
     // field present and non-zero). Used to decide whether to enable the
     // one-sided path.
     bool has_one_sided = false;
-
-    // ---- RNDV protocol parameters (v3 extension) ----
-    // RNDV allows large messages to be transferred with a single READ WR
-    // instead of N READ WRs. Both sides must have RNDV enabled and have
-    // allocated an RNDV buffer.
-    bool rndv_enabled = false;
-    uint64_t rndv_buf_va = 0;
-    uint32_t rndv_buf_size = 0;
-    uint32_t rndv_seg_token_id = 0;
-    uint8_t rndv_seg_eid[16] = {0};
-    uint32_t rndv_seg_uasid = 0;
 };
 
 // Validate all values that influence resource import and queue/window sizing.
@@ -97,12 +86,12 @@ bool ValidHello(const ParsedHello& hello);
 namespace v2_wire {
 
 constexpr size_t MAGIC_STR_LEN = 4;
-constexpr size_t HELLO_BODY_LEN = 198;
-constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 202
+constexpr size_t HELLO_BODY_LEN = 158;
+constexpr size_t HELLO_PACKET_LEN = MAGIC_STR_LEN + HELLO_BODY_LEN;  // 162
 constexpr size_t HELLO_MSG_LEN_MIN = HELLO_PACKET_LEN;
 constexpr size_t HELLO_MSG_LEN_MAX = 4096;
 constexpr uint16_t HELLO_V2_VERSION = 2;
-constexpr uint16_t IMPL_V2_VERSION = 3;  // bumped to 3 for RNDV extension
+constexpr uint16_t IMPL_V2_VERSION = 2;  // bumped to 2 for one-sided extension
 
 // The serializable struct. Aligned so it can be reinterpreted as raw bytes.
 struct HelloMessage {
@@ -135,14 +124,6 @@ struct HelloMessage {
     uint32_t send_buf_token_id;    // peer send_buf segment token id
     uint8_t send_buf_seg_eid[16];  // peer send_buf segment EID
     uint32_t send_buf_seg_uasid;   // peer send_buf segment uasid
-    // ---- RNDV extension (impl_ver >= 3) ----
-    uint8_t rndv_enabled;          // 1 if RNDV buffer is allocated
-    uint8_t pad3[3];              // alignment to 8 bytes
-    uint64_t rndv_buf_va;         // RNDV buffer virtual address
-    uint32_t rndv_buf_size;       // RNDV buffer size in bytes
-    uint32_t rndv_seg_token_id;   // RNDV segment token id
-    uint8_t rndv_seg_eid[16];     // RNDV segment EID
-    uint32_t rndv_seg_uasid;      // RNDV segment uasid
 
     void Serialize(void* buf) const;   // host -> network order, write to buf
     void Deserialize(const void* buf);  // network -> host order, read from buf

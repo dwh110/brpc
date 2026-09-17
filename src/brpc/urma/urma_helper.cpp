@@ -149,21 +149,6 @@ DEFINE_int32(urma_recv_buf_size, 128,
              "Size in KB of the per-connection recv_buf for one-sided "
              "operations. Must be a multiple of 1KB. Used as the "
              "destination buffer for incoming WRITE_IMM data.");
-DEFINE_bool(urma_rndv_enabled, true,
-            "Enable RNDV protocol for large messages in HYBRID mode. "
-            "When enabled, messages above --urma_rndv_threshold are copied "
-            "to a pre-registered RNDV buffer and the receiver issues a "
-            "single READ WR instead of N READ WRs.");
-DEFINE_int32(urma_rndv_buf_size, 32768,
-             "Size in KB of the per-connection RNDV buffer. Split equally "
-             "into TX (sender copy) and RX (READ destination) halves. Must "
-             "be large enough for max_message_size * queue_depth. Default "
-             "32MB = 16MB TX + 16MB RX, supports 16 concurrent 1MB or "
-             "2 concurrent 8MB RNDV operations.");
-DEFINE_int32(urma_rndv_threshold, 256,
-             "Message size threshold in KB above which RNDV is used instead "
-             "of PRE_WRITE+READ. Only applies when --urma_rndv_enabled and "
-             "--urma_io_mode=2.");
 
 
 // Set to true to skip real URMA hardware initialization (unit tests). When

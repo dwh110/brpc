@@ -65,7 +65,6 @@ enum UrmaIoOpcode : uint8_t {
     URMA_IO_POST_WRITE      = 2,  // ack: "READ done, you can release send_buf"
     URMA_IO_WRITE_IN_BAND   = 3,  // small IO: data written inline into recv_buf
     URMA_IO_WRITE_IN_BAND_ACK = 4,  // ack: "data consumed, you can release send_buf"
-    URMA_IO_RNDV             = 5,  // RNDV: single READ for entire message
 };
 
 // 64-bit immediate data carried by WRITE_IMM WRs.
@@ -104,15 +103,6 @@ struct PageBufferInMessage {
     uint32_t seg_token_id;   // sender's pool segment token id (unused; pool
                              // seg is already imported via handshake)
 };
-
-// RNDV descriptor: sent in the control message after UrmaMessageHead when
-// opcode == URMA_IO_RNDV. Tells the receiver where to READ the full message.
-struct RndvDescriptor {
-    uint64_t addr;        // sender's rndv_buf virtual address
-    uint32_t total_size;  // total message size in bytes
-    uint32_t reserved;    // alignment padding
-};
-static_assert(sizeof(RndvDescriptor) == 16, "RndvDescriptor must be 16 bytes");
 
 // Allocation granularity for send_buf / recv_buf (bytes).
 constexpr uint32_t URMA_ONE_SIDED_ALLOC_UNIT = 1024;
@@ -239,9 +229,6 @@ struct UrmaRxSlot {
     uint32_t total_bytes{0}; // total bytes to receive across all READs
     uint32_t received_bytes{0};
     uint16_t sq_slots_used{0}; // SQ slots consumed by READ WRs (for reclaim)
-    // RNDV RX buffer offset (for release in HandleReadCompletion).
-    uint32_t rndv_rx_offset{0};
-    uint32_t rndv_rx_size{0};
     // READ target buffers: {local_addr, size} pairs. Data is copied from
     // these into _socket->_read_buf after all READs complete.
     std::vector<std::pair<void*, size_t>> read_targets;
@@ -257,8 +244,6 @@ struct UrmaRxSlot {
         total_bytes = 0;
         received_bytes = 0;
         sq_slots_used = 0;
-        rndv_rx_offset = 0;
-        rndv_rx_size = 0;
         read_targets.clear();
         recv_bufs.clear();
     }
@@ -272,11 +257,8 @@ struct UrmaSendContext {
     uint64_t request_id{0};
     uint32_t send_buf_offset{0};  // byte offset in send_buf
     uint32_t send_buf_size{0};    // allocated size in send_buf
-    uint8_t opcode{0};            // URMA_IO_WRITE_IN_BAND / PRE_WRITE / RNDV
+    uint8_t opcode{0};            // URMA_IO_WRITE_IN_BAND or URMA_IO_PRE_WRITE
     butil::IOBuf saved_blocks;    // large IO: holds IOBuf block refs
-    // RNDV-specific (valid when opcode == URMA_IO_RNDV).
-    uint32_t rndv_offset{0};      // offset in _rndv_buf
-    uint32_t rndv_size{0};        // size allocated in _rndv_buf
 
     UrmaSendContext() = default;
 };

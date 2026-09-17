@@ -136,16 +136,6 @@ void HelloMessage::Serialize(void* buf) const {
     std::memcpy(p, send_buf_seg_eid, sizeof(send_buf_seg_eid));
     p += sizeof(send_buf_seg_eid);
     write32(send_buf_seg_uasid);
-    // RNDV extension (impl_ver >= 3).
-    *p++ = rndv_enabled;
-    std::memset(p, 0, sizeof(pad3));
-    p += sizeof(pad3);
-    write64(rndv_buf_va);
-    write32(rndv_buf_size);
-    write32(rndv_seg_token_id);
-    std::memcpy(p, rndv_seg_eid, sizeof(rndv_seg_eid));
-    p += sizeof(rndv_seg_eid);
-    write32(rndv_seg_uasid);
 }
 
 void HelloMessage::Deserialize(const void* buf) {
@@ -202,15 +192,6 @@ void HelloMessage::Deserialize(const void* buf) {
     std::memcpy(send_buf_seg_eid, p, sizeof(send_buf_seg_eid));
     p += sizeof(send_buf_seg_eid);
     send_buf_seg_uasid = read32();
-    // RNDV extension (impl_ver >= 3).
-    rndv_enabled = *p++;
-    p += sizeof(pad3);
-    rndv_buf_va = read64();
-    rndv_buf_size = read32();
-    rndv_seg_token_id = read32();
-    std::memcpy(rndv_seg_eid, p, sizeof(rndv_seg_eid));
-    p += sizeof(rndv_seg_eid);
-    rndv_seg_uasid = read32();
 }
 
 }  // namespace v2_wire
@@ -289,13 +270,6 @@ int ReadBodyAndNegotiate(UrmaEndpoint* ep, ParsedHello* out, bool* negotiated) {
     p.send_buf_token_id = m.send_buf_token_id;
     std::memcpy(p.send_buf_seg_eid, m.send_buf_seg_eid, 16);
     p.send_buf_seg_uasid = m.send_buf_seg_uasid;
-    // RNDV fields (impl_ver >= 3).
-    p.rndv_enabled = (m.rndv_enabled != 0);
-    p.rndv_buf_va = m.rndv_buf_va;
-    p.rndv_buf_size = m.rndv_buf_size;
-    p.rndv_seg_token_id = m.rndv_seg_token_id;
-    std::memcpy(p.rndv_seg_eid, m.rndv_seg_eid, 16);
-    p.rndv_seg_uasid = m.rndv_seg_uasid;
     if (!ValidHello(p)) {
         return 0;
     }
