@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "butil/atomicops.h"
@@ -81,14 +82,15 @@ union UrmaWriteImmData {
 static_assert(sizeof(UrmaWriteImmData) == sizeof(uint64_t),
               "UrmaWriteImmData must be 64 bits");
 
-// Control message header (16 bytes, 4-byte aligned). Placed at the start
+// Control message header (24 bytes, 4-byte aligned). Placed at the start
 // of every one-sided buffer slot.
 struct UrmaMessageHead {
     uint32_t magic;          // URMA_CTRL_MAGIC
     uint32_t message_size;   // total allocated size (head + payload), bytes
     uint32_t data_count;     // WRITE_IN_BAND: payload byte count
                              // PRE_WRITE: number of PageBufferInMessage entries
-    uint32_t flags;          // reserved for future use
+    uint32_t flags;          // bits [0:15]=chunk_idx, bits [16:31]=total_chunks
+                             // single-chunk msg: chunk_idx=0, total_chunks=1
     uint64_t request_id;     // sender-side request ID for matching
 };
 static_assert(sizeof(UrmaMessageHead) == 24, "UrmaMessageHead must be 24 bytes");
@@ -106,6 +108,15 @@ struct PageBufferInMessage {
 
 // Allocation granularity for send_buf / recv_buf (bytes).
 constexpr uint32_t URMA_ONE_SIDED_ALLOC_UNIT = 1024;
+
+// Maximum payload per WRITE_IN_BAND chunk. Must fit in send_buf/recv_buf
+// alongside the 24-byte UrmaMessageHead and align to URMA_ONE_SIDED_ALLOC_UNIT.
+constexpr uint32_t URMA_CHUNK_PAYLOAD_MAX = 127 * 1024;  // 127KB
+
+// Maximum READ WRs posted per batch in the PRE_WRITE + READ path.
+// Inspired by UBS's TX_POST_BATCH_MAX=64. Keeps SQ window consumption
+// bounded regardless of message size.
+constexpr uint32_t URMA_READ_BATCH_MAX = 64;
 
 // Bitmap-based ring buffer allocator for send_buf / recv_buf.
 // ACK/POST_WRITE messages may release slots out of order, so a simple
@@ -228,13 +239,19 @@ struct UrmaRxSlot {
     uint64_t request_id{0};  // sender's request ID
     uint32_t total_bytes{0}; // total bytes to receive across all READs
     uint32_t received_bytes{0};
-    uint16_t sq_slots_used{0}; // SQ slots consumed by READ WRs (for reclaim)
+    uint16_t sq_slots_used{0}; // SQ slots consumed by current batch (for reclaim)
     // READ target buffers: {local_addr, size} pairs. Data is copied from
     // these into _socket->_read_buf after all READs complete.
     std::vector<std::pair<void*, size_t>> read_targets;
     // IOBuf objects that own the local pool buffers used as READ destinations.
     // These must stay alive until all READs complete and data is copied.
     std::vector<butil::IOBuf> recv_bufs;
+    // ---- Batched READ state (分批 READ + 完成驱动续发) ----
+    uint32_t total_blocks{0};      // total block count (across all batches)
+    uint32_t next_read_idx{0};     // next block index to post READ for
+    // PageBufferInMessage entries copied from the PRE_WRITE control message.
+    // Must survive across batches since recv_buf will be overwritten.
+    std::vector<PageBufferInMessage> entries;
 
     UrmaRxSlot() = default;
     void Reset() {
@@ -246,6 +263,9 @@ struct UrmaRxSlot {
         sq_slots_used = 0;
         read_targets.clear();
         recv_bufs.clear();
+        total_blocks = 0;
+        next_read_idx = 0;
+        entries.clear();
     }
 };
 
@@ -261,6 +281,25 @@ struct UrmaSendContext {
     butil::IOBuf saved_blocks;    // large IO: holds IOBuf block refs
 
     UrmaSendContext() = default;
+};
+
+// Receiver-side reassembly context for chunked WRITE_IN_BAND messages.
+// One per in-flight large message (identified by request_id).
+struct UrmaReasmCtx {
+    uint64_t request_id{0};
+    uint32_t total_chunks{0};
+    uint32_t received_chunks{0};
+    // Chunk data indexed by chunk_idx. Copied from recv_buf immediately
+    // on arrival (recv_buf will be overwritten by next WRITE_IMM).
+    std::vector<std::string> chunks;
+
+    UrmaReasmCtx() = default;
+    void Reset() {
+        request_id = 0;
+        total_chunks = 0;
+        received_chunks = 0;
+        chunks.clear();
+    }
 };
 
 // user_ctx encoding for one-sided WRs. Since urma_cr_opcode_t has no

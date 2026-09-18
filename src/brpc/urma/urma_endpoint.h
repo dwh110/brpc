@@ -396,6 +396,18 @@ private:
     UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
     butil::atomic<uint64_t> _rx_consume_seq{0};
 
+    // ---- Chunked WRITE_IN_BAND state ----
+    // Sender-side: tracks current message's chunk progress across multiple
+    // CutFromIOBufList calls (KeepWrite is single-threaded per socket, so no
+    // concurrent access). Reset when all chunks of a message are sent.
+    uint32_t _chunked_chunk_idx{0};      // next chunk index to send
+    uint32_t _chunked_total_chunks{0};   // total chunks for current message
+    uint64_t _chunked_request_id{0};     // request_id for current message
+
+    // Receiver-side: reassembly contexts keyed by request_id.
+    std::mutex _reasm_mutex;
+    std::unordered_map<uint64_t, UrmaReasmCtx*> _reasm_ctxs;
+
     // ---- One-sided methods ----
     int AllocateOneSidedBuffers();
     void DeallocateOneSidedBuffers();
@@ -405,6 +417,7 @@ private:
     ssize_t CutFromIOBufList_Send(butil::IOBuf** from, size_t ndata);
     ssize_t WriteInline(butil::IOBuf** from, size_t ndata);
     ssize_t WriteZeroCopy(butil::IOBuf** from, size_t ndata);
+    ssize_t WriteInlineChunked(butil::IOBuf** from, size_t ndata);
 
     // Completion handlers for one-sided operations.
     ssize_t HandleWriteImmCompletion(const urma_cr_t& cr);
@@ -412,10 +425,17 @@ private:
     void HandleWriteInBandAck(const urma_cr_t& cr);
     void HandlePostWrite(const urma_cr_t& cr);
 
+    // Post one batch of READ WRs (up to URMA_READ_BATCH_MAX). Called by
+    // HandleWriteImmCompletion for the first batch, and by HandleReadCompletion
+    // for subsequent batches. Returns 0 on success, -1 on error (errno set).
+    int PostReadBatch(uint32_t slot_idx);
+
     // Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to
-    // the peer's send_buf at the mirrored offset.
+    // the peer's send_buf at the mirrored offset. chunk_idx is written into
+    // flags so the peer's HandleWriteInBandAck can locate the chunk's context.
     int ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
-                            uint64_t request_id, uint32_t message_size);
+                            uint64_t request_id, uint32_t message_size,
+                            uint16_t chunk_idx = 0);
 
     // Helper: find and remove a pending send context by request_id.
     UrmaSendContext* FindAndRemoveSendContext(uint64_t request_id);
