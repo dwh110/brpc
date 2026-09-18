@@ -165,6 +165,15 @@ void UrmaTransport::QueueMessage(InputMessageClosure& input_msg,
         Transport::ProcessInputMessage(to_run_msg);
         return;
     }
+    // Event mode with non-zero max_rounds: inline all messages to avoid
+    // futex_wake overhead from bthread_start_background. PollCq yields to
+    // EventDispatcher via max_rounds, so user code running inline does not
+    // permanently block other workers.
+    if (!urma::FLAGS_urma_use_polling &&
+        urma::FLAGS_urma_pollcq_max_rounds > 0) {
+        Transport::ProcessInputMessage(to_run_msg);
+        return;
+    }
     bthread_t th;
     bthread_attr_t tmp =
         (FLAGS_usercode_in_pthread ? BTHREAD_ATTR_PTHREAD : BTHREAD_ATTR_NORMAL) |

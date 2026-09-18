@@ -2655,11 +2655,19 @@ void UrmaEndpoint::PollCq(Socket* m) {
     }
 
     const bool event_mode = !FLAGS_urma_use_polling;
+    const int max_rounds = FLAGS_urma_pollcq_max_rounds;
     int progress = Socket::PROGRESS_INIT;
+    int rounds = 0;
     while (true) {
         urma_jfc_t* event_jfc = nullptr;
         if (event_mode) {
-            const int event_count = ep->WaitCqEvent(s, &event_jfc);
+            // After max_rounds consecutive WaitCqEvent calls, yield the
+            // bthread worker back to EventDispatcher by forcing event_count=0
+            // so MoreReadEvents can check _nevent and potentially return.
+            const int event_count = (max_rounds <= 0 || rounds < max_rounds)
+                                        ? ep->WaitCqEvent(s, &event_jfc)
+                                        : 0;
+            ++rounds;
             if (event_count < 0) {
                 return;
             }
@@ -2667,6 +2675,7 @@ void UrmaEndpoint::PollCq(Socket* m) {
                 if (!m->MoreReadEvents(&progress)) {
                     return;
                 }
+                rounds = 0;
                 continue;
             }
         }
@@ -2757,12 +2766,10 @@ void UrmaEndpoint::PollCq(Socket* m) {
             return;
         }
         // The bonding JFCE fd is itself an epoll fd aggregating physical
-        // JFCEs, while brpc watches it with EPOLLET. urma_wait_jfc(..., 1, ...)
-        // consumes only one aggregated event. Keep draining the inner JFCE
-        // until it reports no event; otherwise another physical event can
-        // leave the fd continuously readable and never create a new outer
-        // edge. The event_count == 0 branch above resets _nevent only after
-        // the inner queue is empty.
+        // JFCEs. Each drain_cq call fully drains the virtual JFC (including
+        // physical JFCs). After max_rounds, PollCq yields to EventDispatcher
+        // via MoreReadEvents. The rearm above ensures new completions produce
+        // a new epoll edge to re-trigger PollCq.
     }
 }
 

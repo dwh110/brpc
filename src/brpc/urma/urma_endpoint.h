@@ -53,6 +53,7 @@ struct ParsedHello;
 DECLARE_bool(urma_use_polling);
 DECLARE_int32(urma_poller_num);
 DECLARE_bool(urma_disable_bthread);
+DECLARE_int32(urma_pollcq_max_rounds);
 
 // Per-connection application-level connect object. Returned by
 // UrmaTransport::Connect(); its StartConnect spawns the client-side handshake

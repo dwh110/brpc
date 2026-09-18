@@ -65,6 +65,10 @@ DEFINE_int32(urma_poller_num, 1,
              "Number of poller bthreads per bthread tag (polling mode only)");
 DEFINE_bool(urma_disable_bthread, false,
             "Run the message-processing callback inline (no bthread spawned)");
+DEFINE_int32(urma_pollcq_max_rounds, 4,
+             "Max consecutive WaitCqEvent rounds in PollCq before yielding "
+             "the bthread worker back to EventDispatcher. 0 = unlimited "
+             "(legacy behavior, PollCq never yields).");
 
 DEFINE_int32(urma_sq_size, 128,
              "Depth of the local send jetty (JFS). [16, 4096]");
