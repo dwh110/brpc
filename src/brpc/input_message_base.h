@@ -58,6 +58,18 @@ friend class Stream;
 friend class Transport;
     int64_t _received_us;
     int64_t _base_real_us;
+#if BRPC_E2E_TRACE
+    // E2E latency trace: URMA transport stage timestamps (cpuwide_time_us).
+    // Set by UrmaEndpoint::DispatchReceivedBytes via thread_local bridge,
+    // then read by ProcessRpcRequest / ProcessRpcResponse.
+public:
+    int64_t _recv_event_us{0};       // #5/#15: OnEdge/PollCq entry
+    int64_t _cq_drain_us{0};         // #6/#16: drain_cq complete
+    int64_t _dispatch_us{0};         // #6/#16: DispatchReceivedBytes entry
+    int64_t _msg_cut_us{0};          // #7/#17: CutInputMessage complete
+    int64_t _process_bthread_us{0};  // #8/#18: ProcessInputMessage entry
+private:
+#endif  // BRPC_E2E_TRACE
     SocketUniquePtr _socket;
     void (*_process)(InputMessageBase* msg);
     const void* _arg;

@@ -128,9 +128,12 @@ DEFINE_bool(urma_poller_yield, false,
             "bthreads run");
 
 DEFINE_bool(urma_trace_latency, false,
-            "Log per-RPC URMA latency breakdown to LOG(INFO). "
-            "Tracks send/recv WR counts, EAGAIN waits, post/recv/ack "
-            "times for each CutFromIOBufList and completion batch. "
+            "Log per-RPC URMA latency breakdown to LOG(INFO) and collect "
+            "19-stage end-to-end latency statistics via bvar. Tracks "
+            "send/recv WR counts, EAGAIN waits, post/recv/ack times for "
+            "each CutFromIOBufList and completion batch, plus "
+            "serialize/queue/post/uplink/bthread/deserialize stages for "
+            "each RPC. Exposes avg/p50/p99 under urma_e2e_* bvar names. "
             "Use with queue_depth=1 for clean per-request traces.");
 
 DEFINE_int32(urma_io_mode, 0,

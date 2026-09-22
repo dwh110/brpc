@@ -334,6 +334,15 @@ private:
     };
     TraceState _trace;
 
+#if BRPC_E2E_TRACE
+    // E2E latency trace timestamps (cpuwide_time_us).
+    // Set in PollCq / drain_cq / DispatchReceivedBytes, read by
+    // ProcessRpcRequest / ProcessRpcResponse via Socket::user() reverse lookup.
+    int64_t _e2e_recv_event_us{0};   // #5/#15: PollCq entry
+    int64_t _e2e_cq_drain_us{0};     // #6/#16: drain_cq complete
+    int64_t _e2e_dispatch_us{0};     // #6/#16: DispatchReceivedBytes entry
+#endif  // BRPC_E2E_TRACE
+
     // RQ consumer index.
     uint16_t _rq_received{0};
 

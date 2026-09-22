@@ -45,6 +45,9 @@ namespace brpc {
 
 DECLARE_bool(enable_rpcz);
 DECLARE_bool(usercode_in_pthread);
+namespace urma {
+DECLARE_bool(urma_trace_latency);
+}  // namespace urma
 DEFINE_string(health_check_path, "", "Http path of health check call."
     "By default health check succeeds if the server is connectable."
     "If this flag is set, health check is not completed until a http "
@@ -583,7 +586,17 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor* method,
     // Ensure that serialize_request is done before pack_request in all
     // possible executions, including:
     //   HandleSendFailed => OnVersionedRPCReturned => IssueRPC(pack_request)
+#if BRPC_E2E_TRACE
+    if (urma::FLAGS_urma_trace_latency) {
+        cntl->_e2e_trace.c_serialize_begin = butil::cpuwide_time_us();
+    }
+#endif
     _serialize_request(&cntl->_request_buf, cntl, request);
+#if BRPC_E2E_TRACE
+    if (urma::FLAGS_urma_trace_latency) {
+        cntl->_e2e_trace.c_serialize_end = butil::cpuwide_time_us();
+    }
+#endif
     if (cntl->FailedInline()) {
         // Handle failures caused by serialize_request, and these error_codes
         // should be excluded from the retry_policy.

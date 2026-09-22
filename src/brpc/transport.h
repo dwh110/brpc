@@ -17,6 +17,7 @@
 
 #ifndef BRPC_TRANSPORT_H
 #define BRPC_TRANSPORT_H
+#include "butil/time.h"                       // butil::monotonic_time_us
 #include "brpc/input_messenger.h"
 #include "brpc/socket.h"
 #include "server.h"
@@ -36,6 +37,10 @@ public:
 
     static void* ProcessInputMessage(void* void_arg) {
         InputMessageBase* msg = static_cast<InputMessageBase*>(void_arg);
+#if BRPC_E2E_TRACE
+        // E2E trace #8/#18: ProcessInputMessage entry (bthread started or inline)
+        msg->_process_bthread_us = butil::cpuwide_time_us();
+#endif
         msg->_process(msg);
         return NULL;
     }

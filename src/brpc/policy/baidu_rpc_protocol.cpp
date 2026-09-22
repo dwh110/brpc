@@ -53,6 +53,9 @@ void bthread_assign_data(void* data);
 
 
 namespace brpc {
+namespace urma {
+DECLARE_bool(urma_trace_latency);
+}  // namespace urma
 namespace policy {
 
 DEFINE_bool(baidu_protocol_use_fullname, true,
@@ -284,6 +287,15 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
                      MethodStatus* method_status, int64_t received_us,
                      std::shared_ptr<Span> span) {
     ControllerPrivateAccessor accessor(cntl);
+#if BRPC_E2E_TRACE
+    // E2E trace #10: service call end (= SendRpcResponse entry)
+    const bool e2e_trace = ::brpc::urma::FLAGS_urma_trace_latency;
+    if (e2e_trace) {
+        cntl->_e2e_trace.s_service_end = butil::cpuwide_time_us();
+    }
+#else
+    const bool e2e_trace = false;
+#endif
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
@@ -330,6 +342,12 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
     if (res != NULL && !cntl->Failed()) {
         append_body = SerializeResponse(*res, *cntl, res_body);
     }
+#if BRPC_E2E_TRACE
+    // E2E trace #11: serialize response complete
+    if (e2e_trace) {
+        cntl->_e2e_trace.s_serialize_end = butil::cpuwide_time_us();
+    }
+#endif
 
     // Don't use res->ByteSize() since it may be compressed
     size_t res_size = 0;
@@ -381,6 +399,41 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
                          << " was closed before sending response";
         }
     }
+
+#if BRPC_E2E_TRACE
+    // E2E trace: write server stage durations into response user_fields for client.
+    if (e2e_trace) {
+        const E2ELatencyTrace& t = cntl->_e2e_trace;
+        const int64_t s_event = t.s_cq_drain_us > 0 ?
+            (t.s_cq_drain_us - t.s_recv_event_us) : 0;
+        const int64_t s_cq = t.s_dispatch_us > 0 ?
+            (t.s_dispatch_us - t.s_cq_drain_us) : 0;
+        const int64_t s_msg = t.s_msg_received_us > 0 ?
+            (t.s_msg_received_us - t.s_dispatch_us) : 0;
+        const int64_t s_bthread = t.s_process_bthread_us > 0 ?
+            (t.s_process_bthread_us - t.s_msg_received_us) : 0;
+        const int64_t s_deser = t.s_deserialize_end > 0 ?
+            (t.s_deserialize_end - t.s_process_bthread_us) : 0;
+        const int64_t s_svc = t.s_service_end > 0 ?
+            (t.s_service_end - t.s_service_begin) : 0;
+        const int64_t s_ser = t.s_write_queue_us > 0 ?
+            (t.s_write_queue_us - t.s_serialize_end) : 0;
+        const int64_t s_queue = t.s_post_begin > 0 ?
+            (t.s_post_begin - t.s_write_queue_us) : 0;
+
+        auto* uf = &(*cntl->response_user_fields());
+        (*uf)["e2e_s_recv"] = std::to_string(t.net_s_recv_real);
+        (*uf)["e2e_s_post"] = std::to_string(butil::gettimeofday_us());
+        (*uf)["e2e_s_event"] = std::to_string(s_event);
+        (*uf)["e2e_s_cq"] = std::to_string(s_cq);
+        (*uf)["e2e_s_msg"] = std::to_string(s_msg);
+        (*uf)["e2e_s_bthread"] = std::to_string(s_bthread);
+        (*uf)["e2e_s_deser"] = std::to_string(s_deser);
+        (*uf)["e2e_s_svc"] = std::to_string(s_svc);
+        (*uf)["e2e_s_ser"] = std::to_string(s_ser);
+        (*uf)["e2e_s_queue"] = std::to_string(s_queue);
+    }
+#endif  // BRPC_E2E_TRACE
 
     if (cntl->has_response_user_fields() &&
         !cntl->response_user_fields()->empty()) {
@@ -454,6 +507,13 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             wopt.id_wait = response_id;
             wopt.notify_on_success = true;
         }
+#if BRPC_E2E_TRACE
+        // E2E trace #12/#13: send queue + send interface (Write before/after)
+        if (e2e_trace) {
+            cntl->_e2e_trace.s_write_queue_us = butil::cpuwide_time_us();
+            cntl->_e2e_trace.s_post_begin = cntl->_e2e_trace.s_write_queue_us;
+        }
+#endif
         if (sock->Write(&res_buf, &wopt) != 0) {
             const int errcode = errno;
             PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -461,6 +521,12 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
                             sock->description().c_str());
             return;
         }
+#if BRPC_E2E_TRACE
+        // E2E trace #13: send interface complete
+        if (e2e_trace) {
+            cntl->_e2e_trace.s_post_end = butil::cpuwide_time_us();
+        }
+#endif
     }
 
     if (span) {
@@ -654,6 +720,23 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         }
     }
 
+#if BRPC_E2E_TRACE
+    // E2E trace: copy URMA stage timestamps from InputMessageBase and user_fields.
+    if (::brpc::urma::FLAGS_urma_trace_latency) {
+        cntl->_e2e_trace.s_recv_event_us = msg_base->_recv_event_us;
+        cntl->_e2e_trace.s_cq_drain_us = msg_base->_cq_drain_us;
+        cntl->_e2e_trace.s_dispatch_us = msg_base->_dispatch_us;
+        cntl->_e2e_trace.s_msg_received_us = msg_base->_msg_cut_us;
+        cntl->_e2e_trace.s_process_bthread_us = msg_base->_process_bthread_us;
+        cntl->_e2e_trace.net_s_recv_real = butil::gettimeofday_us();
+        // Read client post timestamp from user_fields for uplink calculation.
+        auto it = meta.user_fields().find("e2e_c_post");
+        if (it != meta.user_fields().end()) {
+            cntl->_e2e_trace.net_c_post_real = strtoll(it->second.c_str(), NULL, 10);
+        }
+    }
+#endif  // BRPC_E2E_TRACE
+
     // Tag the bthread with this server's key for thread_local_data().
     if (server->thread_local_options().thread_local_data_factory) {
         bthread_assign_data((void*)&server->thread_local_options());
@@ -844,6 +927,12 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
             }
             req_buf.clear();
         }
+#if BRPC_E2E_TRACE
+        // E2E trace #9: deserialize complete
+        if (::brpc::urma::FLAGS_urma_trace_latency) {
+            cntl->_e2e_trace.s_deserialize_end = butil::cpuwide_time_us();
+        }
+#endif
 
         // `socket' will be held until response has been sent
         google::protobuf::Closure* done = ::brpc::NewCallback<
@@ -855,6 +944,12 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
         // optional, just release resource ASAP
         msg.reset();
 
+#if BRPC_E2E_TRACE
+        // E2E trace #10: service call begin
+        if (::brpc::urma::FLAGS_urma_trace_latency) {
+            cntl->_e2e_trace.s_service_begin = butil::cpuwide_time_us();
+        }
+#endif
         if (span) {
             span->set_start_callback_us(butil::cpuwide_time_us());
             span->AsParent();
@@ -969,6 +1064,51 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         }
     }
 
+#if BRPC_E2E_TRACE
+    // E2E trace: copy URMA stage timestamps from InputMessageBase and user_fields.
+    if (::brpc::urma::FLAGS_urma_trace_latency) {
+        cntl->_e2e_trace.c_recv_event_us = msg_base->_recv_event_us;
+        cntl->_e2e_trace.c_cq_drain_us = msg_base->_cq_drain_us;
+        cntl->_e2e_trace.c_dispatch_us = msg_base->_dispatch_us;
+        cntl->_e2e_trace.c_msg_received_us = msg_base->_msg_cut_us;
+        cntl->_e2e_trace.c_process_bthread_us = msg_base->_process_bthread_us;
+        cntl->_e2e_trace.net_c_recv_real = butil::gettimeofday_us();
+        auto it = meta.user_fields().find("e2e_s_recv");
+        if (it != meta.user_fields().end()) {
+            cntl->_e2e_trace.net_s_recv_real = strtoll(it->second.c_str(), NULL, 10);
+        }
+        it = meta.user_fields().find("e2e_s_post");
+        if (it != meta.user_fields().end()) {
+            cntl->_e2e_trace.net_s_post_real = strtoll(it->second.c_str(), NULL, 10);
+        }
+        // Server stage durations
+        it = meta.user_fields().find("e2e_s_event");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_event_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_cq");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_cq_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_msg");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_msg_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_bthread");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_bthread_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_deser");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_deser_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_svc");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_svc_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_ser");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_ser_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_queue");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_queue_dur = strtoll(it->second.c_str(), NULL, 10);
+    }
+#endif  // BRPC_E2E_TRACE
+
     cntl->set_rpc_received_us(msg->received_us());
     if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
@@ -1017,6 +1157,13 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
             const butil::IOBuf* checksum_attachment =
                 cntl->response_checksum_attachment() ?
                 &cntl->response_attachment() : NULL;
+#if BRPC_E2E_TRACE
+            // E2E trace #19: deserialize begin
+            const bool e2e_trace = ::brpc::urma::FLAGS_urma_trace_latency;
+            if (e2e_trace) {
+                cntl->_e2e_trace.c_deserialize_begin = butil::cpuwide_time_us();
+            }
+#endif
             if (cntl->response()->GetDescriptor() == SerializedResponse::descriptor()) {
                 ((SerializedResponse*)cntl->response())->
                     serialized_data().append(*res_buf_ptr);
@@ -1033,6 +1180,12 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
                     CompressTypeToCStr(compress_type),
                     ChecksumTypeToCStr(checksum_type), res_size);
             }
+#if BRPC_E2E_TRACE
+            // E2E trace #19: deserialize end
+            if (e2e_trace) {
+                cntl->_e2e_trace.c_deserialize_end = butil::cpuwide_time_us();
+            }
+#endif
         } // else silently ignore the response.
     } while (0);
     // Unlocks correlation_id inside. Revert controller's
@@ -1140,6 +1293,16 @@ void PackRpcRequest(butil::IOBuf* req_buf,
             stream_settings->mutable_extra_stream_ids()->Add(request_stream_ids[i]);
         }
     }
+
+#if BRPC_E2E_TRACE
+    // E2E trace: write client post timestamp into request user_fields for server.
+    if (::brpc::urma::FLAGS_urma_trace_latency) {
+        if (cntl->_e2e_trace.net_c_post_real > 0) {
+            (*cntl->request_user_fields())["e2e_c_post"] =
+                std::to_string(cntl->_e2e_trace.net_c_post_real);
+        }
+    }
+#endif  // BRPC_E2E_TRACE
 
     if (cntl->has_request_user_fields() && !cntl->request_user_fields()->empty()) {
         ::google::protobuf::Map<std::string, std::string>& user_fields

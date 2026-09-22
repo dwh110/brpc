@@ -123,6 +123,12 @@ config_setting(
 )
 
 config_setting(
+    name = "brpc_with_e2e_trace",
+    define_values = {"BRPC_E2E_TRACE": "true"},
+    visibility = ["//visibility:public"],
+)
+
+config_setting(
     name = "brpc_with_boringssl",
     define_values = {"BRPC_WITH_BORINGSSL": "true"},
     visibility = ["//visibility:public"],

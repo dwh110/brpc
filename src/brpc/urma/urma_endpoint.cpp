@@ -2581,6 +2581,12 @@ void UrmaEndpoint::HandlePostWrite(const urma_cr_t& cr) {
 }
 
 void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
+#if BRPC_E2E_TRACE
+    // E2E trace #6/#16: DispatchReceivedBytes entry
+    if (FLAGS_urma_trace_latency) {
+        _e2e_dispatch_us = butil::cpuwide_time_us();
+    }
+#endif
     int64_t pending = _pending_received_bytes.load(butil::memory_order_relaxed);
     if (bytes > 0) {
         pending = _pending_received_bytes.fetch_add(
@@ -2637,8 +2643,19 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
         _trace.recv_tx_complete = 0;
     }
     InputMessageClosure last_msg;
+#if BRPC_E2E_TRACE
+    // E2E trace: set thread-local bridge so ProcessNewMessage can copy
+    // URMA stage timestamps into the newly created InputMessageBase.
+    if (FLAGS_urma_trace_latency) {
+        set_e2e_trace_bridge(_e2e_recv_event_us, _e2e_cq_drain_us,
+                             _e2e_dispatch_us);
+    }
+#endif
     messenger->ProcessNewMessage(s.get(), static_cast<ssize_t>(pending),
                                  false, received_us, base_realtime, last_msg);
+#if BRPC_E2E_TRACE
+    clear_e2e_trace_bridge();
+#endif
 }
 
 void UrmaEndpoint::PollCq(Socket* m) {
@@ -2646,6 +2663,12 @@ void UrmaEndpoint::PollCq(Socket* m) {
     if (!ep || !ep->_resource || !ep->_resource->jfc) {
         return;
     }
+#if BRPC_E2E_TRACE
+    // E2E trace #5/#15: PollCq entry (bthread started after ProcessEvent)
+    if (FLAGS_urma_trace_latency) {
+        ep->_e2e_recv_event_us = butil::cpuwide_time_us();
+    }
+#endif
     SocketUniquePtr s;
     if (Socket::Address(ep->_socket->id(), &s) != 0) {
         return;
@@ -2726,6 +2749,12 @@ void UrmaEndpoint::PollCq(Socket* m) {
         };
 
         int completion_error = drain_cq();
+#if BRPC_E2E_TRACE
+        // E2E trace #6/#16: drain_cq complete
+        if (FLAGS_urma_trace_latency) {
+            ep->_e2e_cq_drain_us = butil::cpuwide_time_us();
+        }
+#endif
         if (tx_err > 0) {
             LOG(WARNING) << "URMA CQ drain: total=" << total_cqes
                       << " tx_ok=" << tx_ok << " tx_err=" << tx_err

@@ -25,6 +25,14 @@ LOCAL_FILES = [
     'src/brpc/urma/urma_endpoint.cpp',
     'src/brpc/urma/urma_helper.cpp',
     'src/brpc/urma_transport.cpp',
+    'src/brpc/controller.h',
+    'src/brpc/controller.cpp',
+    'src/brpc/input_message_base.h',
+    'src/brpc/input_messenger.h',
+    'src/brpc/input_messenger.cpp',
+    'src/brpc/transport.h',
+    'src/brpc/channel.cpp',
+    'src/brpc/policy/baidu_rpc_protocol.cpp',
 ]
 REMOTE_URMA_DIR = '/home/d00836578/brpc_workspace/brpc_urma/brpc/src/brpc/urma/'
 REMOTE_TRANSPORT_DIR = '/home/d00836578/brpc_workspace/brpc_urma/brpc/src/brpc/'

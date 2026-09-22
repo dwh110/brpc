@@ -1,0 +1,115 @@
+
+============================================================
+Stage 5: Analyze E2E trace
+============================================================
+Records (after warmup skip 100): 4902
+
+------------------------------------------------------------
+CLIENT-SIDE STAGES (monotonic)
+------------------------------------------------------------
+  c_ser          avg=     0.4  p50=     0  p99=     1  min=    0  max=     2  [filtered avg=0.4 p50=0 p99=1 n=4902]
+  c_queue        avg=     0.0  p50=     0  p99=     0  min=    0  max=     0  [filtered avg=0.0 p50=0 p99=0 n=4902]
+  c_post         avg=     1.3  p50=     1  p99=     3  min=    0  max=    13  [filtered avg=1.3 p50=1 p99=3 n=4902]
+  c_event        avg=     3.8  p50=     3  p99=     8  min=    1  max=   455  [filtered avg=3.8 p50=3 p99=8 n=4902]
+  c_cq           avg=     0.4  p50=     0  p99=     2  min=    0  max=     6  [filtered avg=0.4 p50=0 p99=2 n=4902]
+  c_msg          avg=     0.4  p50=     0  p99=     1  min=    0  max=     5  [filtered avg=0.4 p50=0 p99=1 n=4902]
+  c_bthread      avg=     0.5  p50=     0  p99=     5  min=    0  max=    14  [filtered avg=0.5 p50=0 p99=5 n=4902]
+  c_deser        avg=     0.4  p50=     0  p99=     1  min=    0  max=     9  [filtered avg=0.4 p50=0 p99=1 n=4902]
+  c_done         avg=     0.4  p50=     0  p99=     1  min=    0  max=     7  [filtered avg=0.4 p50=0 p99=1 n=4902]
+  total          avg=    36.9  p50=    34  p99=    59  min=   26  max=   848  [filtered avg=36.9 p50=34 p99=59 n=4902]
+
+------------------------------------------------------------
+NETWORK LATENCY (residual = total - sum(client stages))
+------------------------------------------------------------
+  network        avg=    29.4  p50=    27  p99=    45  min= -364  max=   841  [filtered avg=29.4 p50=27 p99=45 n=4902]
+
+------------------------------------------------------------
+ALL 19 STAGES (server stages may be 0 if not transmitted)
+------------------------------------------------------------
+  Stage          avg(us)    p50(us)    p99(us)    min    max   
+  ----------------------------------------------------------
+  c_ser          0.4        0          1          0      2     
+  c_queue        0.0        0          0          0      0     
+  c_post         1.3        1          3          0      13    
+  uplink         (no data)
+  s_event        3.4        3          5          2      462   
+  s_cq           0.3        0          1          0      1     
+  s_msg          0.4        0          1          0      10    
+  s_bthread      0.6        0          7          0      33    
+  s_deser        3.5        3          9          2      23    
+  s_svc          1.3        1          8          0      20    
+  s_ser          0.0        0          0          0      0     
+  s_queue        0.0        0          0          0      0     
+  s_post         0.0        0          0          0      0     
+  downlink       27234760.1 27234758   27234808   27234709 27235316
+  c_event        3.8        3          8          1      455   
+  c_cq           0.4        0          2          0      6     
+  c_msg          0.4        0          1          0      5     
+  c_bthread      0.5        0          5          0      14    
+  c_deser        0.4        0          1          0      9     
+  c_done         0.4        0          1          0      7     
+  total          36.9       34         59         26     848   
+
+------------------------------------------------------------
+BREAKDOWN (averages)
+------------------------------------------------------------
+  Client local: 7.5 us (20%)
+  Network:      29.4 us (80%)
+  Total:        36.9 us
+
+------------------------------------------------------------
+TOTAL LATENCY DISTRIBUTION
+------------------------------------------------------------
+  p50: 34 us
+  p75: 40 us
+  p90: 45 us
+  p95: 48 us
+  p99: 59 us
+  p99.9: 438 us
+  p99.99: 848 us
+  avg: 36.9 us
+  min: 26 us
+  max: 848 us
+
+------------------------------------------------------------
+SAMPLE RECORDS (first 5)
+------------------------------------------------------------
+  [0] c_ser=0 c_queue=0 c_post=1 uplink=-27234677 s_event=4 s_cq=0 s_msg=1 s_bthread=3 s_deser=6 s_svc=1 s_ser=0 s_queue=0 s_post=0 downlink=27234719 c_event=3 c_cq=1 c_msg=0 c_bthread=1 c_deser=1 c_done=0 total=46
+  [1] c_ser=1 c_queue=0 c_post=1 uplink=-27234682 s_event=3 s_cq=0 s_msg=1 s_bthread=0 s_deser=3 s_svc=1 s_ser=0 s_queue=0 s_post=0 downlink=27234711 c_event=4 c_cq=0 c_msg=1 c_bthread=0 c_deser=1 c_done=0 total=33
+  [2] c_ser=0 c_queue=0 c_post=1 uplink=-27234685 s_event=3 s_cq=1 s_msg=0 s_bthread=0 s_deser=3 s_svc=1 s_ser=0 s_queue=0 s_post=0 downlink=27234710 c_event=4 c_cq=0 c_msg=0 c_bthread=0 c_deser=0 c_done=0 total=29
+  [3] c_ser=0 c_queue=0 c_post=1 uplink=-27234684 s_event=3 s_cq=0 s_msg=1 s_bthread=0 s_deser=3 s_svc=1 s_ser=0 s_queue=0 s_post=0 downlink=27234711 c_event=3 c_cq=0 c_msg=1 c_bthread=0 c_deser=0 c_done=1 total=32
+  [4] c_ser=0 c_queue=0 c_post=1 uplink=-27234684 s_event=3 s_cq=0 s_msg=0 s_bthread=0 s_deser=3 s_svc=1 s_ser=0 s_queue=0 s_post=0 downlink=27234712 c_event=3 c_cq=1 c_msg=0 c_bthread=0 c_deser=1 c_done=0 total=31
+
+================================================================================
+WATERFALL CHART (avg latency per stage, in RPC execution order)
+================================================================================
+  Total avg: 36.9 us  |  bar scale: 29.4 us
+
+  CLIENT Client serialize           0.4 us  #                                                   ( 1.1%)
+  CLIENT Client queue               0.0 us  #                                                   ( 0.0%)
+  CLIENT Client URMA post           1.3 us  ##                                                  ( 3.5%)
+
+  NET   Uplink (net)           ~  29.4 us  [network residual, clock-skewed]
+
+  SERVER Server event               3.4 us  #####                                               ( 9.3%)
+  SERVER Server CQ drain            0.3 us  #                                                   ( 0.7%)
+  SERVER Server msg recv            0.4 us  #                                                   ( 1.0%)
+  SERVER Server bthread             0.6 us  #                                                   ( 1.7%)
+  SERVER Server deser               3.5 us  #####                                               ( 9.4%)
+  SERVER Server service             1.3 us  ##                                                  ( 3.6%)
+  SERVER Server serialize           0.0 us  [not transmitted]
+  SERVER Server queue               0.0 us  [not transmitted]
+  SERVER Server URMA post           0.0 us  [not transmitted]
+
+  NET   Downlink (net)         ~  29.4 us  [network residual, clock-skewed]
+
+  CLIENT Client event               3.8 us  ######                                              (10.4%)
+  CLIENT Client CQ drain            0.4 us  #                                                   ( 1.0%)
+  CLIENT Client msg recv            0.4 us  #                                                   ( 1.0%)
+  CLIENT Client bthread             0.5 us  #                                                   ( 1.4%)
+  CLIENT Client deser               0.4 us  #                                                   ( 1.0%)
+  CLIENT Client done                0.4 us  #                                                   ( 1.0%)
+
+  NET   Network (residual)        29.4 us  ==================================================  (79.6%)
+  NET   Client local sum           7.5 us
+  NET   Total                     36.9 us

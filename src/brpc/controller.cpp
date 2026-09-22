@@ -91,6 +91,10 @@ DECLARE_bool(log_as_json);
 
 namespace brpc {
 
+namespace urma {
+DECLARE_bool(urma_trace_latency);
+}  // namespace urma
+
 DEFINE_bool(graceful_quit_on_sigterm, false,
             "Register SIGTERM handle func to quit graceful");
 DEFINE_bool(graceful_quit_on_sighup, false,
@@ -301,6 +305,9 @@ void Controller::ResetPods() {
     _session_data = NULL;
     _auth_flags = 0;
     _rpc_received_us = 0;
+#if BRPC_E2E_TRACE
+    _e2e_trace = E2ELatencyTrace{};
+#endif
 }
 
 Controller::Call::Call(Controller::Call* rhs)
@@ -1037,7 +1044,112 @@ void Controller::OnRPCEnd(int64_t end_time_us) {
     if (NULL != _backup_request_policy) {
         _backup_request_policy->OnRPCEnd(this);
     }
+#if BRPC_E2E_TRACE
+    // E2E trace: record done_run timestamp and client recv time for network calc
+    if (urma::FLAGS_urma_trace_latency) {
+        _e2e_trace.c_done_run_us = butil::cpuwide_time_us();
+        _e2e_trace.net_c_recv_real = end_time_us;
+        LogAndStatE2E();
+    }
+#endif
 }
+
+#if BRPC_E2E_TRACE
+// E2E latency trace: bvar recorders for each stage
+static bvar::LatencyRecorder g_e2e_c_serialize("urma_e2e_c_serialize");
+static bvar::LatencyRecorder g_e2e_c_queue("urma_e2e_c_queue");
+static bvar::LatencyRecorder g_e2e_c_post("urma_e2e_c_post");
+static bvar::LatencyRecorder g_e2e_uplink("urma_e2e_uplink");
+static bvar::LatencyRecorder g_e2e_s_event("urma_e2e_s_event");
+static bvar::LatencyRecorder g_e2e_s_cq("urma_e2e_s_cq");
+static bvar::LatencyRecorder g_e2e_s_msg("urma_e2e_s_msg");
+static bvar::LatencyRecorder g_e2e_s_bthread("urma_e2e_s_bthread");
+static bvar::LatencyRecorder g_e2e_s_deser("urma_e2e_s_deser");
+static bvar::LatencyRecorder g_e2e_s_svc("urma_e2e_s_svc");
+static bvar::LatencyRecorder g_e2e_s_ser("urma_e2e_s_ser");
+static bvar::LatencyRecorder g_e2e_s_queue("urma_e2e_s_queue");
+static bvar::LatencyRecorder g_e2e_s_post("urma_e2e_s_post");
+static bvar::LatencyRecorder g_e2e_downlink("urma_e2e_downlink");
+static bvar::LatencyRecorder g_e2e_c_event("urma_e2e_c_event");
+static bvar::LatencyRecorder g_e2e_c_cq("urma_e2e_c_cq");
+static bvar::LatencyRecorder g_e2e_c_msg("urma_e2e_c_msg");
+static bvar::LatencyRecorder g_e2e_c_bthread("urma_e2e_c_bthread");
+static bvar::LatencyRecorder g_e2e_c_deser("urma_e2e_c_deser");
+static bvar::LatencyRecorder g_e2e_c_done("urma_e2e_c_done");
+static bvar::LatencyRecorder g_e2e_total("urma_e2e_total");
+
+void Controller::LogAndStatE2E() {
+    const E2ELatencyTrace& t = _e2e_trace;
+    // Stage durations (monotonic)
+    const int64_t c_ser = t.c_serialize_end - t.c_serialize_begin;
+    const int64_t c_queue = t.c_post_begin - t.c_write_queue_us;
+    const int64_t c_post = t.c_post_end - t.c_post_begin;
+    const int64_t s_event = t.s_event_dur;
+    const int64_t s_cq = t.s_cq_dur;
+    const int64_t s_msg = t.s_msg_dur;
+    const int64_t s_bthread = t.s_bthread_dur;
+    const int64_t s_deser = t.s_deser_dur;
+    const int64_t s_svc = t.s_svc_dur;
+    const int64_t s_ser = t.s_ser_dur;
+    const int64_t s_queue = t.s_queue_dur;
+    const int64_t s_post = 0;  // not transmitted (only available after Write)
+    const int64_t c_event = t.c_cq_drain_us > 0 ?
+        (t.c_cq_drain_us - t.c_recv_event_us) : 0;
+    const int64_t c_cq = t.c_dispatch_us > 0 ?
+        (t.c_dispatch_us - t.c_cq_drain_us) : 0;
+    const int64_t c_msg = t.c_msg_received_us > 0 ?
+        (t.c_msg_received_us - t.c_dispatch_us) : 0;
+    const int64_t c_bthread = t.c_process_bthread_us > 0 ?
+        (t.c_process_bthread_us - t.c_msg_received_us) : 0;
+    const int64_t c_deser = t.c_deserialize_end > 0 ?
+        (t.c_deserialize_end - t.c_deserialize_begin) : 0;
+    const int64_t c_done = t.c_done_run_us > 0 ?
+        (t.c_done_run_us - t.c_deserialize_end) : 0;
+    // Network (wall clock)
+    const int64_t uplink = (t.net_s_recv_real > 0 && t.net_c_post_real > 0) ?
+        (t.net_s_recv_real - t.net_c_post_real) : 0;
+    const int64_t downlink = (t.net_c_recv_real > 0 && t.net_s_post_real > 0) ?
+        (t.net_c_recv_real - t.net_s_post_real) : 0;
+    const int64_t total = t.c_done_run_us - t.c_serialize_begin;
+
+    if (urma::FLAGS_urma_trace_latency) {
+        LOG(INFO) << "[URMA-E2E] c_ser=" << c_ser
+                 << " c_queue=" << c_queue << " c_post=" << c_post
+                 << " | uplink=" << uplink
+                 << " | s_event=" << s_event << " s_cq=" << s_cq
+                 << " s_msg=" << s_msg << " s_bthread=" << s_bthread
+                 << " s_deser=" << s_deser << " s_svc=" << s_svc
+                 << " s_ser=" << s_ser << " s_queue=" << s_queue
+                 << " s_post=" << s_post
+                 << " | downlink=" << downlink
+                 << " | c_event=" << c_event << " c_cq=" << c_cq
+                 << " c_msg=" << c_msg << " c_bthread=" << c_bthread
+                 << " c_deser=" << c_deser << " c_done=" << c_done
+                 << " | total=" << total << "us";
+        g_e2e_c_serialize << c_ser;
+        g_e2e_c_queue << c_queue;
+        g_e2e_c_post << c_post;
+        g_e2e_uplink << uplink;
+        g_e2e_s_event << s_event;
+        g_e2e_s_cq << s_cq;
+        g_e2e_s_msg << s_msg;
+        g_e2e_s_bthread << s_bthread;
+        g_e2e_s_deser << s_deser;
+        g_e2e_s_svc << s_svc;
+        g_e2e_s_ser << s_ser;
+        g_e2e_s_queue << s_queue;
+        g_e2e_s_post << s_post;
+        g_e2e_downlink << downlink;
+        g_e2e_c_event << c_event;
+        g_e2e_c_cq << c_cq;
+        g_e2e_c_msg << c_msg;
+        g_e2e_c_bthread << c_bthread;
+        g_e2e_c_deser << c_deser;
+        g_e2e_c_done << c_done;
+        g_e2e_total << total;
+    }
+}
+#endif  // BRPC_E2E_TRACE
 
 void Controller::RunDoneInBackupThread(void* arg) {
     static_cast<Controller*>(arg)->DoneInBackupThread();
@@ -1256,6 +1368,16 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     // Make request
     butil::IOBuf packet;
     SocketMessage* user_packet = NULL;
+#if BRPC_E2E_TRACE
+    const bool e2e_trace = urma::FLAGS_urma_trace_latency;
+    if (e2e_trace) {
+        // Set net_c_post_real BEFORE _pack_request so PackRpcRequest can
+        // serialize it into request user_fields for server-side uplink calc.
+        _e2e_trace.net_c_post_real = butil::gettimeofday_us();
+    }
+#else
+    const bool e2e_trace = false;
+#endif
     _pack_request(&packet, &user_packet, cid.value, _method, this,
                   _request_buf, using_auth);
     // TODO: PackRequest may accept SocketMessagePtr<>?
@@ -1291,6 +1413,12 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     wopt.write_in_background = write_to_socket_in_background();
     int rc;
     size_t packet_size = 0;
+#if BRPC_E2E_TRACE
+    if (e2e_trace) {
+        _e2e_trace.c_write_queue_us = butil::cpuwide_time_us();
+        _e2e_trace.c_post_begin = _e2e_trace.c_write_queue_us;
+    }
+#endif
     if (user_packet_guard) {
         if (auto span = _span.lock()) {
             packet_size = user_packet_guard->EstimatedByteSize();
@@ -1300,6 +1428,11 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
         packet_size = packet.size();
         rc = _current_call.sending_sock->Write(&packet, &wopt);
     }
+#if BRPC_E2E_TRACE
+    if (e2e_trace) {
+        _e2e_trace.c_post_end = butil::cpuwide_time_us();
+    }
+#endif
     if (auto span = _span.lock()) {
         if (_current_call.nretry == 0) {
             span->set_sent_us(butil::cpuwide_time_us());

@@ -75,6 +75,53 @@ class RetryPolicy;
 class BackupRequestPolicy;
 class InputMessageBase;
 class ThriftStub;
+
+// End-to-end latency trace: 19-stage timestamp storage for URMA transport.
+// All fields use cpuwide_time_us (local clock) except net_* (gettimeofday_us).
+// Only populated when FLAGS_urma_trace_latency is on.
+// Gated by BRPC_E2E_TRACE compile macro: zero overhead when disabled.
+#if BRPC_E2E_TRACE
+struct E2ELatencyTrace {
+    // Client side (cpuwide_time_us)
+    int64_t c_serialize_begin{0}, c_serialize_end{0};    // #1
+    int64_t c_write_queue_us{0};                          // #2
+    int64_t c_post_begin{0}, c_post_end{0};               // #3
+    int64_t c_recv_event_us{0};                           // #15
+    int64_t c_cq_drain_us{0}, c_dispatch_us{0};           // #16
+    int64_t c_msg_received_us{0};                         // #17
+    int64_t c_process_bthread_us{0};                      // #18
+    int64_t c_deserialize_begin{0}, c_deserialize_end{0}; // #19
+    int64_t c_done_run_us{0};                             // #19 end
+
+    // Server side (cpuwide_time_us)
+    int64_t s_recv_event_us{0};                           // #5
+    int64_t s_cq_drain_us{0}, s_dispatch_us{0};           // #6
+    int64_t s_msg_received_us{0};                         // #7
+    int64_t s_process_bthread_us{0};                      // #8
+    int64_t s_deserialize_end{0};                         // #9
+    int64_t s_service_begin{0}, s_service_end{0};         // #10
+    int64_t s_serialize_end{0};                           // #11
+    int64_t s_write_queue_us{0};                          // #12
+    int64_t s_post_begin{0}, s_post_end{0};               // #13
+
+    // Cross-network (gettimeofday_us, NTP-synced wall clock)
+    int64_t net_c_post_real{0};    // client post moment
+    int64_t net_s_recv_real{0};    // server recv moment
+    int64_t net_s_post_real{0};    // server post moment
+    int64_t net_c_recv_real{0};    // client recv moment
+
+    // Server-side stage durations (received from server via RpcMeta user_fields)
+    int64_t s_event_dur{0};
+    int64_t s_cq_dur{0};
+    int64_t s_msg_dur{0};
+    int64_t s_bthread_dur{0};
+    int64_t s_deser_dur{0};
+    int64_t s_svc_dur{0};
+    int64_t s_ser_dur{0};
+    int64_t s_queue_dur{0};
+};
+#endif  // BRPC_E2E_TRACE
+
 namespace policy {
 class OnServerStreamCreated;
 void ProcessMongoRequest(InputMessageBase*);
@@ -829,6 +876,9 @@ private:
     }
 
     void OnRPCEnd(int64_t end_time_us);
+#if BRPC_E2E_TRACE
+    void LogAndStatE2E();
+#endif
 
     static void RunDoneInBackupThread(void*);
     void DoneInBackupThread();
@@ -1007,6 +1057,14 @@ private:
 
     // The point in time when the rpc is read from the socket
     int64_t _rpc_received_us;
+
+    // End-to-end latency trace (19 stages). Populated only when
+    // FLAGS_urma_trace_latency is true.
+#if BRPC_E2E_TRACE
+public:
+    E2ELatencyTrace _e2e_trace;
+private:
+#endif
 };
 
 // Advises the RPC system that the caller desires that the RPC call be

@@ -173,6 +173,15 @@ BUTIL_FORCE_INLINE InputMessenger* get_client_side_messenger() {
 
 InputMessenger* get_or_new_client_side_messenger();
 
+#if BRPC_E2E_TRACE
+// E2E latency trace: set thread-local bridge for URMA stage timestamps.
+// Called by UrmaEndpoint::DispatchReceivedBytes before ProcessNewMessage.
+struct E2ETraceBridge;
+void set_e2e_trace_bridge(int64_t recv_event_us, int64_t cq_drain_us,
+                          int64_t dispatch_us);
+void clear_e2e_trace_bridge();
+#endif  // BRPC_E2E_TRACE
+
 } // namespace brpc
 
 

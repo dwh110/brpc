@@ -58,6 +58,9 @@ DEFINES = [
      "//bazel/config:brpc_with_urma_mock": ["BRPC_USE_URMA_MOCK=1"],
      "//conditions:default": ["BRPC_USE_URMA_MOCK=0"],
  }) + select({
+     "//bazel/config:brpc_with_e2e_trace": ["BRPC_E2E_TRACE=1"],
+     "//conditions:default": ["BRPC_E2E_TRACE=0"],
+ }) + select({
      "//bazel/config:brpc_with_debug_bthread_sche_safety": ["BRPC_DEBUG_BTHREAD_SCHE_SAFETY=1"],
      "//conditions:default": ["BRPC_DEBUG_BTHREAD_SCHE_SAFETY=0"],
  }) + select({
