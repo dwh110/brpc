@@ -401,7 +401,16 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
     }
 
 #if BRPC_E2E_TRACE
+    // E2E trace #12: mark meta construction complete (before writing user_fields
+    // so s_ser and s_queue can be computed).
+    if (e2e_trace) {
+        cntl->_e2e_trace.s_write_queue_us = butil::cpuwide_time_us();
+    }
+#endif
+
+#if BRPC_E2E_TRACE
     // E2E trace: write server stage durations into response user_fields for client.
+    // s_ser and s_queue are computed here. s_post is filled after first serialization.
     if (e2e_trace) {
         const E2ELatencyTrace& t = cntl->_e2e_trace;
         const int64_t s_event = t.s_cq_drain_us > 0 ?
@@ -416,10 +425,10 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             (t.s_deserialize_end - t.s_process_bthread_us) : 0;
         const int64_t s_svc = t.s_service_end > 0 ?
             (t.s_service_end - t.s_service_begin) : 0;
-        const int64_t s_ser = t.s_write_queue_us > 0 ?
+        const int64_t s_ser = t.s_serialize_end > 0 ?
+            (t.s_serialize_end - t.s_service_end) : 0;
+        const int64_t s_queue = t.s_write_queue_us > 0 ?
             (t.s_write_queue_us - t.s_serialize_end) : 0;
-        const int64_t s_queue = t.s_post_begin > 0 ?
-            (t.s_post_begin - t.s_write_queue_us) : 0;
 
         auto* uf = &(*cntl->response_user_fields());
         (*uf)["e2e_s_event"] = std::to_string(s_event);
@@ -430,6 +439,7 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
         (*uf)["e2e_s_svc"] = std::to_string(s_svc);
         (*uf)["e2e_s_ser"] = std::to_string(s_ser);
         (*uf)["e2e_s_queue"] = std::to_string(s_queue);
+        (*uf)["e2e_s_post"] = std::to_string(0);  // placeholder, updated after serialization
     }
 #endif  // BRPC_E2E_TRACE
 
@@ -444,6 +454,28 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
 
     butil::IOBuf res_buf;
     SerializeRpcHeaderAndMeta(&res_buf, meta, res_size + attached_size);
+
+#if BRPC_E2E_TRACE
+    // E2E trace #13: after first serialization, s_post can be computed.
+    // Re-serialize meta with updated s_post value in user_fields.
+    if (e2e_trace) {
+        cntl->_e2e_trace.s_post_begin = butil::cpuwide_time_us();
+        const int64_t s_post = cntl->_e2e_trace.s_post_begin -
+                               cntl->_e2e_trace.s_write_queue_us;
+        // Update s_post in user_fields (use [] to overwrite the placeholder)
+        (*cntl->response_user_fields())["e2e_s_post"] = std::to_string(s_post);
+        // Overwrite s_post in meta's user_fields (insert() won't replace existing keys)
+        {
+            ::google::protobuf::Map<std::string, std::string>& user_fields
+                = *meta.mutable_user_fields();
+            user_fields["e2e_s_post"] = std::to_string(s_post);
+        }
+        // Re-serialize with complete user_fields
+        res_buf.clear();
+        SerializeRpcHeaderAndMeta(&res_buf, meta, res_size + attached_size);
+    }
+#endif
+
     if (append_body) {
         res_buf.append(res_body.movable());
         if (attached_size > 0) {
@@ -505,13 +537,6 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             wopt.id_wait = response_id;
             wopt.notify_on_success = true;
         }
-#if BRPC_E2E_TRACE
-        // E2E trace #12/#13: send queue + send interface (Write before/after)
-        if (e2e_trace) {
-            cntl->_e2e_trace.s_write_queue_us = butil::cpuwide_time_us();
-            cntl->_e2e_trace.s_post_begin = cntl->_e2e_trace.s_write_queue_us;
-        }
-#endif
         if (sock->Write(&res_buf, &wopt) != 0) {
             const int errcode = errno;
             PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -1089,6 +1114,9 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         it = meta.user_fields().find("e2e_s_queue");
         if (it != meta.user_fields().end())
             cntl->_e2e_trace.s_queue_dur = strtoll(it->second.c_str(), NULL, 10);
+        it = meta.user_fields().find("e2e_s_post");
+        if (it != meta.user_fields().end())
+            cntl->_e2e_trace.s_post_dur = strtoll(it->second.c_str(), NULL, 10);
     }
 #endif  // BRPC_E2E_TRACE
 

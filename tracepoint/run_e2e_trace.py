@@ -387,7 +387,12 @@ def print_waterfall(records):
         pct = 100 * s['avg'] / avg_total if avg_total > 0 else 0
         note = ''
         if s['avg'] == 0 and group == 'server':
-            note = '[not transmitted]'
+            if stage_key == 's_queue':
+                note = '[no queueing]'
+            elif stage_key == 's_post':
+                note = '[in network]'
+            else:
+                note = '[not transmitted]'
         elif group == 'network':
             note = '[uplink+downlink]'
 

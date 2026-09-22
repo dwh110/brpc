@@ -113,6 +113,7 @@ struct E2ELatencyTrace {
     int64_t s_svc_dur{0};
     int64_t s_ser_dur{0};
     int64_t s_queue_dur{0};
+    int64_t s_post_dur{0};
 };
 #endif  // BRPC_E2E_TRACE
 

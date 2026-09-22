@@ -1090,7 +1090,7 @@ void Controller::LogAndStatE2E() {
     const int64_t s_svc = t.s_svc_dur;
     const int64_t s_ser = t.s_ser_dur;
     const int64_t s_queue = t.s_queue_dur;
-    const int64_t s_post = 0;  // not transmitted (only available after Write)
+    const int64_t s_post = t.s_post_dur;
     const int64_t c_event = t.c_cq_drain_us > 0 ?
         (t.c_cq_drain_us - t.c_recv_event_us) : 0;
     const int64_t c_cq = t.c_dispatch_us > 0 ?
@@ -1106,7 +1106,7 @@ void Controller::LogAndStatE2E() {
     // Network: client send-complete to recv-event, minus server processing.
     // All timestamps are cpuwide_time_us (same machine), no clock skew.
     const int64_t server_sum = s_event + s_cq + s_msg + s_bthread
-                             + s_deser + s_svc + s_ser + s_queue;
+                             + s_deser + s_svc + s_ser + s_queue + s_post;
     const int64_t network = (t.c_recv_event_us > 0 && t.c_post_end > 0) ?
         (t.c_recv_event_us - t.c_post_end - server_sum) : 0;
     const int64_t total = t.c_done_run_us - t.c_serialize_begin;
