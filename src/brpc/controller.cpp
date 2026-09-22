@@ -1045,10 +1045,9 @@ void Controller::OnRPCEnd(int64_t end_time_us) {
         _backup_request_policy->OnRPCEnd(this);
     }
 #if BRPC_E2E_TRACE
-    // E2E trace: record done_run timestamp and client recv time for network calc
+    // E2E trace: record done_run timestamp
     if (urma::FLAGS_urma_trace_latency) {
         _e2e_trace.c_done_run_us = butil::cpuwide_time_us();
-        _e2e_trace.net_c_recv_real = end_time_us;
         LogAndStatE2E();
     }
 #endif
@@ -1059,7 +1058,7 @@ void Controller::OnRPCEnd(int64_t end_time_us) {
 static bvar::LatencyRecorder g_e2e_c_serialize("urma_e2e_c_serialize");
 static bvar::LatencyRecorder g_e2e_c_queue("urma_e2e_c_queue");
 static bvar::LatencyRecorder g_e2e_c_post("urma_e2e_c_post");
-static bvar::LatencyRecorder g_e2e_uplink("urma_e2e_uplink");
+static bvar::LatencyRecorder g_e2e_network("urma_e2e_network");
 static bvar::LatencyRecorder g_e2e_s_event("urma_e2e_s_event");
 static bvar::LatencyRecorder g_e2e_s_cq("urma_e2e_s_cq");
 static bvar::LatencyRecorder g_e2e_s_msg("urma_e2e_s_msg");
@@ -1069,7 +1068,6 @@ static bvar::LatencyRecorder g_e2e_s_svc("urma_e2e_s_svc");
 static bvar::LatencyRecorder g_e2e_s_ser("urma_e2e_s_ser");
 static bvar::LatencyRecorder g_e2e_s_queue("urma_e2e_s_queue");
 static bvar::LatencyRecorder g_e2e_s_post("urma_e2e_s_post");
-static bvar::LatencyRecorder g_e2e_downlink("urma_e2e_downlink");
 static bvar::LatencyRecorder g_e2e_c_event("urma_e2e_c_event");
 static bvar::LatencyRecorder g_e2e_c_cq("urma_e2e_c_cq");
 static bvar::LatencyRecorder g_e2e_c_msg("urma_e2e_c_msg");
@@ -1105,23 +1103,23 @@ void Controller::LogAndStatE2E() {
         (t.c_deserialize_end - t.c_deserialize_begin) : 0;
     const int64_t c_done = t.c_done_run_us > 0 ?
         (t.c_done_run_us - t.c_deserialize_end) : 0;
-    // Network (wall clock)
-    const int64_t uplink = (t.net_s_recv_real > 0 && t.net_c_post_real > 0) ?
-        (t.net_s_recv_real - t.net_c_post_real) : 0;
-    const int64_t downlink = (t.net_c_recv_real > 0 && t.net_s_post_real > 0) ?
-        (t.net_c_recv_real - t.net_s_post_real) : 0;
+    // Network: client send-complete to recv-event, minus server processing.
+    // All timestamps are cpuwide_time_us (same machine), no clock skew.
+    const int64_t server_sum = s_event + s_cq + s_msg + s_bthread
+                             + s_deser + s_svc + s_ser + s_queue;
+    const int64_t network = (t.c_recv_event_us > 0 && t.c_post_end > 0) ?
+        (t.c_recv_event_us - t.c_post_end - server_sum) : 0;
     const int64_t total = t.c_done_run_us - t.c_serialize_begin;
 
     if (urma::FLAGS_urma_trace_latency) {
         LOG(INFO) << "[URMA-E2E] c_ser=" << c_ser
                  << " c_queue=" << c_queue << " c_post=" << c_post
-                 << " | uplink=" << uplink
+                 << " | network=" << network
                  << " | s_event=" << s_event << " s_cq=" << s_cq
                  << " s_msg=" << s_msg << " s_bthread=" << s_bthread
                  << " s_deser=" << s_deser << " s_svc=" << s_svc
                  << " s_ser=" << s_ser << " s_queue=" << s_queue
                  << " s_post=" << s_post
-                 << " | downlink=" << downlink
                  << " | c_event=" << c_event << " c_cq=" << c_cq
                  << " c_msg=" << c_msg << " c_bthread=" << c_bthread
                  << " c_deser=" << c_deser << " c_done=" << c_done
@@ -1129,7 +1127,7 @@ void Controller::LogAndStatE2E() {
         g_e2e_c_serialize << c_ser;
         g_e2e_c_queue << c_queue;
         g_e2e_c_post << c_post;
-        g_e2e_uplink << uplink;
+        g_e2e_network << network;
         g_e2e_s_event << s_event;
         g_e2e_s_cq << s_cq;
         g_e2e_s_msg << s_msg;
@@ -1139,7 +1137,6 @@ void Controller::LogAndStatE2E() {
         g_e2e_s_ser << s_ser;
         g_e2e_s_queue << s_queue;
         g_e2e_s_post << s_post;
-        g_e2e_downlink << downlink;
         g_e2e_c_event << c_event;
         g_e2e_c_cq << c_cq;
         g_e2e_c_msg << c_msg;
@@ -1370,11 +1367,6 @@ void Controller::IssueRPC(int64_t start_realtime_us) {
     SocketMessage* user_packet = NULL;
 #if BRPC_E2E_TRACE
     const bool e2e_trace = urma::FLAGS_urma_trace_latency;
-    if (e2e_trace) {
-        // Set net_c_post_real BEFORE _pack_request so PackRpcRequest can
-        // serialize it into request user_fields for server-side uplink calc.
-        _e2e_trace.net_c_post_real = butil::gettimeofday_us();
-    }
 #else
     const bool e2e_trace = false;
 #endif

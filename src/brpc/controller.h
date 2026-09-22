@@ -104,12 +104,6 @@ struct E2ELatencyTrace {
     int64_t s_write_queue_us{0};                          // #12
     int64_t s_post_begin{0}, s_post_end{0};               // #13
 
-    // Cross-network (gettimeofday_us, NTP-synced wall clock)
-    int64_t net_c_post_real{0};    // client post moment
-    int64_t net_s_recv_real{0};    // server recv moment
-    int64_t net_s_post_real{0};    // server post moment
-    int64_t net_c_recv_real{0};    // client recv moment
-
     // Server-side stage durations (received from server via RpcMeta user_fields)
     int64_t s_event_dur{0};
     int64_t s_cq_dur{0};

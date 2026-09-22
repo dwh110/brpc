@@ -422,8 +422,6 @@ void SendRpcResponse(int64_t correlation_id, Controller* cntl,
             (t.s_post_begin - t.s_write_queue_us) : 0;
 
         auto* uf = &(*cntl->response_user_fields());
-        (*uf)["e2e_s_recv"] = std::to_string(t.net_s_recv_real);
-        (*uf)["e2e_s_post"] = std::to_string(butil::gettimeofday_us());
         (*uf)["e2e_s_event"] = std::to_string(s_event);
         (*uf)["e2e_s_cq"] = std::to_string(s_cq);
         (*uf)["e2e_s_msg"] = std::to_string(s_msg);
@@ -721,19 +719,13 @@ void ProcessRpcRequest(InputMessageBase* msg_base) {
     }
 
 #if BRPC_E2E_TRACE
-    // E2E trace: copy URMA stage timestamps from InputMessageBase and user_fields.
+    // E2E trace: copy URMA stage timestamps from InputMessageBase.
     if (::brpc::urma::FLAGS_urma_trace_latency) {
         cntl->_e2e_trace.s_recv_event_us = msg_base->_recv_event_us;
         cntl->_e2e_trace.s_cq_drain_us = msg_base->_cq_drain_us;
         cntl->_e2e_trace.s_dispatch_us = msg_base->_dispatch_us;
         cntl->_e2e_trace.s_msg_received_us = msg_base->_msg_cut_us;
         cntl->_e2e_trace.s_process_bthread_us = msg_base->_process_bthread_us;
-        cntl->_e2e_trace.net_s_recv_real = butil::gettimeofday_us();
-        // Read client post timestamp from user_fields for uplink calculation.
-        auto it = meta.user_fields().find("e2e_c_post");
-        if (it != meta.user_fields().end()) {
-            cntl->_e2e_trace.net_c_post_real = strtoll(it->second.c_str(), NULL, 10);
-        }
     }
 #endif  // BRPC_E2E_TRACE
 
@@ -1072,17 +1064,8 @@ void ProcessRpcResponse(InputMessageBase* msg_base) {
         cntl->_e2e_trace.c_dispatch_us = msg_base->_dispatch_us;
         cntl->_e2e_trace.c_msg_received_us = msg_base->_msg_cut_us;
         cntl->_e2e_trace.c_process_bthread_us = msg_base->_process_bthread_us;
-        cntl->_e2e_trace.net_c_recv_real = butil::gettimeofday_us();
-        auto it = meta.user_fields().find("e2e_s_recv");
-        if (it != meta.user_fields().end()) {
-            cntl->_e2e_trace.net_s_recv_real = strtoll(it->second.c_str(), NULL, 10);
-        }
-        it = meta.user_fields().find("e2e_s_post");
-        if (it != meta.user_fields().end()) {
-            cntl->_e2e_trace.net_s_post_real = strtoll(it->second.c_str(), NULL, 10);
-        }
         // Server stage durations
-        it = meta.user_fields().find("e2e_s_event");
+        auto it = meta.user_fields().find("e2e_s_event");
         if (it != meta.user_fields().end())
             cntl->_e2e_trace.s_event_dur = strtoll(it->second.c_str(), NULL, 10);
         it = meta.user_fields().find("e2e_s_cq");
@@ -1293,16 +1276,6 @@ void PackRpcRequest(butil::IOBuf* req_buf,
             stream_settings->mutable_extra_stream_ids()->Add(request_stream_ids[i]);
         }
     }
-
-#if BRPC_E2E_TRACE
-    // E2E trace: write client post timestamp into request user_fields for server.
-    if (::brpc::urma::FLAGS_urma_trace_latency) {
-        if (cntl->_e2e_trace.net_c_post_real > 0) {
-            (*cntl->request_user_fields())["e2e_c_post"] =
-                std::to_string(cntl->_e2e_trace.net_c_post_real);
-        }
-    }
-#endif  // BRPC_E2E_TRACE
 
     if (cntl->has_request_user_fields() && !cntl->request_user_fields()->empty()) {
         ::google::protobuf::Map<std::string, std::string>& user_fields

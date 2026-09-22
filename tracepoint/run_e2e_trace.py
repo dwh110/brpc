@@ -90,12 +90,11 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 LOCAL_LOG = os.path.join(SCRIPT_DIR, 'output', 'e2e_client_trace.log')
 LOCAL_ANALYSIS = os.path.join(SCRIPT_DIR, 'output', 'e2e_analysis.txt')
 
-# All 19 stages (matching Controller::LogAndStatE2E output)
+# All stages (matching Controller::LogAndStatE2E output)
 ALL_STAGES = [
-    'c_ser', 'c_queue', 'c_post', 'uplink',
+    'c_ser', 'c_queue', 'c_post', 'network',
     's_event', 's_cq', 's_msg', 's_bthread',
     's_deser', 's_svc', 's_ser', 's_queue', 's_post',
-    'downlink',
     'c_event', 'c_cq', 'c_msg', 'c_bthread',
     'c_deser', 'c_done',
 ]
@@ -138,6 +137,8 @@ def upload_file(host, local, remote):
     sftp = ssh.open_sftp()
     sftp.put(local, remote)
     sftp.close()
+    # Convert CRLF to LF (Windows -> Unix)
+    ssh.exec_command(f'sed -i "s/\\r$//" "{remote}"')
     ssh.close()
 
 
@@ -321,8 +322,9 @@ def print_waterfall(records):
         ('c_ser',    'Client serialize',     'client'),
         ('c_queue',  'Client queue',         'client'),
         ('c_post',   'Client URMA post',     'client'),
-        # Network + server (residual, not individually measurable)
-        ('uplink',   'Uplink (net)',         'network'),
+        # Network (uplink + downlink, measured as single residual)
+        ('network',  'Network (RTT)',        'network'),
+        # Server processing
         ('s_event',  'Server event',         'server'),
         ('s_cq',     'Server CQ drain',      'server'),
         ('s_msg',    'Server msg recv',      'server'),
@@ -332,7 +334,6 @@ def print_waterfall(records):
         ('s_ser',    'Server serialize',     'server'),
         ('s_queue',  'Server queue',         'server'),
         ('s_post',   'Server URMA post',     'server'),
-        ('downlink', 'Downlink (net)',       'network'),
         # Client recv path
         ('c_event',  'Client event',         'client'),
         ('c_cq',     'Client CQ drain',      'client'),
@@ -353,9 +354,8 @@ def print_waterfall(records):
 
     avg_total = sum(r['total'] for r in records) / len(records)
 
-    # Network residual = total - sum(client local stages)
+    # Client local sum for breakdown
     client_sum = sum(stage_avgs.get(s, 0) or 0 for s in CLIENT_LOCAL_STAGES)
-    network_residual = avg_total - client_sum if avg_total > client_sum else 0
 
     # Bar scale: max bar width = 50 chars
     MAX_BAR_WIDTH = 50
@@ -363,8 +363,6 @@ def print_waterfall(records):
         (v for v in stage_avgs.values() if v is not None and 0 < v < 10000),
         default=1
     )
-    # Include network residual in scale consideration
-    max_stage_val = max(max_stage_val, network_residual)
 
     print("\n" + "=" * 80)
     print("WATERFALL CHART (avg latency per stage, in RPC execution order)")
@@ -372,7 +370,6 @@ def print_waterfall(records):
     print(f"  Total avg: {avg_total:.1f} us  |  bar scale: {max_stage_val:.1f} us")
     print()
 
-    group_colors = {'client': '', 'server': '', 'network': ''}
     group_labels = {
         'client': 'CLIENT',
         'server': 'SERVER',
@@ -388,12 +385,6 @@ def print_waterfall(records):
             prev_group = group
 
         avg = stage_avgs[stage_key]
-
-        # Skip unreliable stages (clock-skewed uplink/downlink, untransmitted server)
-        if stage_key in ('uplink', 'downlink'):
-            print(f"  {group_labels[group]} {label:<22} ~{network_residual:>6.1f} us  "
-                  f"[network residual, clock-skewed]")
-            continue
 
         if avg is None:
             print(f"  {group_labels[group]} {label:<22} {'---':>7}     [no data]")
@@ -413,13 +404,15 @@ def print_waterfall(records):
         pct = 100 * avg / avg_total if avg_total > 0 else 0
         print(f"  {group_labels[group]} {label:<22} {avg:>7.1f} us  {bar:<{MAX_BAR_WIDTH}}  ({pct:>4.1f}%)")
 
-    # Network residual summary line
+    # Summary lines
+    server_sum = sum(stage_avgs.get(s, 0) or 0
+                     for s in ['s_event','s_cq','s_msg','s_bthread',
+                               's_deser','s_svc','s_ser','s_queue','s_post'])
+    network_avg = stage_avgs.get('network', 0) or 0
     print()
-    net_bar_width = int(network_residual / max_stage_val * MAX_BAR_WIDTH) if max_stage_val > 0 else 0
-    net_bar = '=' * net_bar_width
-    net_pct = 100 * network_residual / avg_total if avg_total > 0 else 0
-    print(f"  {'NET  '} {'Network (residual)':<22} {network_residual:>7.1f} us  {net_bar:<{MAX_BAR_WIDTH}}  ({net_pct:>4.1f}%)")
+    print(f"  {'NET  '} {'Network (RTT)':<22} {network_avg:>7.1f} us")
     print(f"  {'NET  '} {'Client local sum':<22} {client_sum:>7.1f} us")
+    print(f"  {'NET  '} {'Server sum':<22} {server_sum:>7.1f} us")
     print(f"  {'NET  '} {'Total':<22} {avg_total:>7.1f} us")
 
 
@@ -479,19 +472,16 @@ def _stage_analyze_impl(lines):
     totals = [r['total'] for r in records if r.get('total', 0) > 0]
     stats(totals, 'total')
 
-    # --- Network residual ---
+    # --- Network latency (directly measured, not residual) ---
     print("\n" + "-" * 60)
-    print("NETWORK LATENCY (residual = total - sum(client stages))")
+    print("NETWORK LATENCY (c_post_end → c_recv_event - server processing)")
     print("-" * 60)
-    residuals = []
-    for r in records:
-        client_sum = sum(r.get(s, 0) for s in CLIENT_LOCAL_STAGES)
-        residuals.append(r['total'] - client_sum)
-    stats(residuals, 'network')
+    network_vals = [r['network'] for r in records if 'network' in r and r['network'] >= 0]
+    stats(network_vals, 'network')
 
-    # --- All 19 stages (includes server-side from RpcMeta user_fields) ---
+    # --- All stages ---
     print("\n" + "-" * 60)
-    print("ALL 19 STAGES (server stages may be 0 if not transmitted)")
+    print("ALL STAGES (server stages may be 0 if not transmitted)")
     print("-" * 60)
     print(f"  {'Stage':<14} {'avg(us)':<10} {'p50(us)':<10} {'p99(us)':<10} {'min':<6} {'max':<6}")
     print("  " + "-" * 58)
@@ -507,7 +497,7 @@ def _stage_analyze_impl(lines):
 
     # --- Breakdown ---
     avg_client = sum(sum(r.get(s, 0) for s in CLIENT_LOCAL_STAGES) for r in records) / len(records)
-    avg_network = sum(residuals) / len(residuals) if residuals else 0
+    avg_network = sum(network_vals) / len(network_vals) if network_vals else 0
     avg_total = sum(totals) / len(totals) if totals else 0
     print("\n" + "-" * 60)
     print("BREAKDOWN (averages)")
