@@ -29,6 +29,14 @@ import time
 
 import paramiko
 
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
 # --- Environment config ---
 SERVER_HOST = '141.61.17.202'
 CLIENT_HOST = '141.61.17.204'
@@ -89,6 +97,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 # Output log file
 LOCAL_LOG = os.path.join(SCRIPT_DIR, 'output', 'e2e_client_trace.log')
 LOCAL_ANALYSIS = os.path.join(SCRIPT_DIR, 'output', 'e2e_analysis.txt')
+LOCAL_EXCEL = os.path.join(SCRIPT_DIR, 'output', 'e2e_trace.xlsx')
 
 # All stages (matching Controller::LogAndStatE2E output)
 ALL_STAGES = [
@@ -310,21 +319,12 @@ def stats(vals, name):
 
 
 def print_waterfall(records):
-    """Print a waterfall chart showing avg latency per stage in RPC execution order.
-
-    Each stage is drawn as a horizontal bar proportional to its avg duration.
-    Stages with 0 or unreliable data (uplink/downlink due to clock skew, or
-    server stages not transmitted via RpcMeta) are marked but not drawn.
-    """
-    # Stage display order with human-readable labels and group separators
+    """Print a waterfall table showing latency statistics per stage in RPC execution order."""
     waterfall_stages = [
-        # Client send path
         ('c_ser',    'Client serialize',     'client'),
         ('c_queue',  'Client queue',         'client'),
         ('c_post',   'Client URMA post',     'client'),
-        # Network (uplink + downlink, measured as single residual)
         ('network',  'Network (RTT)',        'network'),
-        # Server processing
         ('s_event',  'Server event',         'server'),
         ('s_cq',     'Server CQ drain',      'server'),
         ('s_msg',    'Server msg recv',      'server'),
@@ -334,7 +334,6 @@ def print_waterfall(records):
         ('s_ser',    'Server serialize',     'server'),
         ('s_queue',  'Server queue',         'server'),
         ('s_post',   'Server URMA post',     'server'),
-        # Client recv path
         ('c_event',  'Client event',         'client'),
         ('c_cq',     'Client CQ drain',      'client'),
         ('c_msg',    'Client msg recv',      'client'),
@@ -343,77 +342,216 @@ def print_waterfall(records):
         ('c_done',   'Client done',          'client'),
     ]
 
-    # Compute avg for each stage
-    stage_avgs = {}
+    # Compute stats for each stage
+    stage_stats = {}
     for stage_key, _, _ in waterfall_stages:
-        vals = [r[stage_key] for r in records if stage_key in r and r[stage_key] >= 0]
+        vals = sorted([r[stage_key] for r in records if stage_key in r and r[stage_key] >= 0])
         if vals:
-            stage_avgs[stage_key] = sum(vals) / len(vals)
+            n = len(vals)
+            stage_stats[stage_key] = {
+                'avg': sum(vals) / n,
+                'p50': vals[n // 2],
+                'p99': vals[int(n * 0.99)] if n > 100 else vals[-1],
+                'min': vals[0],
+                'max': vals[-1],
+            }
         else:
-            stage_avgs[stage_key] = None
+            stage_stats[stage_key] = None
 
     avg_total = sum(r['total'] for r in records) / len(records)
 
-    # Client local sum for breakdown
-    client_sum = sum(stage_avgs.get(s, 0) or 0 for s in CLIENT_LOCAL_STAGES)
-
-    # Bar scale: max bar width = 50 chars
-    MAX_BAR_WIDTH = 50
-    max_stage_val = max(
-        (v for v in stage_avgs.values() if v is not None and 0 < v < 10000),
-        default=1
-    )
-
-    print("\n" + "=" * 80)
-    print("WATERFALL CHART (avg latency per stage, in RPC execution order)")
-    print("=" * 80)
-    print(f"  Total avg: {avg_total:.1f} us  |  bar scale: {max_stage_val:.1f} us")
-    print()
+    print("\n" + "=" * 92)
+    print("WATERFALL TABLE (latency per stage, in RPC execution order)")
+    print("=" * 92)
+    print(f"  {'#':<3} {'Group':<8} {'Stage':<22} {'avg(us)':>8} {'p50(us)':>8} {'p99(us)':>8} {'min(us)':>8} {'max(us)':>8} {'%':>6}  Note")
+    print("  " + "-" * 88)
 
     group_labels = {
         'client': 'CLIENT',
         'server': 'SERVER',
-        'network': 'NET  ',
+        'network': 'NET',
     }
 
-    prev_group = None
+    idx = 0
     for stage_key, label, group in waterfall_stages:
-        # Print group separator
-        if group != prev_group:
-            if prev_group is not None:
-                print()
-            prev_group = group
-
-        avg = stage_avgs[stage_key]
-
-        if avg is None:
-            print(f"  {group_labels[group]} {label:<22} {'---':>7}     [no data]")
+        idx += 1
+        s = stage_stats[stage_key]
+        if s is None:
+            print(f"  {idx:<3} {group_labels[group]:<8} {label:<22} {'---':>8} {'---':>8} {'---':>8} {'---':>8} {'---':>8} {'':>6}  [no data]")
             continue
 
-        if avg >= 10000:
-            print(f"  {group_labels[group]} {label:<22} {avg:>7.1f} us  [unreliable]")
+        if s['avg'] >= 10000:
+            print(f"  {idx:<3} {group_labels[group]:<8} {label:<22} {s['avg']:>8.1f} {s['p50']:>8} {s['p99']:>8} {s['min']:>8} {s['max']:>8} {'':>6}  [unreliable]")
             continue
 
-        if avg == 0 and group == 'server':
-            print(f"  {group_labels[group]} {label:<22} {'0.0':>7} us  [not transmitted]")
-            continue
+        pct = 100 * s['avg'] / avg_total if avg_total > 0 else 0
+        note = ''
+        if s['avg'] == 0 and group == 'server':
+            note = '[not transmitted]'
+        elif group == 'network':
+            note = '[uplink+downlink]'
 
-        bar_width = int(avg / max_stage_val * MAX_BAR_WIDTH) if max_stage_val > 0 else 0
-        bar_width = max(bar_width, 1)  # at least 1 char for visible stages
-        bar = '#' * bar_width
-        pct = 100 * avg / avg_total if avg_total > 0 else 0
-        print(f"  {group_labels[group]} {label:<22} {avg:>7.1f} us  {bar:<{MAX_BAR_WIDTH}}  ({pct:>4.1f}%)")
+        print(f"  {idx:<3} {group_labels[group]:<8} {label:<22} {s['avg']:>8.1f} {s['p50']:>8} {s['p99']:>8} {s['min']:>8} {s['max']:>8} {pct:>5.1f}%  {note}")
 
-    # Summary lines
-    server_sum = sum(stage_avgs.get(s, 0) or 0
+    # Summary
+    client_sum = sum(stage_stats.get(s, {}).get('avg', 0) or 0 for s in CLIENT_LOCAL_STAGES)
+    server_sum = sum(stage_stats.get(s, {}).get('avg', 0) or 0
                      for s in ['s_event','s_cq','s_msg','s_bthread',
                                's_deser','s_svc','s_ser','s_queue','s_post'])
-    network_avg = stage_avgs.get('network', 0) or 0
-    print()
-    print(f"  {'NET  '} {'Network (RTT)':<22} {network_avg:>7.1f} us")
-    print(f"  {'NET  '} {'Client local sum':<22} {client_sum:>7.1f} us")
-    print(f"  {'NET  '} {'Server sum':<22} {server_sum:>7.1f} us")
-    print(f"  {'NET  '} {'Total':<22} {avg_total:>7.1f} us")
+    network_avg = stage_stats.get('network', {}).get('avg', 0) if stage_stats.get('network') else 0
+    print("  " + "-" * 88)
+    print(f"  {'':3} {'NET':<8} {'Network (RTT)':<22} {network_avg:>8.1f}")
+    print(f"  {'':3} {'NET':<8} {'Client local sum':<22} {client_sum:>8.1f}")
+    print(f"  {'':3} {'NET':<8} {'Server sum':<22} {server_sum:>8.1f}")
+    print(f"  {'':3} {'NET':<8} {'Total':<22} {avg_total:>8.1f}")
+
+
+def export_excel(records):
+    """Export trace records and stage statistics to an Excel file."""
+    if not HAS_OPENPYXL:
+        print("Excel export skipped (openpyxl not installed). Install with: pip install openpyxl")
+        return
+
+    wb = Workbook()
+
+    # --- Style helpers ---
+    header_font = Font(bold=True, color='FFFFFF')
+    header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+    group_fills = {
+        'CLIENT': PatternFill(start_color='D6E4F0', end_color='D6E4F0', fill_type='solid'),
+        'SERVER': PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid'),
+        'NET':    PatternFill(start_color='FCE4D6', end_color='FCE4D6', fill_type='solid'),
+    }
+    thin_border = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin'),
+    )
+
+    # --- Sheet 1: Stage Statistics ---
+    ws1 = wb.active
+    ws1.title = 'Stage Statistics'
+
+    waterfall_stages = [
+        ('c_ser',    'Client serialize',     'CLIENT'),
+        ('c_queue',  'Client queue',         'CLIENT'),
+        ('c_post',   'Client URMA post',     'CLIENT'),
+        ('network',  'Network (RTT)',        'NET'),
+        ('s_event',  'Server event',         'SERVER'),
+        ('s_cq',     'Server CQ drain',      'SERVER'),
+        ('s_msg',    'Server msg recv',      'SERVER'),
+        ('s_bthread','Server bthread',       'SERVER'),
+        ('s_deser',  'Server deser',         'SERVER'),
+        ('s_svc',    'Server service',       'SERVER'),
+        ('s_ser',    'Server serialize',     'SERVER'),
+        ('s_queue',  'Server queue',         'SERVER'),
+        ('s_post',   'Server URMA post',     'SERVER'),
+        ('c_event',  'Client event',         'CLIENT'),
+        ('c_cq',     'Client CQ drain',      'CLIENT'),
+        ('c_msg',    'Client msg recv',      'CLIENT'),
+        ('c_bthread','Client bthread',       'CLIENT'),
+        ('c_deser',  'Client deser',         'CLIENT'),
+        ('c_done',   'Client done',          'CLIENT'),
+    ]
+
+    headers = ['#', 'Group', 'Stage', 'avg(us)', 'p50(us)', 'p99(us)', 'min(us)', 'max(us)', '%']
+    for col, h in enumerate(headers, 1):
+        cell = ws1.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center')
+        cell.border = thin_border
+
+    avg_total = sum(r['total'] for r in records) / len(records)
+
+    for i, (stage_key, label, group) in enumerate(waterfall_stages, 1):
+        vals = sorted([r[stage_key] for r in records if stage_key in r and r[stage_key] >= 0])
+        row = i + 1
+        ws1.cell(row=row, column=1, value=i).border = thin_border
+        ws1.cell(row=row, column=2, value=group).border = thin_border
+        ws1.cell(row=row, column=3, value=label).border = thin_border
+        if vals:
+            n = len(vals)
+            avg = sum(vals) / n
+            p50 = vals[n // 2]
+            p99 = vals[int(n * 0.99)] if n > 100 else vals[-1]
+            pct = 100 * avg / avg_total if avg_total > 0 else 0
+            ws1.cell(row=row, column=4, value=round(avg, 1)).border = thin_border
+            ws1.cell(row=row, column=5, value=p50).border = thin_border
+            ws1.cell(row=row, column=6, value=p99).border = thin_border
+            ws1.cell(row=row, column=7, value=vals[0]).border = thin_border
+            ws1.cell(row=row, column=8, value=vals[-1]).border = thin_border
+            ws1.cell(row=row, column=9, value=round(pct, 1)).border = thin_border
+        else:
+            for col in range(4, 10):
+                ws1.cell(row=row, column=col, value='---').border = thin_border
+        for col in range(1, 10):
+            ws1.cell(row=row, column=col).fill = group_fills.get(group, PatternFill())
+
+    # Summary rows
+    summary_start = len(waterfall_stages) + 2
+    summaries = [
+        ('Network (RTT)',     [r['network'] for r in records if 'network' in r]),
+        ('Client local sum',  [sum(r.get(s, 0) for s in CLIENT_LOCAL_STAGES) for r in records]),
+        ('Server sum',        [sum(r.get(s, 0) for s in ['s_event','s_cq','s_msg','s_bthread',
+                                                         's_deser','s_svc','s_ser','s_queue','s_post']) for r in records]),
+        ('Total',             [r['total'] for r in records]),
+    ]
+    for j, (label, vals) in enumerate(summaries):
+        row = summary_start + j
+        ws1.cell(row=row, column=3, value=label).font = Font(bold=True)
+        if vals:
+            avg = sum(vals) / len(vals)
+            ws1.cell(row=row, column=4, value=round(avg, 1)).font = Font(bold=True)
+        for col in range(1, 10):
+            ws1.cell(row=row, column=col).border = thin_border
+
+    # Column widths
+    for col, width in enumerate([5, 8, 22, 10, 10, 10, 10, 10, 8], 1):
+        ws1.column_dimensions[get_column_letter(col)].width = width
+
+    # --- Sheet 2: Raw Records ---
+    ws2 = wb.create_sheet('Raw Records')
+    col_headers = ['Index'] + ALL_STAGES + ['total']
+    for col, h in enumerate(col_headers, 1):
+        cell = ws2.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center')
+        cell.border = thin_border
+
+    for i, r in enumerate(records, 1):
+        ws2.cell(row=i + 1, column=1, value=i).border = thin_border
+        for j, stage in enumerate(ALL_STAGES + ['total'], 2):
+            ws2.cell(row=i + 1, column=j, value=r.get(stage, 0)).border = thin_border
+
+    for col in range(1, len(col_headers) + 1):
+        ws2.column_dimensions[get_column_letter(col)].width = 12
+
+    # --- Sheet 3: Test Parameters ---
+    ws3 = wb.create_sheet('Test Info')
+    info = [
+        ('IO Mode', IO_MODE),
+        ('Request Size (B)', REQ_SIZE),
+        ('Response Size (B)', RSP_SIZE),
+        ('Expected QPS', EXPECTED_QPS),
+        ('Test Duration (s)', TEST_SECONDS),
+        ('Send Buffer (KB)', SEND_BUF_KB),
+        ('Recv Buffer (KB)', RECV_BUF_KB),
+        ('Num Threads', NUM_THREADS),
+        ('Records', len(records)),
+        ('Warmup Skip', WARMUP_SKIP),
+        ('Server Host', SERVER_HOST),
+        ('Client Host', CLIENT_HOST),
+    ]
+    for i, (k, v) in enumerate(info, 1):
+        ws3.cell(row=i, column=1, value=k).font = Font(bold=True)
+        ws3.cell(row=i, column=2, value=v)
+    ws3.column_dimensions['A'].width = 22
+    ws3.column_dimensions['B'].width = 20
+
+    os.makedirs(os.path.dirname(LOCAL_EXCEL), exist_ok=True)
+    wb.save(LOCAL_EXCEL)
+    print(f"Excel saved to {LOCAL_EXCEL}")
 
 
 def stage_analyze(lines=None):
@@ -529,6 +667,9 @@ def _stage_analyze_impl(lines):
 
     # --- Waterfall chart ---
     print_waterfall(records)
+
+    # --- Excel export ---
+    export_excel(records)
 
 
 # --- Main ---
