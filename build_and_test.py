@@ -16,6 +16,8 @@ LOCAL_FILES = [
     "src/brpc/urma/urma_one_sided.h",
     "src/brpc/urma/urma_endpoint.h",
     "src/brpc/urma/urma_endpoint.cpp",
+    "src/brpc/urma/urma_helper.h",
+    "src/brpc/urma/urma_helper.cpp",
 ]
 REMOTE_DIR = "/home/d00836578/brpc_workspace/brpc_urma/brpc/src/brpc/urma/"
 
@@ -26,9 +28,8 @@ BUILD_CMD = (
     "cd /home/d00836578/brpc_workspace/brpc_urma/brpc && "
     'export http_proxy="http://141.1.37.126:7777" && '
     'export https_proxy="http://141.1.37.126:7777" && '
-    "export CPLUS_INCLUDE_PATH=//usr/include/ub/:/usr/include/ub/umdk/:/usr/include/ub/umdk/urma:$CPLUS_INCLUDE_PATH && "
-    "bazel build //example:ub_test_server //example:ub_test_client "
-    "--define=BRPC_WITH_URMA=true --repo_env=BRPC_DOWNLOAD_URMA_HEADERS=0 -c opt "
+    "bazel build -c opt //example:ub_test_server //example:ub_test_client "
+    "--define=BRPC_WITH_URMA=true --spawn_strategy=standalone "
     "--define=BUTIL_USE_CPU_FREQUENCY=true 2>&1"
 )
 
@@ -122,10 +123,12 @@ def main():
     print("=" * 60)
 
     test_cases = [
-        (1048576, 1000, "1MB qd=10 - key test"),
         (1024, 1000, "1KB regression"),
         (8192, 1000, "8KB regression"),
+        (102400, 1000, "100KB"),
+        (1048576, 1000, "1MB qd=10"),
         (8388608, 1000, "8MB qd=10"),
+        (8388608, 500, "8MB qd=10 qps=500"),
     ]
 
     results = []
@@ -136,11 +139,14 @@ def main():
         run_cmd(server, "pkill -f ub_test_server 2>/dev/null; sleep 1", timeout=10)
 
         server_cmd = (
-            f"nohup numactl -C 96-111 -m 1 {SERVER_BIN} "
+            f"setsid numactl -C 96-111 -m 1 {SERVER_BIN} "
             f"--port {PORT} --use_urma=true --rsp_size={size} --num_threads=16 "
             f"--urma_io_mode=2 --urma_max_sge_len=65536 "
             f"--urma_send_buf_size=2048 --urma_recv_buf_size=2048 "
-            f"> /tmp/ub_test_server.log 2>&1 &"
+            f"--urma_chunk_payload_size=2095104 --urma_sq_size=1024 "
+            f"--urma_use_polling=true "
+            f"--graceful_quit_on_sigterm "
+            f"> /tmp/ub_test_server.log 2>&1 & echo $!"
         )
         run_cmd(server, server_cmd, timeout=10)
         time.sleep(3)
@@ -159,7 +165,9 @@ def main():
             f"--servers={SERVER_HOST}:{PORT} --use_urma=true "
             f"--urma_io_mode=2 --urma_max_sge_len=65536 "
             f"--urma_send_buf_size=2048 --urma_recv_buf_size=2048 "
-            f"--rpc_timeout_ms=2000 --connect_timeout_ms=6000 "
+            f"--urma_chunk_payload_size=2095104 --urma_sq_size=1024 "
+            f"--urma_use_polling=true "
+            f"--rpc_timeout_ms=5000 --connect_timeout_ms=6000 "
             f"--test_seconds=20 --max_retry=10 --queue_depth=10 "
             f"--req_size={size} --dummy_port=0 --expected_qps={qps} "
             f"--initial_tokens=0 2>&1"
@@ -187,11 +195,11 @@ def main():
                 print(f"    {l}")
             results.append((size, qps, "ERROR", "", ""))
 
-        run_cmd(server, "pkill -f ub_test_server 2>/dev/null", timeout=10)
+        run_cmd(server, f"kill -TERM {pid_out} 2>/dev/null; sleep 1", timeout=10)
         # Print last 30 lines of server log for debugging.
         if size >= 1048576:
-            print("  --- Server log (last 30 lines) ---")
-            _, srv_log, _ = run_cmd(server, "tail -30 /tmp/ub_test_server.log", timeout=10)
+            print("  --- Server log (last 20 lines) ---")
+            _, srv_log, _ = run_cmd(server, "tail -20 /tmp/ub_test_server.log", timeout=10)
         time.sleep(2)
 
     # Summary

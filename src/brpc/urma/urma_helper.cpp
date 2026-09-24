@@ -16,6 +16,7 @@
 // under the License.
 
 #include "brpc/urma/urma_helper.h"
+#include "brpc/urma/urma_one_sided.h"
 
 #if BRPC_WITH_URMA
 
@@ -156,6 +157,13 @@ DEFINE_int32(urma_recv_buf_size, 128,
              "Size in KB of the per-connection recv_buf for one-sided "
              "operations. Must be a multiple of 1KB. Used as the "
              "destination buffer for incoming WRITE_IMM data.");
+DEFINE_int32(urma_chunk_payload_size, 130048,
+             "Max payload bytes per WRITE_IN_BAND chunk (io_mode=2 large IO). "
+             "Must fit within send_buf/recv_buf alongside the 24-byte "
+             "UrmaMessageHead and align to 1KB. Larger values reduce WR "
+             "count for big messages (e.g. 2MB chunk → 8MB = 4 WRs instead "
+             "of 65). Increase --urma_send_buf_size/--urma_recv_buf_size "
+             "accordingly. 0 means use 127KB legacy default.");
 
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
@@ -936,6 +944,22 @@ uint32_t GetUrmaSendMaxSgeLen() {
     // whose SGE payload exceeds 4096 bytes.  This value is NOT affected
     // by --urma_max_sge_len.
     return 4096;
+}
+
+uint32_t GetUrmaChunkPayloadMax() {
+    // Max payload per WRITE_IN_BAND chunk (io_mode=2 large IO path).
+    // Controlled by --urma_chunk_payload_size. WRITE_IMM is NOT subject to
+    // the 4096-byte SEND limit — 127KB chunks are proven stable, and larger
+    // values (up to ~2MB) are supported when send_buf/recv_buf are enlarged.
+    // Must be aligned to URMA_ONE_SIDED_ALLOC_UNIT (1KB) and leave room for
+    // the 24-byte UrmaMessageHead.
+    if (FLAGS_urma_chunk_payload_size <= 0) {
+        return 127 * 1024;  // legacy default
+    }
+    // Align down to 1KB allocation unit.
+    uint32_t v = static_cast<uint32_t>(FLAGS_urma_chunk_payload_size);
+    v &= ~static_cast<uint32_t>(1024 - 1);
+    return v;
 }
 
 // ============================================================================

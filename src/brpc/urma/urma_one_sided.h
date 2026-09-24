@@ -112,7 +112,9 @@ constexpr uint32_t URMA_ONE_SIDED_ALLOC_UNIT = 1024;
 
 // Maximum payload per WRITE_IN_BAND chunk. Must fit in send_buf/recv_buf
 // alongside the 24-byte UrmaMessageHead and align to URMA_ONE_SIDED_ALLOC_UNIT.
-constexpr uint32_t URMA_CHUNK_PAYLOAD_MAX = 127 * 1024;  // 127KB
+// Controlled by --urma_chunk_payload_size gflag (see urma_helper.cpp).
+// Use GetUrmaChunkPayloadMax() at runtime instead of a hardcoded constant.
+uint32_t GetUrmaChunkPayloadMax();
 
 // Maximum READ WRs posted per batch in the PRE_WRITE + READ path.
 // Inspired by UBS's TX_POST_BATCH_MAX=64. Keeps SQ window consumption
@@ -297,16 +299,18 @@ struct UrmaReasmCtx {
     uint64_t request_id{0};
     uint32_t total_chunks{0};
     uint32_t received_chunks{0};
-    // Chunk data indexed by chunk_idx. Copied from recv_buf immediately
-    // on arrival (recv_buf will be overwritten by next WRITE_IMM).
-    std::vector<std::string> chunks;
+    uint32_t next_expected{0};  // next expected chunk_idx (for in-order fast path)
+    // Out-of-order chunks stored as IOBuf (pool-backed, zero extra heap alloc).
+    // In-order chunks are appended directly to _read_buf and not stored here.
+    std::vector<butil::IOBuf> ooo_chunks;
 
     UrmaReasmCtx() = default;
     void Reset() {
         request_id = 0;
         total_chunks = 0;
         received_chunks = 0;
-        chunks.clear();
+        next_expected = 0;
+        ooo_chunks.clear();
     }
 };
 

@@ -75,6 +75,7 @@ DECLARE_int32(urma_io_mode);
 DECLARE_int32(urma_inline_threshold);
 DECLARE_int32(urma_send_buf_size);
 DECLARE_int32(urma_recv_buf_size);
+DECLARE_int32(urma_chunk_payload_size);
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -1540,9 +1541,10 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
     if (remaining == 0) return 0;
 
     // Initialize chunk tracking for a new message (when previous fully sent).
+    const uint32_t chunk_payload_max = GetUrmaChunkPayloadMax();
     if (_chunked_total_chunks == 0) {
         _chunked_total_chunks = static_cast<uint32_t>(
-            (remaining + URMA_CHUNK_PAYLOAD_MAX - 1) / URMA_CHUNK_PAYLOAD_MAX);
+            (remaining + chunk_payload_max - 1) / chunk_payload_max);
         _chunked_chunk_idx = 0;
         _chunked_request_id = _one_sided_seq.fetch_add(1,
             butil::memory_order_relaxed);
@@ -1551,7 +1553,7 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
     size_t total_sent = 0;
     while (remaining > 0) {
         const uint32_t chunk_payload = static_cast<uint32_t>(
-            std::min(remaining, static_cast<size_t>(URMA_CHUNK_PAYLOAD_MAX)));
+            std::min(remaining, static_cast<size_t>(chunk_payload_max)));
         const uint32_t alloc_size = sizeof(UrmaMessageHead) + chunk_payload;
 
         // Allocate send_buf slot.
@@ -2385,29 +2387,41 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
             // Single-chunk message (small IO): append directly.
             _socket->_read_buf.append(data, data_count);
         } else {
-            // Multi-chunk message (large IO): reassemble.
-            std::string chunk_data(data, data_count);
-            std::lock_guard<std::mutex> lock(_reasm_mutex);
+            // Multi-chunk message (large IO): reassemble without mutex
+            // (PollCq is single-threaded per endpoint). In-order chunks
+            // go directly to _read_buf; out-of-order chunks are buffered
+            // as IOBuf (pool-backed, no heap string allocation).
             auto it = _reasm_ctxs.find(request_id);
             UrmaReasmCtx* rctx;
             if (it == _reasm_ctxs.end()) {
                 rctx = new UrmaReasmCtx();
                 rctx->request_id = request_id;
                 rctx->total_chunks = total_chunks;
-                rctx->chunks.resize(total_chunks);
+                rctx->ooo_chunks.resize(total_chunks);
                 _reasm_ctxs[request_id] = rctx;
             } else {
                 rctx = it->second;
             }
-            rctx->chunks[chunk_idx] = std::move(chunk_data);
             ++rctx->received_chunks;
 
-            if (rctx->received_chunks >= rctx->total_chunks) {
-                // All chunks received: append in order to _read_buf.
-                for (uint32_t i = 0; i < rctx->total_chunks; ++i) {
-                    _socket->_read_buf.append(rctx->chunks[i].data(),
-                                              rctx->chunks[i].size());
+            if (chunk_idx == rctx->next_expected) {
+                // In-order fast path: append directly from recv_buf.
+                _socket->_read_buf.append(data, data_count);
+                ++rctx->next_expected;
+                // Flush any consecutive out-of-order chunks now in order.
+                while (rctx->next_expected < rctx->total_chunks &&
+                       !rctx->ooo_chunks[rctx->next_expected].empty()) {
+                    _socket->_read_buf.append(
+                        rctx->ooo_chunks[rctx->next_expected]);
+                    rctx->ooo_chunks[rctx->next_expected].clear();
+                    ++rctx->next_expected;
                 }
+            } else {
+                // Out-of-order: copy to IOBuf (pool-backed block).
+                rctx->ooo_chunks[chunk_idx].append(data, data_count);
+            }
+
+            if (rctx->received_chunks >= rctx->total_chunks) {
                 _reasm_ctxs.erase(request_id);
                 delete rctx;
             }
