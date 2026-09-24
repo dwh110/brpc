@@ -420,6 +420,12 @@ private:
     UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
     butil::atomic<uint64_t> _rx_consume_seq{0};
 
+    // Mutex serializing JFS posts on the WriteZeroCopy path. Bonding devices
+    // reject concurrent READ+WRITE_IMM on the same jetty (status=8): PollCq
+    // posts READ / POST_WRITE while KeepWrite posts PRE_WRITE. This mutex
+    // mirrors UBS v2's dispatch_lock_ to prevent the interleaving.
+    butil::Mutex _zerocopy_post_mutex;
+
     // ---- Chunked WRITE_IN_BAND state ----
     // Sender-side: tracks current message's chunk progress across multiple
     // CutFromIOBufList calls (KeepWrite is single-threaded per socket, so no

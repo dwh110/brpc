@@ -76,6 +76,7 @@ DECLARE_int32(urma_inline_threshold);
 DECLARE_int32(urma_send_buf_size);
 DECLARE_int32(urma_recv_buf_size);
 DECLARE_int32(urma_chunk_payload_size);
+DECLARE_bool(urma_use_zerocopy_read);
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -1040,9 +1041,14 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         // WRITE_ONLY: all sizes use WriteInline.
         return WriteInline(from, ndata);
     }
-    // HYBRID: small IO uses WriteInline, large IO uses WriteInlineChunked.
+    // HYBRID: small IO uses WriteInline, large IO uses either
+    // WriteInlineChunked (WRITE_IMM push) or WriteZeroCopy (PRE_WRITE+READ
+    // pull) depending on --urma_use_zerocopy_read.
     if (total <= static_cast<size_t>(FLAGS_urma_inline_threshold)) {
         return WriteInline(from, ndata);
+    }
+    if (FLAGS_urma_use_zerocopy_read) {
+        return WriteZeroCopy(from, ndata);
     }
     return WriteInlineChunked(from, ndata);
 }
@@ -1332,8 +1338,15 @@ ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
     // Consume one SQ slot for the WRITE_IMM WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    const urma_status_t status =
-        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    // When zerocopy_read is enabled, PollCq may post READ WRs concurrently.
+    // Bonding devices reject READ+WRITE_IMM interleaving (status=8), so
+    // serialize all WRITE_IMM posts with the mutex.
+    const urma_status_t status = [&]() {
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
+                                            std::defer_lock);
+        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    }();
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
         _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
@@ -1496,8 +1509,13 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     // Consume one SQ slot for the WRITE_IMM control message WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    const urma_status_t status =
-        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    // Hold _zerocopy_post_mutex during the jetty post to avoid concurrent
+    // READ / POST_WRITE posts from PollCq on the same jetty — bonding
+    // devices reject READ+WRITE_IMM interleaving with status=8.
+    const urma_status_t status = [&]() {
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
+        return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    }();
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
         _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
@@ -1640,8 +1658,13 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
         // Post WR.
         _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
         urma_jfs_wr_t* bad = nullptr;
-        const urma_status_t status =
-            urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+        // Serialize with PollCq's READ posts when zerocopy_read is enabled.
+        const urma_status_t status = [&]() {
+            std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
+                                                std::defer_lock);
+            if (FLAGS_urma_use_zerocopy_read) lock.lock();
+            return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+        }();
         if (status != URMA_SUCCESS) {
             const int provider_errno = errno;
             _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
@@ -1728,8 +1751,16 @@ int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
     // Consume one SQ slot for the WRITE_IMM WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    const urma_status_t status =
-        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    // Serialize with concurrent READ/WRITE_IMM posts when zerocopy_read is
+    // enabled. This function is called from PollCq (WRITE_IN_BAND_ACK,
+    // POST_WRITE) which may race with KeepWrite's WRITE_IMM posts and
+    // PollCq's PostReadBatch on bonding devices.
+    const urma_status_t status = [&]() {
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
+                                            std::defer_lock);
+        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    }();
     if (status != URMA_SUCCESS) {
         _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
         PLOG(WARNING) << "ResponseCtrlMessage: post failed: " << status
@@ -1846,8 +1877,12 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     // data windows in CutFromIOBufList: polling may observe its completion as
     // soon as the provider accepts the WR.
     --_sq_imm_window_size;
-    const urma_status_t status =
-        urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    const urma_status_t status = [&]() {
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
+                                            std::defer_lock);
+        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
+    }();
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
         ++_sq_imm_window_size;
@@ -2339,8 +2374,15 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     slot.next_read_idx += batch;
 
     urma_jfs_wr_t* bad = nullptr;
-    const urma_status_t status =
-        urma_post_jetty_send_wr(_resource->jetty, wrs.get(), &bad);
+    // PostReadBatch is called from PollCq (HandleWriteImmCompletion,
+    // HandleReadCompletion). When zerocopy_read is enabled, KeepWrite may
+    // concurrently post WRITE_IMM on the same jetty — bonding devices
+    // reject READ+WRITE_IMM interleaving (status=8). The mutex is always
+    // held during post; callers must NOT hold it.
+    const urma_status_t status = [&]() {
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
+        return urma_post_jetty_send_wr(_resource->jetty, wrs.get(), &bad);
+    }();
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
         _sq_window_size.fetch_add(static_cast<uint16_t>(batch),
@@ -2472,12 +2514,15 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
         }
         slot.total_bytes = total_bytes;
 
-        // Post the first batch of READ WRs.
+        // Post the first batch of READ WRs. PostReadBatch internally holds
+        // _zerocopy_post_mutex to serialize against KeepWrite's WRITE_IMM.
         if (PostReadBatch(idx) != 0) {
+            const int saved_errno = errno;
             LOG(ERROR) << "HandlePreWrite: PostReadBatch failed on "
                        << _socket->description();
-            slot.state.store(UrmaRxSlot::IDLE, butil::memory_order_relaxed);
-            errno = EAGAIN;
+            slot.state.store(UrmaRxSlot::IDLE,
+                             butil::memory_order_relaxed);
+            errno = saved_errno;
             return -1;
         }
 
@@ -2533,24 +2578,33 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
 
     // All READs in the current batch are done. More blocks to read?
     if (slot.next_read_idx < slot.total_blocks) {
+        // PostReadBatch internally holds _zerocopy_post_mutex.
         if (PostReadBatch(idx) != 0) {
+            const int saved_errno = errno;
             LOG(ERROR) << "HandleReadCompletion: PostReadBatch failed on "
                        << _socket->description()
                        << " next_read_idx=" << slot.next_read_idx
                        << " total_blocks=" << slot.total_blocks;
+            errno = saved_errno;
+            return -1;
         }
         return 0;
     }
 
-    // All batches complete: send POST_WRITE ack and clean up.
+    // All batches complete: send POST_WRITE ack to the sender so it can
+    // release its send_buf and saved_blocks. ResponseCtrlMessage internally
+    // holds _zerocopy_post_mutex to serialize the WRITE_IMM post.
     slot.state.store(UrmaRxSlot::DATA_READY, butil::memory_order_relaxed);
-
     const UrmaWriteImmData imm{slot.write_imm};
-    ResponseCtrlMessage(URMA_IO_POST_WRITE,
-                        imm.io.buffer_offset,
-                        slot.request_id,
-                        0);
-
+    if (ResponseCtrlMessage(URMA_IO_POST_WRITE,
+                            imm.io.buffer_offset,
+                            slot.request_id, 0) != 0) {
+        const int saved_errno = errno;
+        LOG(ERROR) << "HandleReadCompletion: POST_WRITE failed on "
+                   << _socket->description();
+        errno = saved_errno;
+        return -1;
+    }
     const ssize_t total_bytes = static_cast<ssize_t>(slot.total_bytes);
     slot.Reset();
     return total_bytes;

@@ -164,7 +164,14 @@ DEFINE_int32(urma_chunk_payload_size, 130048,
              "count for big messages (e.g. 2MB chunk → 8MB = 4 WRs instead "
              "of 65). Increase --urma_send_buf_size/--urma_recv_buf_size "
              "accordingly. 0 means use 127KB legacy default.");
-
+DEFINE_bool(urma_use_zerocopy_read, false,
+            "If true, io_mode=2 large IO uses WriteZeroCopy (PRE_WRITE + READ "
+            "pull model) instead of WriteInlineChunked (WRITE_IMM push model). "
+            "WriteZeroCopy sends only a control message; the receiver READs "
+            "data blocks from the sender's pool — no send_buf capacity is "
+            "consumed for payload, so concurrency is not limited by send_buf "
+            "size. Block size = --urma_max_sge_len (use a large value like "
+            "2095104 to minimize READ WR count).");
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
 // true, GlobalUrmaInitializeOrDie() returns without touching liburma and the
