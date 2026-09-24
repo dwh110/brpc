@@ -18,6 +18,7 @@
 #ifndef BRPC_URMA_ENDPOINT_H
 #define BRPC_URMA_ENDPOINT_H
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <ostream>
@@ -40,6 +41,19 @@
 #include "brpc/urma/urma_handshake.h"
 #include "brpc/urma/urma_handshake.pb.h"
 #include "brpc/urma/urma_one_sided.h"
+
+// Lock-free pending-send slot for MPSC pattern.
+// state lifecycle: 0 (free) -> key (occupied) -> 0 (free)
+// Writer (KeepWrite, single-threaded): CAS 0->key to acquire slot, then set ctx.
+// Reader (PollCq, single-threaded): find slot by key, read ctx, set state->0.
+struct PendingSendSlot {
+    std::atomic<uint64_t> state{0};  // 0=free, nonzero=key
+    brpc::urma::UrmaSendContext* ctx{nullptr};
+};
+
+// Max concurrent in-flight sends. send_buf 2MB / 1024B unit = 2048 slots
+// covers worst case. Use 4096 for headroom.
+static constexpr size_t kMaxPendingSends = 4096;
 
 namespace brpc {
 
@@ -397,10 +411,10 @@ private:
     // Request ID counter for one-sided messages.
     butil::atomic<uint64_t> _one_sided_seq{1};
 
-    // Pending send contexts: keyed by request_id. Tracks in-flight
-    // one-sided messages so we can release send_buf on ACK/POST_WRITE.
-    std::mutex _pending_sends_mutex;
-    std::unordered_map<uint64_t, UrmaSendContext*> _pending_sends;
+    // Pending send contexts: lock-free MPSC slot array.
+    // Writer (KeepWrite) CAS-acquires a free slot; Reader (PollCq) finds
+    // by key and releases. Replaces the old mutex+unordered_map.
+    PendingSendSlot _pending_sends[kMaxPendingSends];
 
     // RX slots for large IO (PRE_WRITE + READ) path.
     UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
@@ -448,7 +462,8 @@ private:
                             uint16_t chunk_idx = 0);
 
     // Helper: find and remove a pending send context by request_id.
-    UrmaSendContext* FindAndRemoveSendContext(uint64_t request_id);
+    UrmaSendContext* FindAndRemoveSendContext(uint64_t key);
+    bool InsertPendingSend(uint64_t key, UrmaSendContext* ctx);
 
     DISALLOW_COPY_AND_ASSIGN(UrmaEndpoint);
 };

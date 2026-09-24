@@ -21,13 +21,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <mutex>
+#include <pthread.h>
 #include <string>
 #include <vector>
 
 #include "butil/atomicops.h"
 #include "butil/iobuf.h"
 #include "butil/macros.h"
+#include "butil/scoped_lock.h"  // for BAIDU_SCOPED_LOCK with pthread_spinlock_t
 
 #if BRPC_WITH_URMA
 
@@ -125,8 +126,8 @@ constexpr uint32_t URMA_READ_BATCH_MAX = 64;
 // KeepWrite (send path) may run on different threads in polling mode.
 class UrmaRingBuf {
 public:
-    UrmaRingBuf() = default;
-    ~UrmaRingBuf() = default;
+    UrmaRingBuf() { pthread_spin_init(&_mutex, 0); }
+    ~UrmaRingBuf() { pthread_spin_destroy(&_mutex); }
 
     // Initialize the allocator for a buffer of @capacity bytes.
     // @capacity must be a multiple of URMA_ONE_SIDED_ALLOC_UNIT.
@@ -150,7 +151,7 @@ public:
     DISALLOW_COPY_AND_ASSIGN(UrmaRingBuf);
 
 private:
-    mutable std::mutex _mutex;
+    mutable pthread_spinlock_t _mutex;
     uint32_t _capacity{0};       // total bytes
     uint32_t _unit_count{0};     // capacity / ALLOC_UNIT
     uint32_t _free_units{0};     // currently free units
@@ -167,7 +168,7 @@ private:
 // ---- UrmaRingBuf inline implementations ----
 
 inline void UrmaRingBuf::Init(uint32_t capacity) {
-    std::lock_guard<std::mutex> lock(_mutex);
+    BAIDU_SCOPED_LOCK(_mutex);
     _capacity = capacity;
     _unit_count = capacity / URMA_ONE_SIDED_ALLOC_UNIT;
     _free_units = _unit_count;
@@ -179,7 +180,7 @@ inline bool UrmaRingBuf::Allocate(uint32_t size, uint32_t* offset) {
     if (units == 0 || units > _unit_count) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(_mutex);
+    BAIDU_SCOPED_LOCK(_mutex);
     if (units > _free_units) {
         return false;
     }
@@ -210,7 +211,7 @@ inline bool UrmaRingBuf::Allocate(uint32_t size, uint32_t* offset) {
 inline void UrmaRingBuf::Release(uint32_t offset, uint32_t size) {
     const uint32_t units = UnitsForSize(size);
     const uint32_t start = offset / URMA_ONE_SIDED_ALLOC_UNIT;
-    std::lock_guard<std::mutex> lock(_mutex);
+    BAIDU_SCOPED_LOCK(_mutex);
     for (uint32_t i = start; i < start + units && i < _unit_count; ++i) {
         if (_bitmap[i] == 1) {
             _bitmap[i] = 0;
@@ -220,7 +221,7 @@ inline void UrmaRingBuf::Release(uint32_t offset, uint32_t size) {
 }
 
 inline uint32_t UrmaRingBuf::Available() const {
-    std::lock_guard<std::mutex> lock(_mutex);
+    BAIDU_SCOPED_LOCK(_mutex);
     return _free_units * URMA_ONE_SIDED_ALLOC_UNIT;
 }
 
@@ -281,6 +282,13 @@ struct UrmaSendContext {
     butil::IOBuf saved_blocks;    // large IO: holds IOBuf block refs
 
     UrmaSendContext() = default;
+    void Reset() {
+        request_id = 0;
+        send_buf_offset = 0;
+        send_buf_size = 0;
+        opcode = 0;
+        saved_blocks.clear();  // release IOBuf block references
+    }
 };
 
 // Receiver-side reassembly context for chunked WRITE_IN_BAND messages.

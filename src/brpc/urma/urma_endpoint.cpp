@@ -38,6 +38,7 @@
 
 #include "butil/atomicops.h"
 #include "butil/iobuf.h"
+#include "butil/object_pool.h"
 #include "butil/logging.h"
 #include "butil/macros.h"
 #include "butil/sys_byteorder.h"
@@ -182,11 +183,17 @@ UrmaEndpoint::~UrmaEndpoint() {
         _reasm_ctxs.clear();
     }
     {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-        for (auto& pair : _pending_sends) {
-            delete pair.second;
+        for (size_t i = 0; i < kMaxPendingSends; ++i) {
+            if (_pending_sends[i].state.load(butil::memory_order_acquire) != 0) {
+                UrmaSendContext* ctx = _pending_sends[i].ctx;
+                _pending_sends[i].ctx = nullptr;
+                _pending_sends[i].state.store(0, butil::memory_order_release);
+                if (ctx) {
+                    ctx->Reset();
+                    butil::return_object(ctx);
+                }
+            }
         }
-        _pending_sends.clear();
     }
 }
 
@@ -220,12 +227,16 @@ void UrmaEndpoint::Reset() {
     for (uint32_t i = 0; i < URMA_RX_RING_SIZE; ++i) {
         _rx_slots[i].Reset();
     }
-    {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-        for (auto& pair : _pending_sends) {
-            delete pair.second;
+    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+        if (_pending_sends[i].state.load(butil::memory_order_acquire) != 0) {
+            UrmaSendContext* ctx = _pending_sends[i].ctx;
+            _pending_sends[i].ctx = nullptr;
+            _pending_sends[i].state.store(0, butil::memory_order_release);
+            if (ctx) {
+                ctx->Reset();
+                butil::return_object(ctx);
+            }
         }
-        _pending_sends.clear();
     }
     _chunked_chunk_idx = 0;
     _chunked_total_chunks = 0;
@@ -738,9 +749,9 @@ int UrmaEndpoint::AllocateOneSidedBuffers() {
         return -1;
     }
 
-    // Initialize the send_buf allocator.
+    // Initialize the send_buf allocator. 
     _send_buf_alloc = new UrmaRingBuf();
-    _send_buf_alloc->Init(_send_buf_capacity);
+    _send_buf_alloc->Init(_send_buf_capacity); // UrmaRingBuf::Init
 
     LOG(INFO) << "Allocated one-sided buffers: recv_buf=" << _recv_buf_capacity
               << " send_buf=" << _send_buf_capacity
@@ -766,11 +777,17 @@ void UrmaEndpoint::DeallocateOneSidedBuffers() {
     _send_buf_capacity = 0;
     _recv_buf_capacity = 0;
     // Clean up any leftover pending send contexts.
-    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-    for (auto& pair : _pending_sends) {
-        delete pair.second;
+    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+        if (_pending_sends[i].state.load(butil::memory_order_acquire) != 0) {
+            UrmaSendContext* ctx = _pending_sends[i].ctx;
+            _pending_sends[i].ctx = nullptr;
+            _pending_sends[i].state.store(0, butil::memory_order_release);
+            if (ctx) {
+                ctx->Reset();
+                butil::return_object(ctx);
+            }
+        }
     }
-    _pending_sends.clear();
 }
 
 // Post empty recv WRs: num_sge=1, len=0. These are consumed by incoming
@@ -805,15 +822,32 @@ int UrmaEndpoint::PostEmptyRecvWr(uint32_t count) {
     return 0;
 }
 
-UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t request_id) {
-    std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-    auto it = _pending_sends.find(request_id);
-    if (it == _pending_sends.end()) {
-        return nullptr;
+UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t key) {
+    // Lock-free MPSC read: PollCq is the single reader.
+    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+        if (_pending_sends[i].state.load(butil::memory_order_acquire) == key) {
+            UrmaSendContext* ctx = _pending_sends[i].ctx;
+            _pending_sends[i].ctx = nullptr;
+            _pending_sends[i].state.store(0, butil::memory_order_release);
+            return ctx;
+        }
     }
-    UrmaSendContext* ctx = it->second;
-    _pending_sends.erase(it);
-    return ctx;
+    return nullptr;
+}
+
+// Insert a pending send context into a free slot (Writer: KeepWrite, single-threaded).
+// Returns true on success, false if all slots are occupied.
+bool UrmaEndpoint::InsertPendingSend(uint64_t key, UrmaSendContext* ctx) {
+    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+        uint64_t expected = 0;
+        if (_pending_sends[i].state.load(butil::memory_order_relaxed) == 0 &&
+            _pending_sends[i].state.compare_exchange_strong(
+                expected, key, butil::memory_order_acq_rel)) {
+            _pending_sends[i].ctx = ctx;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -1278,14 +1312,20 @@ ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
     wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, request_id);
 
     // Register the send context.
-    auto* ctx = new UrmaSendContext();
+    auto* ctx = butil::get_object<UrmaSendContext>();
     ctx->request_id = request_id;
     ctx->send_buf_offset = offset;
     ctx->send_buf_size = alloc_size;
     ctx->opcode = URMA_IO_WRITE_IN_BAND;
-    {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-        _pending_sends[(request_id << 20) | 0u] = ctx;
+    const uint64_t send_key = (request_id << 20) | 0u;
+    if (!InsertPendingSend(send_key, ctx)) {
+        LOG(ERROR) << "WriteInline: pending sends slot array full on "
+                   << _socket->description();
+        _send_buf_alloc->Release(offset, alloc_size);
+        ctx->Reset();
+        butil::return_object(ctx);
+        errno = ENOMEM;
+        return -1;
     }
 
     // Consume one SQ slot for the WRITE_IMM WR.
@@ -1300,11 +1340,9 @@ ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
                      << status << " provider_errno=" << provider_errno
                      << " on " << _socket->description();
         _send_buf_alloc->Release(offset, alloc_size);
-        {
-            std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-            _pending_sends.erase((request_id << 20) | 0u);
-        }
-        delete ctx;
+        FindAndRemoveSendContext(send_key);
+        ctx->Reset();
+        butil::return_object(ctx);
         errno = status;
         return -1;
     }
@@ -1436,7 +1474,7 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, request_id);
 
     // Register the send context and save IOBuf block references.
-    auto* ctx = new UrmaSendContext();
+    auto* ctx = butil::get_object<UrmaSendContext>();
     ctx->request_id = request_id;
     ctx->send_buf_offset = offset;
     ctx->send_buf_size = ctrl_msg_size;
@@ -1444,9 +1482,14 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     for (size_t i = 0; i < ndata; ++i) {
         ctx->saved_blocks.append(*from[i]);
     }
-    {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-        _pending_sends[request_id] = ctx;
+    if (!InsertPendingSend(request_id, ctx)) {
+        LOG(ERROR) << "WriteZeroCopy: pending sends slot array full on "
+                   << _socket->description();
+        _send_buf_alloc->Release(offset, ctrl_msg_size);
+        ctx->Reset();
+        butil::return_object(ctx);
+        errno = ENOMEM;
+        return -1;
     }
 
     // Consume one SQ slot for the WRITE_IMM control message WR.
@@ -1462,7 +1505,8 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
                      << " on " << _socket->description();
         _send_buf_alloc->Release(offset, ctrl_msg_size);
         FindAndRemoveSendContext(request_id);
-        delete ctx;
+        ctx->Reset();
+        butil::return_object(ctx);
         errno = status;
         return -1;
     }
@@ -1573,16 +1617,22 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
         wr.user_ctx = EncodeUserCtx(CTRL_DATA_REQUEST, _chunked_request_id);
 
         // Register send context keyed by (request_id, chunk_idx).
-        auto* ctx = new UrmaSendContext();
+        auto* ctx = butil::get_object<UrmaSendContext>();
         ctx->request_id = _chunked_request_id;
         ctx->send_buf_offset = offset;
         ctx->send_buf_size = alloc_size;
         ctx->opcode = URMA_IO_WRITE_IN_BAND;
         const uint64_t pend_key =
             (_chunked_request_id << 20) | _chunked_chunk_idx;
-        {
-            std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-            _pending_sends[pend_key] = ctx;
+        if (!InsertPendingSend(pend_key, ctx)) {
+            LOG(ERROR) << "WriteInlineChunked: pending sends slot array full on "
+                       << _socket->description();
+            _send_buf_alloc->Release(offset, alloc_size);
+            ctx->Reset();
+            butil::return_object(ctx);
+            if (total_sent > 0) break;
+            errno = ENOMEM;
+            return -1;
         }
 
         // Post WR.
@@ -1594,11 +1644,9 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
             const int provider_errno = errno;
             _sq_window_size.fetch_add(1, butil::memory_order_relaxed);
             _send_buf_alloc->Release(offset, alloc_size);
-            {
-                std::lock_guard<std::mutex> lock(_pending_sends_mutex);
-                _pending_sends.erase(pend_key);
-                delete ctx;
-            }
+            FindAndRemoveSendContext(pend_key);
+            ctx->Reset();
+            butil::return_object(ctx);
             LOG(WARNING) << "WriteInlineChunked: post failed: " << status
                          << " provider_errno=" << provider_errno
                          << " on " << _socket->description();
@@ -2510,41 +2558,30 @@ void UrmaEndpoint::HandleWriteInBandAck(const urma_cr_t& cr) {
     const UrmaMessageHead* head =
         reinterpret_cast<const UrmaMessageHead*>(send_buf + offset);
 
-    if (head->magic != URMA_CTRL_MAGIC) {
-        LOG(WARNING) << "HandleWriteInBandAck: bad magic on "
-                     << _socket->description();
-        goto repost;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(_pending_sends_mutex);
+    if (head->magic == URMA_CTRL_MAGIC) {
         // Try chunked key first: (request_id << 20) | chunk_idx.
         const uint64_t chunk_key =
             (head->request_id << 20) | (head->flags & 0xFFFF);
-        auto it = _pending_sends.find(chunk_key);
-        if (it != _pending_sends.end()) {
-            _send_buf_alloc->Release(offset, it->second->send_buf_size);
-            delete it->second;
-            _pending_sends.erase(it);
+        UrmaSendContext* ctx = FindAndRemoveSendContext(chunk_key);
+        if (!ctx) {
+            // Fallback: non-chunked WriteInline key = (request_id << 20) | 0.
+            const uint64_t inline_key = (head->request_id << 20) | 0u;
+            ctx = FindAndRemoveSendContext(inline_key);
+        }
+        if (ctx) {
+            _send_buf_alloc->Release(offset, ctx->send_buf_size);
+            ctx->Reset();
+            butil::return_object(ctx);
             _socket->WakeAsEpollOut();
-            goto repost;
+        } else {
+            LOG(WARNING) << "HandleWriteInBandAck: no pending send for offset="
+                         << offset << " on " << _socket->description();
         }
-        // Fallback: search by offset for non-chunked (old-style) contexts.
-        for (auto it2 = _pending_sends.begin(); it2 != _pending_sends.end(); ++it2) {
-            if (it2->second->send_buf_offset == offset &&
-                it2->second->opcode == URMA_IO_WRITE_IN_BAND) {
-                _send_buf_alloc->Release(offset, it2->second->send_buf_size);
-                delete it2->second;
-                _pending_sends.erase(it2);
-                _socket->WakeAsEpollOut();
-                goto repost;
-            }
-        }
+    } else {
+        LOG(WARNING) << "HandleWriteInBandAck: bad magic on "
+                     << _socket->description();
     }
-    LOG(WARNING) << "HandleWriteInBandAck: no pending send for offset="
-                 << offset << " on " << _socket->description();
 
-repost:
     // Repost the recv WR consumed by this WRITE_IMM ACK.
     if (_io_mode != 0) {
         PostEmptyRecvWr(1);
@@ -2570,7 +2607,8 @@ void UrmaEndpoint::HandlePostWrite(const urma_cr_t& cr) {
     UrmaSendContext* ctx = FindAndRemoveSendContext(head->request_id);
     if (ctx) {
         _send_buf_alloc->Release(ctx->send_buf_offset, ctx->send_buf_size);
-        delete ctx;  // releases saved_blocks
+        ctx->Reset();  // releases saved_blocks
+        butil::return_object(ctx);
     }
     _socket->WakeAsEpollOut();
 
