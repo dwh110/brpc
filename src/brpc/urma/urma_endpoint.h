@@ -418,7 +418,8 @@ private:
 
     // RX slots for large IO (PRE_WRITE + READ) path.
     UrmaRxSlot _rx_slots[URMA_RX_RING_SIZE];
-    butil::atomic<uint64_t> _rx_consume_seq{0};
+    butil::atomic<uint64_t> _rx_consume_seq{0};  // next slot to allocate
+    butil::atomic<uint64_t> _rx_delivery_seq{0}; // next slot to deliver in-order
 
     // Mutex serializing JFS posts on the WriteZeroCopy path. Bonding devices
     // reject concurrent READ+WRITE_IMM on the same jetty (status=8): PollCq
@@ -459,6 +460,11 @@ private:
     // HandleWriteImmCompletion for the first batch, and by HandleReadCompletion
     // for subsequent batches. Returns 0 on success, -1 on error (errno set).
     int PostReadBatch(uint32_t slot_idx);
+
+    // Deliver consecutive DATA_READY slots to _read_buf in allocation order.
+    // Called after a slot transitions to DATA_READY. Advances
+    // _rx_delivery_seq past each delivered slot and resets it to IDLE.
+    void DeliverReadySlots();
 
     // Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to
     // the peer's send_buf at the mirrored offset. chunk_idx is written into

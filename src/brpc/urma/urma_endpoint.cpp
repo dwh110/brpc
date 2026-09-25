@@ -226,6 +226,7 @@ void UrmaEndpoint::Reset() {
     _remote_send_buf_size = 0;
     _one_sided_seq.store(1, butil::memory_order_relaxed);
     _rx_consume_seq.store(0, butil::memory_order_relaxed);
+    _rx_delivery_seq.store(0, butil::memory_order_relaxed);
     for (uint32_t i = 0; i < URMA_RX_RING_SIZE; ++i) {
         _rx_slots[i].Reset();
     }
@@ -2397,6 +2398,31 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     return 0;
 }
 
+// Deliver consecutive DATA_READY slots to _read_buf in allocation order.
+// PollCq is single-threaded per endpoint, so no lock is needed. This ensures
+// InputMessenger sees complete RPC messages in the order they were sent
+// (PRE_WRITE arrival order = slot allocation order).
+void UrmaEndpoint::DeliverReadySlots() {
+    uint64_t seq = _rx_delivery_seq.load(butil::memory_order_relaxed);
+    while (true) {
+        const uint32_t idx = static_cast<uint32_t>(
+            seq % URMA_RX_RING_SIZE);
+        UrmaRxSlot& slot = _rx_slots[idx];
+        if (slot.state.load(butil::memory_order_relaxed)
+            != UrmaRxSlot::DATA_READY) {
+            break;  // not ready or gap — wait for earlier slots
+        }
+        // Append all blocks in order, then release the slot.
+        for (size_t i = 0; i < slot.read_targets.size(); ++i) {
+            _socket->_read_buf.append(slot.read_targets[i].first,
+                                      slot.read_targets[i].second);
+        }
+        slot.Reset();  // sets state back to IDLE
+        ++seq;
+    }
+    _rx_delivery_seq.store(seq, butil::memory_order_relaxed);
+}
+
 // Handle a WRITE_IMM receive completion (WRITE_IN_BAND or PRE_WRITE).
 // The imm_data encodes the opcode and buffer_offset. The data was written
 // into our recv_buf at the specified offset.
@@ -2492,13 +2518,22 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
         const auto* entries_ptr = reinterpret_cast<const PageBufferInMessage*>(
             recv_buf + offset + sizeof(UrmaMessageHead));
 
-        // Allocate an RX slot.
+        // Allocate an RX slot in order (PRE_WRITE arrival order). The slot
+        // must be IDLE — if not, the ring is too small for the concurrency.
         const uint64_t seq = _rx_consume_seq.fetch_add(
             1, butil::memory_order_relaxed);
         const uint32_t idx = static_cast<uint32_t>(
             seq % URMA_RX_RING_SIZE);
         UrmaRxSlot& slot = _rx_slots[idx];
-        slot.Reset();
+        if (slot.state.load(butil::memory_order_relaxed) != UrmaRxSlot::IDLE) {
+            LOG(ERROR) << "HandlePreWrite: RX slot " << idx
+                       << " not IDLE (state="
+                       << slot.state.load(butil::memory_order_relaxed)
+                       << ") on " << _socket->description()
+                       << " — ring too small for qd";
+            errno = ENOMEM;
+            return -1;
+        }
         slot.state.store(UrmaRxSlot::READING, butil::memory_order_relaxed);
         slot.write_imm = imm.data;
         slot.request_id = head->request_id;
@@ -2557,10 +2592,13 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
         return 0;
     }
 
-    // Copy this block's data into _socket->_read_buf.
+    // Accumulate received bytes; data stays in slot.recv_bufs (owned by
+    // IOBuf pool buffers). We do NOT append to _read_buf here — READ
+    // completions from different slots interleave on the CQ, and appending
+    // per-CQE would corrupt _read_buf with fragments from unrelated
+    // messages. Instead, the complete message is appended in block order
+    // after all READs finish (see the "All batches complete" path below).
     if (block_idx < slot.read_targets.size()) {
-        _socket->_read_buf.append(slot.read_targets[block_idx].first,
-                                  slot.read_targets[block_idx].second);
         slot.received_bytes += slot.read_targets[block_idx].second;
     }
 
@@ -2591,10 +2629,17 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
         return 0;
     }
 
-    // All batches complete: send POST_WRITE ack to the sender so it can
-    // release its send_buf and saved_blocks. ResponseCtrlMessage internally
-    // holds _zerocopy_post_mutex to serialize the WRITE_IMM post.
+    // All batches complete: the entire message has been pulled via READ.
+    // Mark DATA_READY but do NOT append to _read_buf yet — messages must be
+    // delivered in PRE_WRITE arrival order (slot allocation order) so that
+    // InputMessenger sees complete, correctly-ordered RPC messages.
+    // DeliverReadySlots drains consecutive DATA_READY slots starting from
+    // _rx_delivery_seq.
     slot.state.store(UrmaRxSlot::DATA_READY, butil::memory_order_relaxed);
+
+    // Send POST_WRITE ack to the sender so it can release its send_buf and
+    // saved_blocks. ResponseCtrlMessage internally holds _zerocopy_post_mutex
+    // to serialize the WRITE_IMM post.
     const UrmaWriteImmData imm{slot.write_imm};
     if (ResponseCtrlMessage(URMA_IO_POST_WRITE,
                             imm.io.buffer_offset,
@@ -2605,8 +2650,10 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
         errno = saved_errno;
         return -1;
     }
+
+    // Deliver consecutive DATA_READY slots in order.
     const ssize_t total_bytes = static_cast<ssize_t>(slot.total_bytes);
-    slot.Reset();
+    DeliverReadySlots();
     return total_bytes;
 }
 
