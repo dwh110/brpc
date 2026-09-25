@@ -67,4 +67,11 @@ message UrmaHello {
 
     // One-sided IO mode: 0=SEND_ONLY, 1=WRITE_ONLY, 2=HYBRID.
     optional uint32 io_mode = 22;
+
+    // [dual-jetty] peer's read-dedicated jetty id. Only present when the peer
+    // has --urma_dual_jetty=true and successfully created a read jetty. If
+    // absent, READ ops fall back to the write jetty (jetty_id). This field
+    // eliminates status=8 (REM_ACCESS_ABORT_ERR) by physically isolating READ
+    // and WRITE_IMM on separate jetty SQs.
+    optional uint32 read_jetty_id = 23;
 }

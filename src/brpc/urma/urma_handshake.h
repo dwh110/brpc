@@ -73,6 +73,14 @@ struct ParsedHello {
     // field present and non-zero). Used to decide whether to enable the
     // one-sided path.
     bool has_one_sided = false;
+
+    // ---- Dual-jetty extension (v3 only) ----
+    // Peer's read-dedicated jetty id. Only present when the peer has
+    // --urma_dual_jetty=true. Used by ImportPeer to import a separate target
+    // jetty for READ ops, eliminating status=8 from READ+WRITE_IMM SQ
+    // contention. v2 peers never set this.
+    uint32_t read_jetty_id = 0;
+    bool has_read_jetty = false;
 };
 
 // Validate all values that influence resource import and queue/window sizing.

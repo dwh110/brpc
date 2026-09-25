@@ -104,8 +104,13 @@ struct UrmaResource {
     urma_jfce_t* jfce{nullptr};   // event mode only; null in polling mode
     urma_jfr_t* jfr{nullptr};
     urma_jetty_t* jetty{nullptr};
+    // [dual-jetty] READ-dedicated jetty (null when --urma_dual_jetty=false).
+    // Shares the same JFC/JFR as the write jetty so PollCq is unchanged.
+    urma_jetty_t* jetty_read{nullptr};
     // Imported peer objects (created per-connection, not pooled).
     urma_target_jetty_t* remote_jetty{nullptr};
+    // [dual-jetty] imported peer read jetty (null when not negotiated).
+    urma_target_jetty_t* remote_jetty_read{nullptr};
     urma_target_seg_t* remote_seg{nullptr};
     // Imported peer recv_buf segment (one-sided only). We WRITE_IMM into
     // this buffer.
@@ -321,6 +326,11 @@ private:
     uint16_t _remote_window_capacity{0};
     butil::atomic<uint16_t> _remote_rq_window_size{0};  // WRs we can send
     butil::atomic<uint16_t> _sq_window_size{0};          // WRs we can post
+    // [dual-jetty] SQ window for the read-dedicated jetty. Tracked separately
+    // from _sq_window_size (write jetty) so the two SQs are independently
+    // gated. Only used when --urma_dual_jetty=true and the read jetty was
+    // successfully created and imported.
+    butil::atomic<uint16_t> _sq_window_size_read{0};
     butil::atomic<uint16_t> _new_rq_wrs{0};              // new recv WRs (to ack)
     uint16_t _sq_imm_window_size{0};                     // budget for pure-ack WRs
 

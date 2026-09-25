@@ -172,6 +172,21 @@ DEFINE_bool(urma_use_zerocopy_read, false,
             "consumed for payload, so concurrency is not limited by send_buf "
             "size. Block size = --urma_max_sge_len (use a large value like "
             "2095104 to minimize READ WR count).");
+DEFINE_bool(urma_dual_jetty, false,
+            "Use a separate jetty for READ ops (WriteZeroCopy path). "
+            "Eliminates status=8 (REM_ACCESS_ABORT_ERR) caused by READ + "
+            "WRITE_IMM concurrent submission to the same jetty SQ. The URMA "
+            "jetty SQ does not support READ and WRITE_IMM interleaving — this "
+            "is a general limitation verified on both bonding_dev_0 and "
+            "physical UDMA (udmac0d1e2) devices. When enabled, READ WRs are "
+            "posted to a dedicated jetty with its own SQ, physically isolating "
+            "them from WRITE_IMM traffic. Experimental: requires v3 handshake "
+            "on both peers (v2 wire cannot carry the read_jetty_id field).");
+DEFINE_int32(urma_read_jetty_sq_size, 64,
+             "SQ depth for the read-dedicated jetty when --urma_dual_jetty=true. "
+             "Each in-flight READ consumes one SQ slot; size to match the max "
+             "expected read concurrency (qd * blocks_per_message). Ignored when "
+             "--urma_dual_jetty=false.");
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
 // true, GlobalUrmaInitializeOrDie() returns without touching liburma and the
@@ -967,6 +982,17 @@ uint32_t GetUrmaChunkPayloadMax() {
     uint32_t v = static_cast<uint32_t>(FLAGS_urma_chunk_payload_size);
     v &= ~static_cast<uint32_t>(1024 - 1);
     return v;
+}
+
+bool GetUrmaDualJetty() {
+    return FLAGS_urma_dual_jetty;
+}
+
+uint16_t GetUrmaReadJettySqSize() {
+    if (FLAGS_urma_read_jetty_sq_size <= 0) {
+        return 64;
+    }
+    return static_cast<uint16_t>(FLAGS_urma_read_jetty_sq_size);
 }
 
 // ============================================================================

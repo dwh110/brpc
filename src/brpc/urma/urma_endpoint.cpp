@@ -129,6 +129,9 @@ std::vector<UrmaEndpoint::PollerGroup> UrmaEndpoint::_poller_groups;
 // ============================================================================
 
 UrmaResource::~UrmaResource() {
+    if (remote_jetty_read) {
+        urma_unimport_jetty(remote_jetty_read);
+    }
     if (remote_jetty) {
         urma_unimport_jetty(remote_jetty);
     }
@@ -137,6 +140,12 @@ UrmaResource::~UrmaResource() {
     }
     if (remote_recv_buf_seg) {
         urma_unimport_seg(remote_recv_buf_seg);
+    }
+    // [dual-jetty] Destroy the read-dedicated jetty. Order: destroy read
+    // jetty before write jetty — both share the same JFC/JFR, and the write
+    // jetty is the "primary" one.
+    if (jetty_read) {
+        urma_delete_jetty(jetty_read);
     }
     if (jetty) {
         urma_delete_jetty(jetty);
@@ -376,6 +385,13 @@ void UrmaEndpoint::MakeLocalParsedHello(ParsedHello* out) const {
                     _send_buf_tseg->seg.ubva.eid.raw, 16);
         out->send_buf_seg_uasid = _send_buf_tseg->seg.ubva.uasid;
     }
+    // [dual-jetty] Advertise the read-dedicated jetty id so the peer can
+    // import it separately. Only when --urma_dual_jetty=true and the read
+    // jetty was successfully created.
+    if (GetUrmaDualJetty() && _resource && _resource->jetty_read) {
+        out->read_jetty_id = _resource->jetty_read->jetty_id.id;
+        out->has_read_jetty = true;
+    }
 }
 
 void UrmaEndpoint::FillLocalHelloV2(v2_wire::HelloMessage* out) const {
@@ -439,6 +455,10 @@ void UrmaEndpoint::FillLocalHelloV3(UrmaHello* out) const {
         out->set_recv_buf_seg_eid(p.recv_buf_seg_eid, 16);
         out->set_recv_buf_seg_uasid(p.recv_buf_seg_uasid);
         out->set_io_mode(p.io_mode);
+    }
+    // [dual-jetty] Serialize read_jetty_id (v3 optional field 23).
+    if (p.has_read_jetty) {
+        out->set_read_jetty_id(p.read_jetty_id);
     }
 }
 
@@ -530,6 +550,11 @@ int UrmaEndpoint::ReadAndParseHelloV3(ParsedHello* out, bool* negotiated) {
             }
         }
     }
+    // [dual-jetty] peer's read-dedicated jetty id (v3 optional field).
+    if (msg.has_read_jetty_id() && msg.read_jetty_id() != 0) {
+        out->read_jetty_id = msg.read_jetty_id();
+        out->has_read_jetty = true;
+    }
     if (!ValidHello(*out)) {
         return 0;
     }
@@ -619,6 +644,29 @@ int UrmaEndpoint::AllocateResources() {
         if (!_resource->jetty) {
             PLOG(ERROR) << "urma_create_jetty";
             return -1;
+        }
+        // [dual-jetty] Create a second jetty dedicated to READ ops. It shares
+        // the same JFC (CQ) and JFR as the write jetty so PollCq is unchanged
+        // — CQEs from both jetties land on the same CQ and are dispatched by
+        // user_ctx type. The independent SQ physically isolates READ WRs from
+        // WRITE_IMM WRs, eliminating status=8 (REM_ACCESS_ABORT_ERR) caused by
+        // READ+WRITE_IMM concurrent submission to the same jetty SQ.
+        if (GetUrmaDualJetty()) {
+            urma_jetty_cfg_t read_cfg = jetty_cfg;  // copy base config
+            read_cfg.jfs_cfg.depth =
+                static_cast<uint32_t>(GetUrmaReadJettySqSize());
+            // shared.jfr / shared.jfc already point to the same objects.
+            _resource->jetty_read = urma_create_jetty(ctx, &read_cfg);
+            if (!_resource->jetty_read) {
+                PLOG(WARNING) << "urma_create_jetty (read) failed; "
+                              << "READ will fall back to write jetty on "
+                              << _socket->description();
+                // Non-fatal: PostReadBatch checks jetty_read and falls back.
+            } else {
+                LOG(INFO) << "Dual-jetty enabled: write SQ=" << _sq_size
+                          << " read SQ=" << GetUrmaReadJettySqSize()
+                          << " on " << _socket->description();
+            }
         }
     }
 
@@ -960,6 +1008,46 @@ int UrmaEndpoint::ImportPeer(const ParsedHello& peer) {
                     << " tp_type=" << remote.tp_type
                     << " bonding_extension=" << use_bonding_extension;
         return -1;
+    }
+
+    // 3. [dual-jetty] Import the peer's read-dedicated jetty. Only when both
+    //    sides have --urma_dual_jetty=true and the peer advertised a
+    //    read_jetty_id. The read jetty uses the same EID/uasid as the write
+    //    jetty but a different jetty id. On bonding devices, the bonding
+    //    extension associates the import with our local jetty_read so the
+    //    provider routes READ WRs through the read SQ.
+    if (GetUrmaDualJetty() && _resource->jetty_read &&
+        peer.has_read_jetty && peer.read_jetty_id != 0) {
+        urma_rjetty_t remote_read = remote;  // copy EID/uasid/tp_type
+        remote_read.jetty_id.id = peer.read_jetty_id;
+        urma_token_t read_token{};
+        if (use_bonding_extension) {
+#if BRPC_URMA_HAS_BONDING_EXT
+            bondp_rjetty_t bonding_remote_read{};
+            bonding_remote_read.base = remote_read;
+            bonding_remote_read.base.flag.bs.has_drv_ext = 1;
+            bonding_remote_read.jetty = _resource->jetty_read;
+            _resource->remote_jetty_read =
+                urma_import_jetty(ctx, &bonding_remote_read.base, &read_token);
+#else
+            LOG(ERROR) << "Bonding read jetty import requires urma_ubagg.h";
+            errno = ENOTSUP;
+#endif
+        } else {
+            _resource->remote_jetty_read =
+                urma_import_jetty(ctx, &remote_read, &read_token);
+        }
+        if (!_resource->remote_jetty_read) {
+            PLOG(WARNING) << "Failed to import peer read jetty"
+                          << " read_jetty_id=" << peer.read_jetty_id
+                          << "; READ will fall back to write jetty on "
+                          << _socket->description();
+            // Non-fatal: PostReadBatch checks remote_jetty_read and falls back.
+        } else {
+            LOG(INFO) << "Dual-jetty: imported peer read jetty id="
+                      << peer.read_jetty_id << " on "
+                      << _socket->description();
+        }
     }
     return 0;
 }
@@ -1977,11 +2065,21 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                     if (os_type == READ_DATA_REQUEST) {
                         // READ WR error: reclaim 1 SQ slot (each READ WR
                         // has complete_enable=1, so each generates its CQE).
-                        uint16_t old = _sq_window_size.load(
+                        // [dual-jetty] Return to the read SQ window when active.
+                        const bool use_read_jetty =
+                            (_resource->jetty_read != nullptr &&
+                             _resource->remote_jetty_read != nullptr);
+                        butil::atomic<uint16_t>& sq_wnd_err =
+                            use_read_jetty ? _sq_window_size_read
+                                           : _sq_window_size;
+                        const uint16_t cap_err = use_read_jetty
+                            ? static_cast<uint16_t>(GetUrmaReadJettySqSize())
+                            : _local_window_capacity;
+                        uint16_t old = sq_wnd_err.load(
                             butil::memory_order_relaxed);
                         while (true) {
-                            if (old >= _local_window_capacity) break;
-                            if (_sq_window_size.compare_exchange_weak(
+                            if (old >= cap_err) break;
+                            if (sq_wnd_err.compare_exchange_weak(
                                     old, static_cast<uint16_t>(old + 1),
                                     butil::memory_order_relaxed)) {
                                 break;
@@ -2034,11 +2132,14 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             butil::subtle::MemoryBarrier();
             _socket->WakeAsEpollOut();
             if (fatal_tp_error) {
-                // Bonding provider TP is dead after status=8 — no more
-                // completions will arrive. Mark the connection failed so
-                // brpc retries on a new connection.
-                LOG(ERROR) << "URMA TX fatal TP error (status=8): bonding "
-                           << "provider TP dead, failing connection "
+                // URMA provider TP is dead after status=8 (REM_ACCESS_ABORT_ERR)
+                // — no more completions will arrive. Verified on both bonding
+                // (bonding_dev_0) and physical UDMA (udmac0d1e2) devices:
+                // WRITE_IMM + READ concurrent submission to the same jetty SQ
+                // triggers this error regardless of device type. Mark the
+                // connection failed so brpc retries on a new connection.
+                LOG(ERROR) << "URMA TX fatal TP error (status=8): provider TP "
+                           << "dead, failing connection "
                            << _socket->description();
                 errno = EIO;
                 return -1;
@@ -2049,9 +2150,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             LOG(WARNING) << "URMA RX completion error: status=" << cr.status
                          << " on " << _socket->description();
             if (fatal_tp_error) {
-                // Same as TX: bonding provider TP is dead after status=8.
-                LOG(ERROR) << "URMA RX fatal TP error (status=8): bonding "
-                           << "provider TP dead, failing connection "
+                // Same as TX: URMA provider TP is dead after status=8.
+                LOG(ERROR) << "URMA RX fatal TP error (status=8): provider TP "
+                           << "dead, failing connection "
                            << _socket->description();
                 errno = EIO;
                 return -1;
@@ -2079,13 +2180,22 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             if (type == READ_DATA_REQUEST) {
                 // READ WR completion: reclaim 1 SQ slot (each READ WR
                 // has complete_enable=1, so each generates its own CQE).
-                uint16_t old =
-                    _sq_window_size.load(butil::memory_order_relaxed);
+                // [dual-jetty] Return the slot to the read SQ window when
+                // the read jetty is active; otherwise the write SQ window.
+                const bool use_read_jetty =
+                    (_resource->jetty_read != nullptr &&
+                     _resource->remote_jetty_read != nullptr);
+                butil::atomic<uint16_t>& sq_wnd =
+                    use_read_jetty ? _sq_window_size_read : _sq_window_size;
+                const uint16_t cap = use_read_jetty
+                    ? static_cast<uint16_t>(GetUrmaReadJettySqSize())
+                    : _local_window_capacity;
+                uint16_t old = sq_wnd.load(butil::memory_order_relaxed);
                 while (true) {
-                    if (old >= _local_window_capacity) {
+                    if (old >= cap) {
                         break;
                     }
-                    if (_sq_window_size.compare_exchange_weak(
+                    if (sq_wnd.compare_exchange_weak(
                             old, static_cast<uint16_t>(old + 1),
                             butil::memory_order_relaxed)) {
                         break;
@@ -2290,9 +2400,20 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
         return 0;  // nothing to do
     }
 
+    // [dual-jetty] When the read-dedicated jetty is available, use it and its
+    // independent SQ window. This physically isolates READ WRs from WRITE_IMM
+    // traffic on the write jetty, eliminating status=8 (REM_ACCESS_ABORT_ERR).
+    // Falls back to the write jetty / _sq_window_size if the read jetty was
+    // not created or the peer didn't advertise a read_jetty_id.
+    const bool use_read_jetty =
+        (_resource->jetty_read != nullptr &&
+         _resource->remote_jetty_read != nullptr);
+    butil::atomic<uint16_t>& sq_wnd =
+        use_read_jetty ? _sq_window_size_read : _sq_window_size;
+
     // batch = min(remaining, sq_available - 1, URMA_READ_BATCH_MAX)
-    // Reserve 1 SQ slot for the eventual POST_WRITE ACK.
-    uint16_t sq_avail = _sq_window_size.load(butil::memory_order_relaxed);
+    // Reserve 1 SQ slot for the eventual POST WRITE ACK.
+    uint16_t sq_avail = sq_wnd.load(butil::memory_order_relaxed);
     if (sq_avail > 0) sq_avail -= 1;
     const uint32_t sq_batch_cap = std::min(
         static_cast<uint32_t>(sq_avail), URMA_READ_BATCH_MAX);
@@ -2301,8 +2422,9 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
         LOG(WARNING) << "PostReadBatch: SQ window exhausted on "
                      << _socket->description()
                      << " remaining=" << remaining
-                     << " sq_window=" << _sq_window_size.load(butil::memory_order_relaxed)
+                     << " sq_window=" << sq_wnd.load(butil::memory_order_relaxed)
                      << " sq_avail=" << sq_avail
+                     << " use_read_jetty=" << use_read_jetty
                      << " sq_capacity=" << _local_window_capacity;
         errno = EAGAIN;
         return -1;
@@ -2310,13 +2432,19 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     LOG(INFO) << "PostReadBatch: batch=" << batch
               << " remaining=" << remaining
               << " next_read_idx=" << slot.next_read_idx
-              << " sq_window=" << _sq_window_size.load(butil::memory_order_relaxed)
+              << " sq_window=" << sq_wnd.load(butil::memory_order_relaxed)
+              << " use_read_jetty=" << use_read_jetty
               << " on " << _socket->description();
 
     // Allocate WR and SGE arrays for this batch.
     std::unique_ptr<urma_jfs_wr_t[]> wrs(new urma_jfs_wr_t[batch]);
     std::unique_ptr<urma_sge_t[]> src_sges(new urma_sge_t[batch]);
     std::unique_ptr<urma_sge_t[]> dst_sges(new urma_sge_t[batch]);
+
+    // Select the target jetty: read-dedicated or fallback to write jetty.
+    urma_target_jetty_t* tjetty = use_read_jetty
+        ? _resource->remote_jetty_read
+        : _resource->remote_jetty;
 
     for (uint32_t i = 0; i < batch; ++i) {
         const uint32_t block_idx = slot.next_read_idx + i;
@@ -2356,7 +2484,7 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
         // intermediate WRs may be silently dropped or cause TP errors
         // (status=8).  UBS uses the same approach on bonding devices.
         wrs[i].flag.bs.complete_enable = 1;
-        wrs[i].tjetty = _resource->remote_jetty;
+        wrs[i].tjetty = tjetty;
         wrs[i].rw.src.sge = &src_sges[i];
         wrs[i].rw.src.num_sge = 1;
         wrs[i].rw.dst.sge = &dst_sges[i];
@@ -2369,28 +2497,36 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     }
 
     // Consume SQ slots for this batch.
-    _sq_window_size.fetch_sub(static_cast<uint16_t>(batch),
-                              butil::memory_order_relaxed);
+    sq_wnd.fetch_sub(static_cast<uint16_t>(batch),
+                     butil::memory_order_relaxed);
     slot.sq_slots_used = static_cast<uint16_t>(batch);
     slot.next_read_idx += batch;
 
+    // Select the post jetty: read-dedicated or fallback to write jetty.
+    urma_jetty_t* post_jetty = use_read_jetty
+        ? _resource->jetty_read
+        : _resource->jetty;
+
     urma_jfs_wr_t* bad = nullptr;
     // PostReadBatch is called from PollCq (HandleWriteImmCompletion,
-    // HandleReadCompletion). When zerocopy_read is enabled, KeepWrite may
-    // concurrently post WRITE_IMM on the same jetty — bonding devices
-    // reject READ+WRITE_IMM interleaving (status=8). The mutex is always
-    // held during post; callers must NOT hold it.
+    // HandleReadCompletion). When dual-jetty is NOT active, KeepWrite may
+    // concurrently post WRITE_IMM on the same jetty — the mutex serializes
+    // the post to avoid READ+WRITE_IMM interleaving (status=8). When
+    // dual-jetty IS active, READ and WRITE_IMM use separate jetties so the
+    // mutex only protects SQ window accounting, not provider-level ordering.
+    // Callers must NOT hold the mutex.
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
-        return urma_post_jetty_send_wr(_resource->jetty, wrs.get(), &bad);
+        return urma_post_jetty_send_wr(post_jetty, wrs.get(), &bad);
     }();
     if (status != URMA_SUCCESS) {
         const int provider_errno = errno;
-        _sq_window_size.fetch_add(static_cast<uint16_t>(batch),
-                                  butil::memory_order_relaxed);
+        sq_wnd.fetch_add(static_cast<uint16_t>(batch),
+                         butil::memory_order_relaxed);
         LOG(WARNING) << "PostReadBatch: READ post failed: status=" << status
                      << " provider_errno=" << provider_errno
                      << " batch=" << batch
+                     << " use_read_jetty=" << use_read_jetty
                      << " on " << _socket->description();
         errno = status;
         return -1;
@@ -2985,6 +3121,14 @@ void UrmaEndpoint::ApplyRemoteHello(const ParsedHello& remote) {
     _remote_rq_window_size.store(_local_window_capacity,
                                  butil::memory_order_relaxed);
     _sq_window_size.store(_local_window_capacity, butil::memory_order_relaxed);
+    // [dual-jetty] Initialize the read SQ window. Only when the read jetty
+    // was created; otherwise _sq_window_size_read stays 0 and PostReadBatch
+    // falls back to _sq_window_size (write jetty).
+    if (GetUrmaDualJetty() && _resource && _resource->jetty_read) {
+        _sq_window_size_read.store(
+            static_cast<uint16_t>(GetUrmaReadJettySqSize()),
+            butil::memory_order_relaxed);
+    }
 
     // Negotiate one-sided IO mode: min(local, remote). v2 peers or peers
     // without one-sided support will have io_mode=0, so we fall back to
@@ -3683,6 +3827,19 @@ int UrmaEndpoint::GlobalInitialize() {
         if (!r->jetty) {
             delete r;
             break;
+        }
+        // [dual-jetty] Create the read-dedicated jetty in the prepared pool
+        // too, so prepared resources match the per-connection allocation path.
+        if (GetUrmaDualJetty()) {
+            urma_jetty_cfg_t read_cfg = jetty_cfg;
+            read_cfg.jfs_cfg.depth =
+                static_cast<uint32_t>(GetUrmaReadJettySqSize());
+            r->jetty_read = urma_create_jetty(ctx, &read_cfg);
+            if (!r->jetty_read) {
+                PLOG(WARNING) << "Prepared pool: urma_create_jetty (read) "
+                              << "failed; READ will fall back to write jetty";
+                // Non-fatal: keep the write jetty in the pool.
+            }
         }
         r->next = g_prepared_list;
         g_prepared_list = r;

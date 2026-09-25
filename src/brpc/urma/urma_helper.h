@@ -128,6 +128,13 @@ uint32_t GetUrmaMaxSgeLen();
 // Hard cap for SEND path (bonding/UDMA hardware limit).
 uint32_t GetUrmaSendMaxSgeLen();
 
+// Whether --urma_dual_jetty is enabled (separate jetty for READ ops to
+// eliminate status=8 from READ+WRITE_IMM SQ contention).
+bool GetUrmaDualJetty();
+
+// SQ depth for the read-dedicated jetty (--urma_read_jetty_sq_size).
+uint16_t GetUrmaReadJettySqSize();
+
 }  // namespace urma
 }  // namespace brpc
 
