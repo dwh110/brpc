@@ -161,6 +161,9 @@ private:
     uint32_t _free_units{0};     // currently free units
     // Bitmap: 1 = allocated, 0 = free. Indexed by unit number.
     std::vector<uint8_t> _bitmap;
+    // [Stage2] Cursor for first-fit search start. Reduces average scan
+    // distance from O(N) to O(N/free_fraction) under steady-state alloc/release.
+    uint32_t _alloc_cursor{0};
 
     // Round up to allocation units.
     uint32_t UnitsForSize(uint32_t size) const {
@@ -177,6 +180,7 @@ inline void UrmaRingBuf::Init(uint32_t capacity) {
     _unit_count = capacity / URMA_ONE_SIDED_ALLOC_UNIT;
     _free_units = _unit_count;
     _bitmap.assign(_unit_count, 0);
+    _alloc_cursor = 0;
 }
 
 inline bool UrmaRingBuf::Allocate(uint32_t size, uint32_t* offset) {
@@ -188,10 +192,21 @@ inline bool UrmaRingBuf::Allocate(uint32_t size, uint32_t* offset) {
     if (units > _free_units) {
         return false;
     }
-    // First-fit search for contiguous free units.
+    // [Stage2] First-fit search starting from _alloc_cursor.
+    // NOTE: the bitmap is a flat array, not a wrap-around ring — a single
+    // allocation must occupy a contiguous range [start, start+units) within
+    // the array bounds. We only use _alloc_cursor to skip the leading
+    // already-allocated region; once the scan wraps past _unit_count we
+    // reset and continue from 0 so the caller still gets a bounded range.
     uint32_t start = 0;
     uint32_t consecutive = 0;
-    for (uint32_t i = 0; i < _unit_count; ++i) {
+    for (uint32_t k = 0; k < _unit_count; ++k) {
+        const uint32_t i = (_alloc_cursor + k) % _unit_count;
+        // Reset streak when wrapping around — a contiguous allocation
+        // cannot span the end of the bitmap array.
+        if (i == 0) {
+            consecutive = 0;
+        }
         if (_bitmap[i] == 0) {
             if (consecutive == 0) {
                 start = i;
@@ -202,6 +217,7 @@ inline bool UrmaRingBuf::Allocate(uint32_t size, uint32_t* offset) {
                     _bitmap[j] = 1;
                 }
                 _free_units -= units;
+                _alloc_cursor = (start + units) % _unit_count;
                 *offset = start * URMA_ONE_SIDED_ALLOC_UNIT;
                 return true;
             }

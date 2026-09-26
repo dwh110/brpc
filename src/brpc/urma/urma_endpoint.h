@@ -431,6 +431,19 @@ private:
     butil::atomic<uint64_t> _rx_consume_seq{0};  // next slot to allocate
     butil::atomic<uint64_t> _rx_delivery_seq{0}; // next slot to deliver in-order
 
+    // [Stage2] Count of RX slots with pending_retry=true. RetryPendingReads
+    // is called after every READ CQE; without this guard it scans all 128
+    // slots each time (32K empty scans for a 255-batch 1M message).
+    // PollCq is single-threaded, so relaxed atomics suffice.
+    butil::atomic<uint32_t> _pending_retry_count{0};
+
+    // [Stage2] Hint for InsertPendingSend (writer) and
+    // FindAndRemoveSendContext (reader). Reduces average scan distance
+    // from O(N/2) to O(1) in steady state. Writer is single-threaded
+    // (KeepWrite), reader is single-threaded (PollCq).
+    butil::atomic<uint32_t> _insert_hint{0};
+    uint32_t _remove_hint{0};
+
     // Mutex serializing JFS posts on the WriteZeroCopy path. Bonding devices
     // reject concurrent READ+WRITE_IMM on the same jetty (status=8): PollCq
     // posts READ / POST_WRITE while KeepWrite posts PRE_WRITE. This mutex

@@ -875,11 +875,15 @@ int UrmaEndpoint::PostEmptyRecvWr(uint32_t count) {
 
 UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t key) {
     // Lock-free MPSC read: PollCq is the single reader.
-    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+    // [Stage2] Start from _remove_hint to reduce average scan distance.
+    const uint32_t hint = _remove_hint;
+    for (size_t k = 0; k < kMaxPendingSends; ++k) {
+        const size_t i = (hint + k) % kMaxPendingSends;
         if (_pending_sends[i].state.load(butil::memory_order_acquire) == key) {
             UrmaSendContext* ctx = _pending_sends[i].ctx;
             _pending_sends[i].ctx = nullptr;
             _pending_sends[i].state.store(0, butil::memory_order_release);
+            _remove_hint = static_cast<uint32_t>(i + 1);
             return ctx;
         }
     }
@@ -889,12 +893,17 @@ UrmaSendContext* UrmaEndpoint::FindAndRemoveSendContext(uint64_t key) {
 // Insert a pending send context into a free slot (Writer: KeepWrite, single-threaded).
 // Returns true on success, false if all slots are occupied.
 bool UrmaEndpoint::InsertPendingSend(uint64_t key, UrmaSendContext* ctx) {
-    for (size_t i = 0; i < kMaxPendingSends; ++i) {
+    // [Stage2] Start from _insert_hint to reduce average scan distance.
+    const uint32_t hint = _insert_hint.load(butil::memory_order_relaxed);
+    for (size_t k = 0; k < kMaxPendingSends; ++k) {
+        const size_t i = (hint + k) % kMaxPendingSends;
         uint64_t expected = 0;
         if (_pending_sends[i].state.load(butil::memory_order_relaxed) == 0 &&
             _pending_sends[i].state.compare_exchange_strong(
                 expected, key, butil::memory_order_acq_rel)) {
             _pending_sends[i].ctx = ctx;
+            _insert_hint.store(static_cast<uint32_t>(i + 1),
+                               butil::memory_order_relaxed);
             return true;
         }
     }
@@ -1472,7 +1481,24 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
         uint32_t size;
         urma_target_seg_t* tseg;
     };
-    std::vector<BlockInfo> blocks;
+    // [Stage2] Stack array for fast path (avoids vector heap allocation).
+    // 256 covers 8MB/64KB=128 blocks with 2x headroom. Fallback to vector
+    // for pathological cases (tiny max_sge_len + huge message).
+    constexpr size_t kStackBlocks = 256;
+    BlockInfo blocks_stack[kStackBlocks];
+    size_t block_count = 0;
+    std::vector<BlockInfo> blocks_heap;  // only used if block_count > 256
+    auto add_block = [&](uint64_t a, uint32_t s, urma_target_seg_t* t) {
+        if (block_count < kStackBlocks) {
+            blocks_stack[block_count] = {a, s, t};
+        } else {
+            blocks_heap.push_back({a, s, t});
+        }
+        ++block_count;
+    };
+    auto get_block = [&](size_t i) -> const BlockInfo& {
+        return (i < kStackBlocks) ? blocks_stack[i] : blocks_heap[i - kStackBlocks];
+    };
     size_t total_payload = 0;
     const uint32_t max_sge_len = GetUrmaMaxSgeLen();
     for (size_t i = 0; i < ndata; ++i) {
@@ -1506,21 +1532,21 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
                 if (max_sge_len > 0 && chunk > max_sge_len) {
                     chunk = max_sge_len;
                 }
-                blocks.push_back({addr, chunk, tseg});
+                add_block(addr, chunk, tseg);
                 total_payload += chunk;
                 addr += chunk;
                 remaining -= chunk;
             }
         }
     }
-    if (blocks.empty()) {
+    if (block_count == 0) {
         return 0;
     }
 
-    // Build control message: UrmaMessageHead + PageBufferInMessage[blocks.size()].
+    // Build control message: UrmaMessageHead + PageBufferInMessage[block_count].
     const uint32_t ctrl_msg_size = static_cast<uint32_t>(
         sizeof(UrmaMessageHead) +
-        blocks.size() * sizeof(PageBufferInMessage));
+        block_count * sizeof(PageBufferInMessage));
     uint32_t offset = 0;
     if (!_send_buf_alloc->Allocate(ctrl_msg_size, &offset)) {
         errno = EAGAIN;
@@ -1533,7 +1559,7 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     UrmaMessageHead* head = reinterpret_cast<UrmaMessageHead*>(dst);
     head->magic = URMA_CTRL_MAGIC;
     head->message_size = ctrl_msg_size;
-    head->data_count = static_cast<uint32_t>(blocks.size());
+    head->data_count = static_cast<uint32_t>(block_count);
     head->flags = 0;
     const uint64_t request_id = _one_sided_seq.fetch_add(1,
                                 butil::memory_order_relaxed);
@@ -1541,9 +1567,10 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
 
     auto* entries = reinterpret_cast<PageBufferInMessage*>(
         dst + sizeof(UrmaMessageHead));
-    for (size_t i = 0; i < blocks.size(); ++i) {
-        entries[i].addr = blocks[i].addr;
-        entries[i].size = blocks[i].size;
+    for (size_t i = 0; i < block_count; ++i) {
+        const BlockInfo& b = get_block(i);
+        entries[i].addr = b.addr;
+        entries[i].size = b.size;
         entries[i].seg_token_id = 0;  // pool seg already imported by peer
     }
 
@@ -2555,6 +2582,12 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
 // SQ window may have freed. Called after each READ CQE reclaims an SQ slot
 // in HandleCompletion TX path. PollCq is single-threaded, so no lock needed.
 void UrmaEndpoint::RetryPendingReads() {
+    // [Stage2] Skip the 128-slot scan entirely when no slot is pending.
+    // Without this guard, a 255-batch 1M message triggers 255×128=32K
+    // empty scans as CQEs arrive in a burst.
+    if (_pending_retry_count.load(butil::memory_order_relaxed) == 0) {
+        return;
+    }
     for (uint32_t i = 0; i < URMA_RX_RING_SIZE; ++i) {
         UrmaRxSlot& slot = _rx_slots[i];
         if (!slot.pending_retry) {
@@ -2563,12 +2596,14 @@ void UrmaEndpoint::RetryPendingReads() {
         if (slot.state.load(butil::memory_order_relaxed) != UrmaRxSlot::READING) {
             // Stale flag (slot was reset or delivered); clear it.
             slot.pending_retry = false;
+            _pending_retry_count.fetch_sub(1, butil::memory_order_relaxed);
             continue;
         }
         // Attempt to post the next batch. PostReadBatch will return EAGAIN
         // again if the window is still too small, leaving pending_retry set.
         if (PostReadBatch(i) == 0) {
             slot.pending_retry = false;
+            _pending_retry_count.fetch_sub(1, butil::memory_order_relaxed);
             LOG(INFO) << "RetryPendingReads: resumed slot " << i
                        << " (next_read_idx=" << slot.next_read_idx
                        << "/" << slot.total_blocks << ") on "
@@ -2581,6 +2616,7 @@ void UrmaEndpoint::RetryPendingReads() {
                        << i << " errno=" << errno
                        << " on " << _socket->description();
             slot.pending_retry = false;
+            _pending_retry_count.fetch_sub(1, butil::memory_order_relaxed);
         }
         // EAGAIN: leave pending_retry=true; will retry on next CQE.
     }
@@ -2749,6 +2785,9 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
                 // SQ window exhausted; keep slot in READING, mark for retry.
                 // SQ window is reclaimed in HandleCompletion TX path (READ CQE)
                 // which calls RetryPendingReads to resume deferred slots.
+                if (!slot.pending_retry) {
+                    _pending_retry_count.fetch_add(1, butil::memory_order_relaxed);
+                }
                 slot.pending_retry = true;
                 LOG(INFO) << "HandlePreWrite: PostReadBatch EAGAIN, deferring slot "
                            << idx << " (next_read_idx=" << slot.next_read_idx
@@ -2829,6 +2868,9 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
             if (errno == EAGAIN) {
                 // SQ window exhausted mid-message; keep slot READING, retry
                 // later when SQ window is reclaimed (HandleCompletion TX).
+                if (!slot.pending_retry) {
+                    _pending_retry_count.fetch_add(1, butil::memory_order_relaxed);
+                }
                 slot.pending_retry = true;
                 LOG(INFO) << "HandleReadCompletion: PostReadBatch EAGAIN, deferring slot "
                            << idx << " (next_read_idx=" << slot.next_read_idx
