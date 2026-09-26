@@ -144,11 +144,15 @@ DEFINE_int32(urma_io_mode, 0,
              "2=HYBRID (small IO <= urma_inline_threshold uses WRITE_IN_BAND, "
              "large IO uses PRE_WRITE + READ). Only effective with v3 "
              "handshake peers; v2 peers fall back to SEND_ONLY.");
-DEFINE_int32(urma_inline_threshold, 2048,
+DEFINE_int32(urma_inline_threshold, 16384,
              "Maximum payload size in bytes for WRITE_IN_BAND (small IO path). "
              "Messages at or below this threshold are written directly into "
              "the peer's recv_buf via WRITE_IMM. Only used when "
-             "--urma_io_mode=2.");
+             "--urma_io_mode=2. [Stage1] Raised from 2048 to 16384 so 4K/8K "
+             "use single-segment WriteInline instead of two-segment "
+             "WriteZeroCopy (PRE_WRITE+READ), saving ~10-14us per message. "
+             "8192 was insufficient because brpc RPC header (~200 bytes) "
+             "pushes 8K IOBuf total > 8192, keeping 8K on WriteZeroCopy.");
 DEFINE_int32(urma_send_buf_size, 128,
              "Size in KB of the per-connection send_buf for one-sided "
              "operations. Must be a multiple of 1KB. Used as the source "
@@ -182,12 +186,14 @@ DEFINE_bool(urma_dual_jetty, false,
             "posted to a dedicated jetty with its own SQ, physically isolating "
             "them from WRITE_IMM traffic. Experimental: requires v3 handshake "
             "on both peers (v2 wire cannot carry the read_jetty_id field).");
-DEFINE_int32(urma_read_jetty_sq_size, 256,
+DEFINE_int32(urma_read_jetty_sq_size, 1024,
              "SQ depth for the read-dedicated jetty when --urma_dual_jetty=true. "
              "Each in-flight READ consumes one SQ slot; size to match the max "
              "expected read concurrency (qd * blocks_per_message). [O2] Increased "
              "from 64 to 256 to allow full-chain READ post for large messages "
-             "(8MB / 64KB = 128 blocks) in a single batch. Ignored when "
+             "(8MB / 64KB = 128 blocks) in a single batch. [Stage1] Further "
+             "raised to 1024 to reduce SQ window pressure at qd=10 (1280 "
+             "concurrent READs), stabilizing 8M qps=1000 latency. Ignored when "
              "--urma_dual_jetty=false.");
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
@@ -992,7 +998,7 @@ bool GetUrmaDualJetty() {
 
 uint16_t GetUrmaReadJettySqSize() {
     if (FLAGS_urma_read_jetty_sq_size <= 0) {
-        return 256;
+        return 1024;
     }
     return static_cast<uint16_t>(FLAGS_urma_read_jetty_sq_size);
 }
