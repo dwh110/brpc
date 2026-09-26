@@ -182,10 +182,12 @@ DEFINE_bool(urma_dual_jetty, false,
             "posted to a dedicated jetty with its own SQ, physically isolating "
             "them from WRITE_IMM traffic. Experimental: requires v3 handshake "
             "on both peers (v2 wire cannot carry the read_jetty_id field).");
-DEFINE_int32(urma_read_jetty_sq_size, 64,
+DEFINE_int32(urma_read_jetty_sq_size, 256,
              "SQ depth for the read-dedicated jetty when --urma_dual_jetty=true. "
              "Each in-flight READ consumes one SQ slot; size to match the max "
-             "expected read concurrency (qd * blocks_per_message). Ignored when "
+             "expected read concurrency (qd * blocks_per_message). [O2] Increased "
+             "from 64 to 256 to allow full-chain READ post for large messages "
+             "(8MB / 64KB = 128 blocks) in a single batch. Ignored when "
              "--urma_dual_jetty=false.");
 
 // Set to true to skip real URMA hardware initialization (unit tests). When
@@ -990,7 +992,7 @@ bool GetUrmaDualJetty() {
 
 uint16_t GetUrmaReadJettySqSize() {
     if (FLAGS_urma_read_jetty_sq_size <= 0) {
-        return 64;
+        return 256;
     }
     return static_cast<uint16_t>(FLAGS_urma_read_jetty_sq_size);
 }

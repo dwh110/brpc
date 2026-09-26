@@ -1599,8 +1599,10 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
     // Hold _zerocopy_post_mutex during the jetty post to avoid concurrent
-    // READ / POST_WRITE posts from PollCq on the same jetty — bonding
-    // devices reject READ+WRITE_IMM interleaving with status=8.
+    // WRITE_IMM posts from PollCq (ResponseCtrlMessage: WRITE_IN_BAND_ACK /
+    // POST_WRITE) on the same write jetty. Even with dual-jetty (READ on
+    // a separate jetty), the write jetty is still shared between KeepWrite
+    // and PollCq, so the mutex is needed to serialize WRITE_IMM vs WRITE_IMM.
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
         return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
@@ -1844,6 +1846,11 @@ int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
     // enabled. This function is called from PollCq (WRITE_IN_BAND_ACK,
     // POST_WRITE) which may race with KeepWrite's WRITE_IMM posts and
     // PollCq's PostReadBatch on bonding devices.
+    // [O3] In dual-jetty mode, READ WRs use a separate read jetty, so the
+    // READ+WRITE_IMM interleaving risk is gone. However, this WRITE_IMM
+    // still races with KeepWrite's WRITE_IMM on the same write jetty
+    // (PollCq vs KeepWrite on different threads), so the mutex is still
+    // needed when zerocopy_read is enabled.
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
                                             std::defer_lock);
@@ -2202,7 +2209,10 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
                     }
                 }
                 _socket->WakeAsEpollOut();
-                return HandleReadCompletion(cr);
+                const ssize_t nr = HandleReadCompletion(cr);
+                // SQ window just grew — retry any slots deferred by EAGAIN.
+                RetryPendingReads();
+                return nr;
             }
             if (type == CTRL_DATA_REQUEST || type == CTRL_DATA_RESPONSE) {
                 // Send completion for our WRITE_IMM (data or control response).
@@ -2513,9 +2523,16 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     // concurrently post WRITE_IMM on the same jetty — the mutex serializes
     // the post to avoid READ+WRITE_IMM interleaving (status=8). When
     // dual-jetty IS active, READ and WRITE_IMM use separate jetties so the
-    // mutex only protects SQ window accounting, not provider-level ordering.
+    // mutex is not needed for provider-level ordering. [O3] Skip the mutex
+    // in dual-jetty mode to allow READ post to proceed without waiting for
+    // KeepWrite's WRITE_IMM post.
     // Callers must NOT hold the mutex.
     const urma_status_t status = [&]() {
+        if (use_read_jetty) {
+            // dual-jetty: READ and WRITE_IMM use different jetties, no mutex.
+            return urma_post_jetty_send_wr(post_jetty, wrs.get(), &bad);
+        }
+        // single jetty: mutex needed to prevent READ+WRITE_IMM interleaving.
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
         return urma_post_jetty_send_wr(post_jetty, wrs.get(), &bad);
     }();
@@ -2534,6 +2551,41 @@ int UrmaEndpoint::PostReadBatch(uint32_t slot_idx) {
     return 0;
 }
 
+// Scan all RX slots for pending_retry and re-post READ batches now that
+// SQ window may have freed. Called after each READ CQE reclaims an SQ slot
+// in HandleCompletion TX path. PollCq is single-threaded, so no lock needed.
+void UrmaEndpoint::RetryPendingReads() {
+    for (uint32_t i = 0; i < URMA_RX_RING_SIZE; ++i) {
+        UrmaRxSlot& slot = _rx_slots[i];
+        if (!slot.pending_retry) {
+            continue;
+        }
+        if (slot.state.load(butil::memory_order_relaxed) != UrmaRxSlot::READING) {
+            // Stale flag (slot was reset or delivered); clear it.
+            slot.pending_retry = false;
+            continue;
+        }
+        // Attempt to post the next batch. PostReadBatch will return EAGAIN
+        // again if the window is still too small, leaving pending_retry set.
+        if (PostReadBatch(i) == 0) {
+            slot.pending_retry = false;
+            LOG(INFO) << "RetryPendingReads: resumed slot " << i
+                       << " (next_read_idx=" << slot.next_read_idx
+                       << "/" << slot.total_blocks << ") on "
+                       << _socket->description();
+        } else if (errno != EAGAIN) {
+            // Real error — clear flag but keep slot READING to avoid a hole
+            // in the delivery order. The slot will be reclaimed when the
+            // ring wraps or the connection closes.
+            LOG(ERROR) << "RetryPendingReads: PostReadBatch hard failure on slot "
+                       << i << " errno=" << errno
+                       << " on " << _socket->description();
+            slot.pending_retry = false;
+        }
+        // EAGAIN: leave pending_retry=true; will retry on next CQE.
+    }
+}
+
 // Deliver consecutive DATA_READY slots to _read_buf in allocation order.
 // PollCq is single-threaded per endpoint, so no lock is needed. This ensures
 // InputMessenger sees complete RPC messages in the order they were sent
@@ -2549,9 +2601,14 @@ void UrmaEndpoint::DeliverReadySlots() {
             break;  // not ready or gap — wait for earlier slots
         }
         // Append all blocks in order, then release the slot.
-        for (size_t i = 0; i < slot.read_targets.size(); ++i) {
-            _socket->_read_buf.append(slot.read_targets[i].first,
-                                      slot.read_targets[i].second);
+        // [O1 零拷贝] Use IOBuf::append(const IOBuf&) which shares Block
+        // references (zero-copy) instead of append(ptr, size) which memcpy's.
+        // slot.recv_bufs[i] owns the pool buffers that were READ destinations;
+        // appending them to _read_buf increments Block refcount. When
+        // slot.Reset() clears recv_bufs, the Blocks stay alive via _read_buf's
+        // references and are freed when brpc consumes the message.
+        for (size_t i = 0; i < slot.recv_bufs.size(); ++i) {
+            _socket->_read_buf.append(slot.recv_bufs[i]);
         }
         slot.Reset();  // sets state back to IDLE
         ++seq;
@@ -2688,6 +2745,21 @@ ssize_t UrmaEndpoint::HandleWriteImmCompletion(const urma_cr_t& cr) {
         // Post the first batch of READ WRs. PostReadBatch internally holds
         // _zerocopy_post_mutex to serialize against KeepWrite's WRITE_IMM.
         if (PostReadBatch(idx) != 0) {
+            if (errno == EAGAIN) {
+                // SQ window exhausted; keep slot in READING, mark for retry.
+                // SQ window is reclaimed in HandleCompletion TX path (READ CQE)
+                // which calls RetryPendingReads to resume deferred slots.
+                slot.pending_retry = true;
+                LOG(INFO) << "HandlePreWrite: PostReadBatch EAGAIN, deferring slot "
+                           << idx << " (next_read_idx=" << slot.next_read_idx
+                           << "/" << slot.total_blocks << ") on "
+                           << _socket->description();
+                // Repost the empty recv WR so future PRE_WRITEs can arrive.
+                if (_io_mode != 0) {
+                    PostEmptyRecvWr(1);
+                }
+                return 0;  // Non-fatal: retry will fire when SQ window frees.
+            }
             const int saved_errno = errno;
             LOG(ERROR) << "HandlePreWrite: PostReadBatch failed on "
                        << _socket->description();
@@ -2754,6 +2826,16 @@ ssize_t UrmaEndpoint::HandleReadCompletion(const urma_cr_t& cr) {
     if (slot.next_read_idx < slot.total_blocks) {
         // PostReadBatch internally holds _zerocopy_post_mutex.
         if (PostReadBatch(idx) != 0) {
+            if (errno == EAGAIN) {
+                // SQ window exhausted mid-message; keep slot READING, retry
+                // later when SQ window is reclaimed (HandleCompletion TX).
+                slot.pending_retry = true;
+                LOG(INFO) << "HandleReadCompletion: PostReadBatch EAGAIN, deferring slot "
+                           << idx << " (next_read_idx=" << slot.next_read_idx
+                           << "/" << slot.total_blocks << ") on "
+                           << _socket->description();
+                return 0;  // Non-fatal: retry will fire when SQ window frees.
+            }
             const int saved_errno = errno;
             LOG(ERROR) << "HandleReadCompletion: PostReadBatch failed on "
                        << _socket->description()

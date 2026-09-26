@@ -476,6 +476,11 @@ private:
     // _rx_delivery_seq past each delivered slot and resets it to IDLE.
     void DeliverReadySlots();
 
+    // Scan all RX slots for pending_retry and re-post READ batches now that
+    // SQ window may have freed. Called after each READ CQE reclaims an SQ
+    // slot in HandleCompletion TX path. PollCq is single-threaded, no lock.
+    void RetryPendingReads();
+
     // Send a control response (WRITE_IN_BAND_ACK or POST_WRITE) back to
     // the peer's send_buf at the mirrored offset. chunk_idx is written into
     // flags so the peer's HandleWriteInBandAck can locate the chunk's context.

@@ -117,9 +117,11 @@ constexpr uint32_t URMA_ONE_SIDED_ALLOC_UNIT = 1024;
 uint32_t GetUrmaChunkPayloadMax();
 
 // Maximum READ WRs posted per batch in the PRE_WRITE + READ path.
-// Inspired by UBS's TX_POST_BATCH_MAX=64. Keeps SQ window consumption
-// bounded regardless of message size.
-constexpr uint32_t URMA_READ_BATCH_MAX = 64;
+// [O2] Increased from 64 to 256 to allow full-chain READ post for large
+// messages (8MB / 64KB = 128 blocks). With dual-jetty's independent read SQ
+// window, all 128 READ WRs can be posted in a single chain, eliminating
+// inter-batch wait gaps.
+constexpr uint32_t URMA_READ_BATCH_MAX = 256;
 
 // Bitmap-based ring buffer allocator for send_buf / recv_buf.
 // ACK/POST_WRITE messages may release slots out of order, so a simple
@@ -255,6 +257,9 @@ struct UrmaRxSlot {
     // PageBufferInMessage entries copied from the PRE_WRITE control message.
     // Must survive across batches since recv_buf will be overwritten.
     std::vector<PageBufferInMessage> entries;
+    // PostReadBatch returned EAGAIN (SQ window exhausted); keep slot in
+    // READING and retry when SQ window is reclaimed in HandleCompletion TX.
+    bool pending_retry{false};
 
     UrmaRxSlot() = default;
     void Reset() {
@@ -269,6 +274,7 @@ struct UrmaRxSlot {
         total_blocks = 0;
         next_read_idx = 0;
         entries.clear();
+        pending_retry = false;
     }
 };
 
