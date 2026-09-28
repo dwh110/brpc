@@ -1436,13 +1436,18 @@ ssize_t UrmaEndpoint::WriteInline(butil::IOBuf** from, size_t ndata) {
     // Consume one SQ slot for the WRITE_IMM WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    // When zerocopy_read is enabled, PollCq may post READ WRs concurrently.
-    // Bonding devices reject READ+WRITE_IMM interleaving (status=8), so
-    // serialize all WRITE_IMM posts with the mutex.
+    // [Stage4] Skip mutex when dual-jetty is active: READ WRs are physically
+    // isolated on jetty_read, so no READ+WRITE_IMM interleaving risk on the
+    // write jetty. WRITE_IMM+WRITE_IMM concurrency is safe per URMA provider
+    // contract (UBS v2 posts without any lock). Only bonding/single-jetty
+    // paths still need the mutex to prevent status=8.
+    const bool need_lock =
+        FLAGS_urma_use_zerocopy_read &&
+        !(_resource->jetty_read && _resource->remote_jetty_read);
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
                                             std::defer_lock);
-        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        if (need_lock) lock.lock();
         return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     }();
     if (status != URMA_SUCCESS) {
@@ -1625,13 +1630,15 @@ ssize_t UrmaEndpoint::WriteZeroCopy(butil::IOBuf** from, size_t ndata) {
     // Consume one SQ slot for the WRITE_IMM control message WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    // Hold _zerocopy_post_mutex during the jetty post to avoid concurrent
-    // WRITE_IMM posts from PollCq (ResponseCtrlMessage: WRITE_IN_BAND_ACK /
-    // POST_WRITE) on the same write jetty. Even with dual-jetty (READ on
-    // a separate jetty), the write jetty is still shared between KeepWrite
-    // and PollCq, so the mutex is needed to serialize WRITE_IMM vs WRITE_IMM.
+    // [Stage4] Skip mutex when dual-jetty is active (see WriteInline).
+    // WriteZeroCopy is only called when FLAGS_urma_use_zerocopy_read=true,
+    // so we only need to check the dual-jetty condition here.
+    const bool need_lock =
+        !(_resource->jetty_read && _resource->remote_jetty_read);
     const urma_status_t status = [&]() {
-        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex);
+        std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
+                                            std::defer_lock);
+        if (need_lock) lock.lock();
         return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     }();
     if (status != URMA_SUCCESS) {
@@ -1776,11 +1783,14 @@ ssize_t UrmaEndpoint::WriteInlineChunked(butil::IOBuf** from, size_t ndata) {
         // Post WR.
         _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
         urma_jfs_wr_t* bad = nullptr;
-        // Serialize with PollCq's READ posts when zerocopy_read is enabled.
+        // [Stage4] Skip mutex when dual-jetty is active (see WriteInline).
+        const bool need_lock =
+            FLAGS_urma_use_zerocopy_read &&
+            !(_resource->jetty_read && _resource->remote_jetty_read);
         const urma_status_t status = [&]() {
             std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
                                                 std::defer_lock);
-            if (FLAGS_urma_use_zerocopy_read) lock.lock();
+            if (need_lock) lock.lock();
             return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
         }();
         if (status != URMA_SUCCESS) {
@@ -1869,19 +1879,14 @@ int UrmaEndpoint::ResponseCtrlMessage(uint8_t opcode, uint16_t buffer_offset,
     // Consume one SQ slot for the WRITE_IMM WR.
     _sq_window_size.fetch_sub(1, butil::memory_order_relaxed);
     urma_jfs_wr_t* bad = nullptr;
-    // Serialize with concurrent READ/WRITE_IMM posts when zerocopy_read is
-    // enabled. This function is called from PollCq (WRITE_IN_BAND_ACK,
-    // POST_WRITE) which may race with KeepWrite's WRITE_IMM posts and
-    // PollCq's PostReadBatch on bonding devices.
-    // [O3] In dual-jetty mode, READ WRs use a separate read jetty, so the
-    // READ+WRITE_IMM interleaving risk is gone. However, this WRITE_IMM
-    // still races with KeepWrite's WRITE_IMM on the same write jetty
-    // (PollCq vs KeepWrite on different threads), so the mutex is still
-    // needed when zerocopy_read is enabled.
+    // [Stage4] Skip mutex when dual-jetty is active (see WriteInline).
+    const bool need_lock =
+        FLAGS_urma_use_zerocopy_read &&
+        !(_resource->jetty_read && _resource->remote_jetty_read);
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
                                             std::defer_lock);
-        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        if (need_lock) lock.lock();
         return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     }();
     if (status != URMA_SUCCESS) {
@@ -2000,10 +2005,14 @@ int UrmaEndpoint::SendImm(uint32_t imm) {
     // data windows in CutFromIOBufList: polling may observe its completion as
     // soon as the provider accepts the WR.
     --_sq_imm_window_size;
+    // [Stage4] Skip mutex when dual-jetty is active (see WriteInline).
+    const bool need_lock =
+        FLAGS_urma_use_zerocopy_read &&
+        !(_resource->jetty_read && _resource->remote_jetty_read);
     const urma_status_t status = [&]() {
         std::unique_lock<butil::Mutex> lock(_zerocopy_post_mutex,
                                             std::defer_lock);
-        if (FLAGS_urma_use_zerocopy_read) lock.lock();
+        if (need_lock) lock.lock();
         return urma_post_jetty_send_wr(_resource->jetty, &wr, &bad);
     }();
     if (status != URMA_SUCCESS) {
