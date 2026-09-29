@@ -41,6 +41,7 @@
 #include "butil/object_pool.h"
 #include "butil/logging.h"
 #include "butil/macros.h"
+#include "butil/memory/scope_guard.h"
 #include "butil/sys_byteorder.h"
 #include "butil/time.h"
 #include "bthread/bthread.h"
@@ -177,6 +178,8 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
         std::max(0, std::min(2, static_cast<int>(FLAGS_urma_io_mode))));
     _read_butex = bthread::butex_create_checked<butil::atomic<int>>();
     _read_butex->store(0, butil::memory_order_relaxed);
+    _shutdown_butex = bthread::butex_create_checked<butil::atomic<int>>();
+    _shutdown_butex->store(0, butil::memory_order_relaxed);
 }
 
 UrmaEndpoint::~UrmaEndpoint() {
@@ -184,6 +187,10 @@ UrmaEndpoint::~UrmaEndpoint() {
     if (_read_butex) {
         bthread::butex_destroy(_read_butex);
         _read_butex = nullptr;
+    }
+    if (_shutdown_butex) {
+        bthread::butex_destroy(_shutdown_butex);
+        _shutdown_butex = nullptr;
     }
     // Clean up any leftover reassembly contexts and pending sends.
     {
@@ -740,11 +747,41 @@ void UrmaEndpoint::DeallocateResources() {
         _cq_sid = INVALID_SOCKET_ID;
     }
 
+    // Set shutdown sentinel (0 → INT32_MIN) and wait for any in-flight
+    // PollCq to exit before deleting _resource. Without this, a poller
+    // bthread that already entered PollCq could access _resource->jfc
+    // after delete, causing use-after-free segfault on exit.
+    int32_t expected = 0;
+    while (!_resource_refcnt.compare_exchange_strong(
+               expected, INT32_MIN, butil::memory_order_acq_rel)) {
+        if (expected < 0) {
+            // Already in shutdown (double-call); safe to proceed.
+            break;
+        }
+        // expected > 0: a PollCq is in flight. Wait for it to exit.
+        _shutdown_butex->store(0, butil::memory_order_relaxed);
+        const timespec ts = butil::microseconds_from_now(1000);
+        bthread::butex_wait(_shutdown_butex, 0, &ts);
+        expected = 0;  // retry CAS
+    }
+
     // Reusing a Jetty requires a driver-supported RESET plus a complete JFC
     // drain. Until that lifecycle is implemented, prepared resources are
     // one-shot: they accelerate connection setup but are destroyed on close.
     delete _resource;
     _resource = nullptr;
+    // Reset refcnt for endpoint reuse (Reset → AllocateResources path).
+    _resource_refcnt.store(0, butil::memory_order_relaxed);
+}
+
+void UrmaEndpoint::ReleaseResourceRef() {
+    const int32_t prev = _resource_refcnt.fetch_sub(
+        1, butil::memory_order_acq_rel);
+    if (prev == INT32_MIN + 1) {
+        // Last holder during shutdown; wake DeallocateResources.
+        _shutdown_butex->store(1, butil::memory_order_release);
+        bthread::butex_wake(_shutdown_butex);
+    }
 }
 
 // ============================================================================
@@ -3082,7 +3119,18 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
 
 void UrmaEndpoint::PollCq(Socket* m) {
     auto* ep = static_cast<UrmaEndpoint*>(m->user());
-    if (!ep || !ep->_resource || !ep->_resource->jfc) {
+    if (!ep) return;
+    // Acquire resource reference; refuse entry during shutdown.
+    // _resource_refcnt: 0=free, >0=PollCq holding, INT32_MIN=shutdown.
+    const int32_t prev = ep->_resource_refcnt.fetch_add(
+        1, butil::memory_order_acq_rel);
+    if (prev < 0) {
+        ep->_resource_refcnt.fetch_sub(1, butil::memory_order_release);
+        return;
+    }
+    // RAII guard: ensures ref is released on every return path.
+    auto guard = butil::MakeScopeGuard([&] { ep->ReleaseResourceRef(); });
+    if (!ep->_resource || !ep->_resource->jfc) {
         return;
     }
 #if BRPC_E2E_TRACE

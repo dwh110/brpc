@@ -236,6 +236,8 @@ private:
     // Jetty, plus the CQ socket). Returns 0 on success.
     int AllocateResources();
     void DeallocateResources();
+    // Decrement _resource_refcnt; wake DeallocateResources if last holder.
+    void ReleaseResourceRef();
 
     // Import the peer's jetty and buffer-pool segment. CRITICAL:
     // urma_import_seg is called BEFORE urma_import_jetty, otherwise the kernel
@@ -307,6 +309,13 @@ private:
     // The SocketId wrapping the JFCE fd (event mode) or a synthetic carrier
     // (polling mode). PollCq is the edge-triggered callback on this socket.
     SocketId _cq_sid{INVALID_SOCKET_ID};
+
+    // Refcount for _resource lifecycle synchronization. 0=free, >0=PollCq
+    // holding, INT32_MIN=shutdown sentinel. DeallocateResources CAS 0→
+    // INT32_MIN then waits for in-flight PollCq to drain before delete.
+    butil::atomic<int32_t> _resource_refcnt{0};
+    // Butex for DeallocateResources to wait for last PollCq to exit.
+    butil::atomic<int>* _shutdown_butex{nullptr};
 
     // ---- Send / recv window bookkeeping ----
     uint16_t _sq_size{0};   // local JFS depth
