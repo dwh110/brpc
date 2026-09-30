@@ -9,6 +9,7 @@ import time
 import sys
 import os
 import re
+import argparse
 
 SERVER_HOST = '141.61.17.202'
 CLIENT_HOST = '141.61.17.204'
@@ -34,8 +35,8 @@ READ_JETTY_SQ = 512
 QPS_VALUES = [1000, 500]
 SIZES = [1024, 4096, 8192, 102400, 204800, 1048576, 8388608]
 
-RESULTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            'o123_64k_sq512_results.csv')
+# RESULTS_FILE is set in main() based on --read-jetty-sq argument.
+RESULTS_FILE = ''
 
 CSV_HEADER = ("pass,urma_io_mode,expected_qps,size,Avg-Latency,50th-Latency,"
               "90th-Latency,99th-Latency,99.9th-Latency,99.99th-Latency,"
@@ -206,20 +207,47 @@ def run_test(qps, size):
 
 
 def main():
+    global READ_JETTY_SQ, RESULTS_FILE
+
+    parser = argparse.ArgumentParser(
+        description='Run O1+O2+O3 URMA test with 64KB buffer')
+    parser.add_argument('--read-jetty-sq', type=int, default=READ_JETTY_SQ,
+                        help='read jetty SQ depth (default: %d)' % READ_JETTY_SQ)
+    parser.add_argument('--sizes', type=str, default='',
+                        help='comma-separated sizes to test (default: all)')
+    parser.add_argument('--qps', type=str, default='',
+                        help='comma-separated qps values (default: all)')
+    args = parser.parse_args()
+
+    READ_JETTY_SQ = args.read_jetty_sq
+    RESULTS_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        'o123_64k_sq%d_results.csv' % READ_JETTY_SQ)
+
+    qps_values = QPS_VALUES
+    if args.qps:
+        qps_values = [int(q) for q in args.qps.split(',')]
+    sizes = SIZES
+    if args.sizes:
+        sizes = [int(s) for s in args.sizes.split(',')]
+
     print("O1+O2+O3 optimization test with 64KB buffer")
     print("  Config: buffer_size=" + str(BUFFER_SIZE) + " buffer_count=" + str(BUFFER_COUNT)
           + " send_buf=" + str(SEND_BUF_KB) + "KB recv_buf=" + str(RECV_BUF_KB)
           + "KB chunk=" + str(CHUNK_PAYLOAD) + " SQ=" + str(SQ_SIZE)
           + " read_jetty_sq=" + str(READ_JETTY_SQ))
+    print("  QPS: " + str(qps_values))
+    print("  Sizes: " + str(sizes))
+    print("  Results: " + RESULTS_FILE)
     print("  QPS: " + str(QPS_VALUES))
     print("  Sizes: " + str(SIZES))
 
     results = [CSV_HEADER + "\n"]
-    total = len(QPS_VALUES) * len(SIZES)
+    total = len(qps_values) * len(sizes)
 
     idx = 0
-    for qps in QPS_VALUES:
-        for size in SIZES:
+    for qps in qps_values:
+        for size in sizes:
             idx += 1
             print("\n[" + str(idx) + "/" + str(total) + "] ")
             try:

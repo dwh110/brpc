@@ -165,6 +165,7 @@ def run_test(io_mode, qps, size):
                f'--urma_max_sge_len=65536 '
                f'--urma_send_buf_size={SEND_BUF_KB} '
                f'--urma_recv_buf_size={RECV_BUF_KB} '
+               f'--urma_use_polling=true '
                f'> /tmp/ub_test_server.log 2>&1 &')
     ssh_exec(SERVER_HOST, srv_cmd, timeout=10)
     time.sleep(3)
@@ -188,6 +189,7 @@ def run_test(io_mode, qps, size):
                f'--urma_max_sge_len=65536 '
                f'--urma_send_buf_size={SEND_BUF_KB} '
                f'--urma_recv_buf_size={RECV_BUF_KB} '
+               f'--urma_use_polling=true '
                f'--rpc_timeout_ms=2000 --connect_timeout_ms=6000 '
                f'--test_seconds=20 --max_retry=10 --queue_depth=10 '
                f'--req_size={size} --dummy_port=0 '

@@ -131,6 +131,73 @@ UBS v2 的 WriteZeroCopy 大包路径：
 ```
 
 ### 3.3 五个核心差异
+UBS v2 8M 路径为什么这么快 —— 根因分析
+基于 brpc_ubsocket_urma调用流程与数据流分析.md 的源码解析,UBS v2 8M=3940us vs brpc 8M=14522us(差距 269%)的原因有 5 个核心差异:
+#### 差异 1:零拷贝发送 vs Chunked memcpy 链
+
+|  | UBS v2 | brpc |
+|---- | ---- |-----|
+|8M 发送路径| WriteZeroCopy: 只发 16B×128 个 PageBufferInMessage 描述符,数据不动 |WriteInlineChunked: 把 8MB 切成 4 个 2MB chunk,每个 chunk memcpy 到 send_buf|
+|TX memcpy 次数|0 次(数据已在 UB Block 中,描述符直接引用地址) | 4 次(每个 chunk 一次 IOBuf cutn → send_buf)|
+|网络 opcode| WRITE_IMM(仅描述符) + READ(接收端拉数据) | 纯 WRITE_IMM(数据内联推送)|
+
+UBS v2 发送端:8MB 数据在 UB Block 内存池中,发送时只 post 一个小的控制消息(~2KB 描述符),接收端通过 RDMA READ 直接从发送端内存拉取。零 memcpy。
+brpc 发送端:8MB 数据在 IOBuf 中,需要逐 chunk 拷贝到 send_buf 再 WRITE_IMM 推送。4 个 chunk × 2MB = 4 次 memcpy。
+#### 差异 2:64KB 粗粒度 Block vs 2MB Chunk
+
+|  | UBS v2 | brpc |
+|---- | ---- |-----|
+|分片粒度 | mini_block_size = 64K |Bchunk_payload_size = 2MB|
+|8M 对应 WR 数|128 个 Block → 128 个 READ WR(链式一次 post) |4 个 chunk → 4 个 WRITE_IMM WR(逐个 post)|
+|READ 粒度| 每个 Block 一个 READ,seg_size = min(remote,local) = 64KB | N/A(纯 push 模式)|
+
+UBS v2 的 128 个 READ WR 通过链式 wr.next 一次 urma_post_jetty_send_wr 提交,硬件流水线处理。brpc 的 4 个 WRITE_IMM 需要逐个 post(受 send_buf 容量限制,串行等待)。
+
+#### 差异 3:send_buf 容量不限制并发度
+|  | UBS v2 | brpc |
+|---- | ---- |-----|
+|send_buf 用途 |仅存描述符(~2KB),不存数据 | 存实际数据(8MB chunk 全部经过 send_buf)|
+|send_buf 大小| 128KB(够存 8192 个描述符) | 2MB(仅够 1 个 2MB chunk,qd=10 需 80MB)|
+| 并发限制|无(数据不在 send_buf,READ 直接从 Block 池拉) | 有(send_buf 容量 < qd × msg_size 时排队)|
+
+这是 brpc 8M QPS 仅 557(达不到 1000)的根因:send_buf=2MB,qd=10 × 8MB = 80MB,远超 send_buf 容量,push 模式被迫串行。
+
+#### 差异 4:接收端零拷贝交付 vs chunk 重组 memcpy
+|  | UBS v2 | brpc |
+|---- | ---- |-----|
+|READ 目标 buffer| 接收端分配的新 UB Block,Block.data 直接作为 dst_sge.addr | 接收端 IOBuf pool buffer|
+| 数据交付| READ 完成后 Block 直接交给 brpc IOBuf(BlockRef 引用),0 次拷贝| READ 完成后 chunk 需要按序 append 到 _read_buf,有重组 memcpy|
+|乱序处理| Block 链表天然乱序容忍(每个 Block 独立,最后链表合并) | 需要按 slot/block_idx 重组,有序约束带来额外开销|
+
+#### 差异 5:线程模型避免 SQ 并发冲突
+|  | UBS v2 | brpc |
+|---- | ---- |-----|
+| PostRead 线程| worker poll 线程内同步调用(NewRequest → 用户回调 → Recv → Get → PostRead)|PollCq 独立 bthread|
+|PostSend 线程| 同一 worker poll 线程(无并发)| KeepWrite 独立 bthread|
+|READ+WRITE_IMM 并发| 无(单线程串行,同一 jetty 无冲突) | 有(双 bthread 并发 post 同一 jetty → status=8)|
+|双 jetty 需求| 不需要 | 需要(dual-jetty 方案)|
+
+UBS v2 靠线程模型天然避免并发,单 jetty 即可。brpc 的 bthread 架构导致必须用 dual-jetty 物理隔离。
+
+#### 总结:brpc 8M 路径的 3 层瓶颈
+brpc 8M = 14522us 分解:
+├── 4× chunk memcpy (2MB each)         ≈ 2000us  (差异 1)
+├── send_buf 容量限流 (串行等待)        ≈ 6000us  (差异 3,也是 QPS<1000 的原因)
+├── 4× WRITE_IMM 逐个 post 开销        ≈ 1500us  (差异 2)
+├── 接收端 chunk 重组 memcpy            ≈ 1000us  (差异 4)
+└── mutex 串行化 post                   ≈ 4000us  (差异 5,虽然是保护性的但也引入等待)
+
+UBS v2 8M = 3940us:
+├── 0× memcpy (零拷贝)                  = 0us
+├── send_buf 不限并发                   = 0us
+├── 128× READ WR 链式一次 post          ≈ 500us
+├── 接收端 Block 零拷贝交付             = 0us
+└── 单线程无锁                          = 0us
+   → 主要是 RDMA READ 硬件传输时间      ≈ 3440us
+核心结论:UBS v2 的优势在于 pull 模式 + 零拷贝 + 粗粒度 Block。brpc 的 Chunked push 模式在大包场景下被 send_buf 容量和 memcpy 开销双重限制。dual-jetty 解决了 SQ 并发问题,但要真正追平 UBS v2,还需要:
+1、切到 ZeroCopy pull 模式(已实现,需 dual-jetty + 大 send_buf)
+2、消除发送端 memcpy(IOBuf block 直接映射为 READ SGE,不经过 send_buf)
+3、增大 Block 粒度(从 2MB chunk 改为 64KB Block,更多并行 READ)
 
 | # | UBS v2 优势 | brpc 当前实现 | 预计差距 |
 |---|------------|-------------|----------|
@@ -139,6 +206,15 @@ UBS v2 的 WriteZeroCopy 大包路径：
 | 3 | **send_buf 不限并发**：只存描述符(~2KB) | ✅ 已实现 | 0 |
 | 4 | **接收端零拷贝交付**：Block.data 直接引用交给 IOBuf | `append(ptr, size)` memcpy 全部数据 | ~2000us |
 | 5 | **单线程模型**：PostRead 在 poll 线程同步，无并发冲突 | mutex 串行 post | ~500us |
+
+已充分理解代码。基于之前的分析,直接设计方案。当前 brpc ZeroCopy 路径有 3 个核心瓶颈需要消除:
+#### 瓶颈 1:接收端 DeliverReadySlots 中的 memcpy
+_socket->_read_buf.append(slot.read_targets[i].first, slot.read_targets[i].second) —— READ 数据落在临时 IOBuf pool buffer,然后 memcpy 到 _read_buf。UBS v2 是 Block 直接引用,零拷贝。
+#### 瓶颈 2:READ 分批串行(URMA_READ_BATCH_MAX=64 + 逐批等待完成)
+当前 PostReadBatch 一次最多 64 个 READ WR,等这批全部完成才发下一批。8MB / max_sge_len(64KB) = 128 个 block,需要 2 批,中间有等待间隙。UBS v2 链式一次 post 全部 128 个 READ WR。
+#### 瓶颈 3:dual-jetty mutex 串行化 post
+即使 dual-jetty 隔离了 READ 和 WRITE_IMM 的 SQ,_zerocopy_post_mutex 仍然串行化所有 post。UBS v2 无锁。
+先确认 max_sge_len 对 READ 路径的影响和 IOBuf append_movable 的可用性。
 
 ### 3.4 根因定位
 
